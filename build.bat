@@ -119,14 +119,23 @@ set "CUR_APP=%~dp0RemoteMapper-Flasher\bin\RemoteMapper_ESP32S3_%CUR_TAG%_app.bi
 set "CUR_BOOT=%~dp0RemoteMapper-Flasher\bin\RemoteMapper_ESP32S3_%CUR_TAG%_bootloader.bin"
 set "CUR_PART=%~dp0RemoteMapper-Flasher\bin\RemoteMapper_ESP32S3_%CUR_TAG%_partitions.bin"
 
+:: N16R8 full images must carry the custom dual-OTA bootloader: the stock
+:: Arduino bootloader is single-app and never switches OTA slots on reboot.
+set "CUR_BOOTLOADER=%CUR_BUILD%\bootloader.bin"
+if /i "%CUR_TAG%"=="N16R8" set "CUR_BOOTLOADER=%~dp0tools\bootloader\bootloader_esp32s3_ota_16mb.bin"
+if not exist "%CUR_BOOTLOADER%" (
+    echo [ERROR] Bootloader not found: %CUR_BOOTLOADER%
+    exit /b 1
+)
+
 echo - Packaging %CUR_TAG% (full image + segmented upgrade files)...
-"%ESPTOOL%" --chip esp32s3 merge_bin -o "%CUR_FULL%" --flash_mode keep --flash_freq keep --flash_size keep 0x0 "%CUR_BUILD%\bootloader.bin" 0x8000 "%CUR_BUILD%\partitions.bin" 0xe000 "%BOOT_APP0%" 0x10000 "%CUR_BUILD%\firmware.bin"
+"%ESPTOOL%" --chip esp32s3 merge_bin -o "%CUR_FULL%" --flash_mode keep --flash_freq keep --flash_size keep 0x0 "%CUR_BOOTLOADER%" 0x8000 "%CUR_BUILD%\partitions.bin" 0xe000 "%BOOT_APP0%" 0x10000 "%CUR_BUILD%\firmware.bin"
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] Failed to merge %CUR_TAG%!
     exit /b 1
 )
 copy /y "%CUR_BUILD%\firmware.bin" "%CUR_APP%" >nul
-copy /y "%CUR_BUILD%\bootloader.bin" "%CUR_BOOT%" >nul
+copy /y "%CUR_BOOTLOADER%" "%CUR_BOOT%" >nul
 copy /y "%CUR_BUILD%\partitions.bin" "%CUR_PART%" >nul
 exit /b 0
 

@@ -396,6 +396,9 @@ static void handle_ota_status() {
 }
 
 static void handle_ota_upload() {
+    if (!s_server.hasUpload()) {
+        return;
+    }
     HTTPUpload& upload = s_server.upload();
     switch (upload.status) {
         case UPLOAD_FILE_START:
