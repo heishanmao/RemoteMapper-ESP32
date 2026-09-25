@@ -391,11 +391,11 @@ static void start_scan() {
     led_indicator_set(LED_STATE_WAIT_CONNECTION);
     s_last_scan_ms = millis();
     NimBLEScan* pScan = NimBLEDevice::getScan();
-    pScan->setActiveScan(true);
+    pScan->setActiveScan(false); // passive: no probe requests (saves TX power)
     pScan->setInterval(BLE_SCAN_INTERVAL_MS);
     pScan->setWindow(BLE_SCAN_WINDOW_MS);
     pScan->start(0, false); // 0 = continuous scan until stopped
-    app_log("BLE", "Continuous scanning for Xiaomi Bluetooth Remote active...");
+    app_log("BLE", "Continuous passive scanning for Xiaomi Bluetooth Remote active...");
 }
 
 static bool setup_services_and_handshake() {
@@ -581,7 +581,7 @@ static bool setup_services_and_handshake() {
 
     // 3. Negotiate data length and connection parameters
     s_client->setDataLen(251);
-    s_client->updateConnParams(12, 12, 0, 400);
+    s_client->updateConnParams(30, 30, 0, 400); // 37.5ms interval (was 15ms) to cut idle link TX
 
     // 4. ATVV Handshake: query CAPS capability only. Do NOT force mic open at boot.
     if (s_char_cmd) {

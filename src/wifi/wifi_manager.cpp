@@ -91,6 +91,14 @@ static void wifi_apply_config(void) {
         app_log("WIFI", "mDNS responder started: http://%s.local", MDNS_HOSTNAME);
         s_mdns_started = true;
     }
+
+    // 4. Power optimizations: modem sleep + capped TX power (device stays near PC/router)
+    WiFi.setSleep(true);
+    if (WiFi.setTxPower(WIFI_POWER_8_5dBm)) {
+        app_log("WIFI", "TX power capped to 8.5dBm, modem sleep enabled");
+    } else {
+        app_log("WIFI", "Modem sleep enabled (TX power set failed)");
+    }
 }
 
 void wifi_manager_init(void) {
@@ -121,8 +129,8 @@ void wifi_manager_init(void) {
         return;
     }
 
-    // Phase 2: ON_DEMAND still boots the radio on (same behavior as before).
-    // The idle-timeout power-down of ON_DEMAND lands in a later phase.
+    // ON_DEMAND boots the radio on; the idle timeout in wifi_manager_task()
+    // powers it down and any user activity (wifi_manager_request_wifi) wakes it.
     wifi_apply_config();
     s_radio_state = WIFI_STATE_ON;
     s_last_activity_ms = millis();
@@ -191,6 +199,45 @@ void wifi_manager_mark_activity(void) {
     s_last_activity_ms = millis();
 }
 
+// Ring of recent key-press times used by the wake gesture (same-key match).
+static uint16_t s_gesture_key  = 0;
+static uint32_t s_press_times[WIFI_WAKE_PRESS_THRESHOLD] = {0};
+static uint8_t  s_press_count = 0;
+
+void wifi_manager_notify_key_press(uint16_t gesture_key) {
+    uint32_t now = millis();
+
+    if (s_radio_state == WIFI_STATE_ON) {
+        // Radio already up: a press is ordinary activity, keep it alive.
+        wifi_manager_mark_activity();
+        return;
+    }
+    if (s_policy == WIFI_POLICY_DISABLED) {
+        return;
+    }
+
+    // Radio powered down: accumulate presses of the SAME key.
+    if (s_press_count > 0) {
+        if ((now - s_press_times[0]) > WIFI_WAKE_PRESS_WINDOW_MS ||
+            gesture_key != s_gesture_key) {
+            // Gesture window expired or a different key -> start a fresh gesture.
+            s_press_count = 0;
+            s_gesture_key = gesture_key;
+        }
+    } else {
+        s_gesture_key = gesture_key;
+    }
+    if (s_press_count < WIFI_WAKE_PRESS_THRESHOLD) {
+        s_press_times[s_press_count++] = now;
+    }
+    if (s_press_count >= WIFI_WAKE_PRESS_THRESHOLD) {
+        app_log("WIFI", "Wake gesture detected (%d quick presses of same key) -> waking radio",
+                (int)WIFI_WAKE_PRESS_THRESHOLD);
+        s_press_count = 0;
+        wifi_manager_request_wifi(WIFI_WAKE_MANUAL);
+    }
+}
+
 uint32_t wifi_manager_get_last_activity_ms(void) {
     return s_last_activity_ms;
 }
@@ -200,8 +247,15 @@ bool wifi_manager_request_wifi(wifi_wake_reason_t reason) {
         app_log("WIFI", "Wi-Fi request ignored: policy DISABLED (reason=%d)", (int)reason);
         return false;
     }
-    // Phase 2: radio stays on whenever not DISABLED. Idle shutdown & transient
-    // ENABLING/SHUTTING_DOWN handling is implemented in a later phase.
+    // On-demand wake: radio was powered down after idle timeout, bring it back.
+    if (s_radio_state != WIFI_STATE_ON) {
+        app_log("WIFI", "On-demand wake (reason=%d): restarting radio...", (int)reason);
+        s_radio_state = WIFI_STATE_ENABLING;
+        wifi_apply_config();
+        s_radio_state = WIFI_STATE_ON;
+        s_last_activity_ms = millis();
+        return true;
+    }
     wifi_manager_mark_activity();
     return s_radio_state != WIFI_STATE_OFF;
 }
@@ -234,6 +288,24 @@ void wifi_manager_task(void) {
     }
 
     uint32_t now = millis();
+
+    // ON_DEMAND: power down the STA radio after the idle timeout.
+    // Any user input (wifi_manager_request_wifi) wakes it back up.
+    if (s_policy == WIFI_POLICY_ON_DEMAND &&
+        s_timeout_min != WIFI_TIMEOUT_NEVER &&
+        s_radio_state == WIFI_STATE_ON &&
+        s_sta_configured &&
+        WiFi.status() == WL_CONNECTED &&
+        (now - s_last_activity_ms) >= (uint32_t)s_timeout_min * 60000U) {
+        app_log("WIFI", "ON_DEMAND idle timeout (%u min) reached -> powering down radio",
+                (unsigned int)s_timeout_min);
+        s_radio_state = WIFI_STATE_SHUTTING_DOWN;
+        WiFi.disconnect(true);
+        s_radio_state = WIFI_STATE_OFF;
+        app_log("WIFI", "Wi-Fi radio OFF (idle). Press a key to wake it.");
+        return;
+    }
+
     if (s_sta_configured && (now - s_last_sta_check > 1000)) {
         s_last_sta_check = now;
         if (WiFi.status() == WL_CONNECTED && WiFi.localIP()[0] != 0) {

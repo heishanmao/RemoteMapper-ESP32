@@ -3,6 +3,7 @@
 #include "audio/audio_pipeline.h"
 #include "log/app_log.h"
 #include "led_indicator.h"
+#include "wifi/wifi_manager.h"
 #include <Arduino.h>
 #include "USB.h"
 #include "USBCDC.h"
@@ -217,6 +218,12 @@ bool usb_hid_consumer_tap(uint16_t usage_code) {
 
 void usb_hid_dispatch_action(const key_action_t *action) {
     if (!action) return;
+
+    // User input feeds ON_DEMAND power management: keeps the radio alive, or
+    // triggers the 5-press-of-same-key wake gesture after an idle power-down.
+    uint16_t gesture_key = (uint16_t)(((uint16_t)action->type << 8) |
+                                      (action->consumer_code != 0 ? action->consumer_code : action->key_code));
+    wifi_manager_notify_key_press(gesture_key);
 
     app_log("USB_HID", "Emit Action: type=%d, mod=0x%02X, key=0x%02X, cons=0x%04X", 
             action->type, action->modifier, action->key_code, action->consumer_code);

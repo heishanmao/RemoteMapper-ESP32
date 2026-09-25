@@ -60,13 +60,17 @@ bool               wifi_manager_set_policy(wifi_policy_t policy);
 uint32_t           wifi_manager_get_timeout_min(void);
 bool               wifi_manager_set_timeout_min(uint32_t minutes);
 wifi_radio_state_t wifi_manager_get_radio_state(void);
-// Request the radio to be available (broadcasts/WOL/API access). Phase 2 keeps
-// the radio always on when enabled; idle shutdown lands in a later phase.
+// Request the radio to be available (wake from idle power-down or broadcast needs).
 bool               wifi_manager_request_wifi(wifi_wake_reason_t reason);
 // Refresh the "last user-initiated activity" timestamp (idle timeout anchor).
 void               wifi_manager_mark_activity(void);
 // Milliseconds since boot of the last user-initiated activity (0 = none yet).
 uint32_t           wifi_manager_get_last_activity_ms(void);
+// Report a user key press: keeps an ON radio alive, and when the radio was
+// powered down by the ON_DEMAND idle timeout, wakes it after WIFI_WAKE_PRESS_THRESHOLD
+// quick presses of the SAME key within the gesture window. `gesture_key` is an
+// opaque token identifying the physical key (type<<8 | code).
+void               wifi_manager_notify_key_press(uint16_t gesture_key);
 const char*        wifi_manager_policy_str(wifi_policy_t policy);
 const char*        wifi_manager_state_str(wifi_radio_state_t state);
 

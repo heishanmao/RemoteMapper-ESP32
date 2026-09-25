@@ -16,6 +16,12 @@
 
 static ota_status_t s_ota = {0};
 static bool         s_watchdog_armed = false;
+// Partition the running OTA upload is written to; boot is switched to it on
+// success. We use esp_ota_* directly: Arduino's Update library writes otadata
+// with a broken CRC, which makes the bootloader treat it as invalid and never
+// boot the freshly flashed slot.
+static const esp_partition_t* s_ota_target = NULL;
+static esp_ota_handle_t       s_ota_handle = 0;
 
 static void ota_refresh_partition_info(void) {
     const esp_partition_t* running = esp_ota_get_running_partition();
@@ -76,6 +82,16 @@ void ota_manager_init(void) {
             s_ota.target_label ? s_ota.target_label : "-",
             s_ota.target_addr,
             s_ota.target_capacity);
+
+    // Tell the IDF bootloader this image is healthy. When the bootloader is
+    // built with app-rollback enabled, an OTA image stays "pending verify"
+    // and boots get invalidated after a few tries unless the app marks itself
+    // valid here; without this, every OTA reverts to the previous slot forever.
+    esp_err_t mr = esp_ota_mark_app_valid_cancel_rollback();
+    if (mr != ESP_OK) {
+        app_log("OTA", "Warn: esp_ota_mark_app_valid_cancel_rollback failed: %s",
+                esp_err_to_name(mr));
+    }
 #else
     s_ota.enabled = false;
     app_log("INIT", "OTA manager disabled in this build");
@@ -112,9 +128,20 @@ bool ota_manager_begin(uint32_t image_size) {
         app_log("OTA", "OTA begin rejected: image %u > slot capacity %u", image_size, s_ota.target_capacity);
         return false;
     }
-    if (!Update.begin(image_size)) {
-        s_ota.last_error = Update.getError();
-        app_log("OTA", "Update.begin failed: %s", ota_manager_error_str());
+    s_ota_target = esp_ota_get_next_update_partition(NULL);
+    if (s_ota_target == NULL) {
+        s_ota.last_error = UPDATE_ERROR_NO_PARTITION;
+        app_log("OTA", "OTA begin rejected: no OTA partition found");
+        return false;
+    }
+    s_ota_handle = 0;
+    esp_err_t eb = esp_ota_begin(
+        s_ota_target,
+        image_size == UPDATE_SIZE_UNKNOWN ? OTA_WITH_SEQUENTIAL_WRITES : image_size,
+        &s_ota_handle);
+    if (eb != ESP_OK) {
+        s_ota.last_error = UPDATE_ERROR_WRITE;
+        app_log("OTA", "esp_ota_begin failed: %s", esp_err_to_name(eb));
         return false;
     }
     s_ota.in_progress = true;
@@ -129,48 +156,66 @@ bool ota_manager_begin(uint32_t image_size) {
 }
 
 size_t ota_manager_write(const uint8_t* data, size_t len) {
-    if (!s_ota.in_progress) {
+    if (!s_ota.in_progress || s_ota_handle == 0 || len == 0) {
         return 0;
     }
-    size_t written = Update.write(const_cast<uint8_t*>(data), len);
-    if (written > 0) {
-        s_ota.received += written;
+    esp_err_t eb = esp_ota_write(s_ota_handle, data, len);
+    if (eb != ESP_OK) {
+        s_ota.last_error = UPDATE_ERROR_WRITE;
+        app_log("OTA", "esp_ota_write failed at %u: %s", s_ota.received, esp_err_to_name(eb));
+        return 0;
     }
-    s_ota.last_error = Update.getError();
-    return written;
+    s_ota.received += len;
+    return len;
 }
 
 bool ota_manager_end(void) {
     if (!s_ota.in_progress) {
         return false;
     }
-    bool ok = Update.end(true);
-    s_ota.last_success = ok;
-    s_ota.in_progress = false;
-    s_ota.last_error = Update.getError();
-    if (ok) {
-        ota_refresh_partition_info();
-        ota_mark_watchdog_pending();
-        app_log("OTA", "OTA success: next boot from %s@0x%x, safe-boot watchdog armed",
-                s_ota.target_label ? s_ota.target_label : "-", s_ota.target_addr);
-    } else {
-        app_log("OTA", "OTA failed: %s", ota_manager_error_str());
+    esp_err_t eb = esp_ota_end(s_ota_handle);
+    s_ota_handle = 0;
+    if (eb != ESP_OK) {
+        s_ota.last_success = false;
+        s_ota.in_progress = false;
+        s_ota.last_error = UPDATE_ERROR_READ;
+        app_log("OTA", "esp_ota_end (image validation) failed: %s", esp_err_to_name(eb));
+        return false;
     }
-    return ok;
+    // esp_ota_end 已补全镜像并校验，切到新分区即可正确 boot。
+    eb = esp_ota_set_boot_partition(s_ota_target);
+    if (eb != ESP_OK) {
+        s_ota.last_success = false;
+        s_ota.in_progress = false;
+        s_ota.last_error = UPDATE_ERROR_ACTIVATE;
+        app_log("OTA", "Failed to activate new boot partition: %s", esp_err_to_name(eb));
+        return false;
+    }
+    s_ota.last_success = true;
+    s_ota.in_progress = false;
+    ota_refresh_partition_info();
+    ota_mark_watchdog_pending();
+    app_log("OTA", "OTA success: next boot from %s@0x%x, safe-boot watchdog armed",
+            s_ota_target ? s_ota_target->label : "-",
+            s_ota_target ? s_ota_target->address : 0U);
+    return true;
 }
 
 void ota_manager_abort(void) {
     if (!s_ota.in_progress) {
         return;
     }
-    Update.abort();
-    s_ota.last_error = Update.getError();
+    if (s_ota_handle != 0) {
+        esp_ota_abort(s_ota_handle);
+        s_ota_handle = 0;
+    }
+    s_ota.last_error = UPDATE_ERROR_ABORT;
     s_ota.in_progress = false;
     app_log("OTA", "OTA upload aborted");
 }
 
 const char* ota_manager_error_str(void) {
-    switch (Update.getError()) {
+    switch (s_ota.last_error) {
         case UPDATE_ERROR_OK:           return "OK";
         case UPDATE_ERROR_WRITE:        return "Flash 写入失败";
         case UPDATE_ERROR_ERASE:        return "Flash 擦除失败";

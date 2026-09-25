@@ -13,6 +13,7 @@
 #include "config/config_backup.h"
 #include <WebServer.h>
 #include <ArduinoJson.h>
+#include <esp_ota_ops.h>
 
 #ifndef REMOTEMAPPER_OTA
 #define REMOTEMAPPER_OTA 0
@@ -51,6 +52,15 @@ static void handle_status() {
     String ap_pass = wifi_manager_get_ap_pass();
     doc["ap_secured"] = (ap_pass.length() >= 8);
     doc["ap_pass"] = ap_pass;
+    // Run/target OTA partition visibility (diagnostic + upgrade confidence).
+    const esp_partition_t* run_p = esp_ota_get_running_partition();
+    if (run_p != NULL) {
+        doc["ota_running_label"] = run_p->label;
+    }
+    const esp_partition_t* next_p = esp_ota_get_next_update_partition(NULL);
+    if (next_p != NULL) {
+        doc["ota_target_label"] = next_p->label;
+    }
 
     String out;
     serializeJson(doc, out);
@@ -222,6 +232,11 @@ static void handle_power_get() {
     doc["radio_state_str"] = wifi_manager_state_str(wifi_manager_get_radio_state());
     doc["wifi_enabled"] = wifi_manager_get_enabled();
     doc["last_activity_sec"] = wifi_manager_get_last_activity_ms() / 1000;
+    doc["idle_sec"] = millis() / 1000 - wifi_manager_get_last_activity_ms() / 1000;
+    doc["sta_status"] = (int)WiFi.status();
+    doc["sta_connected"] = (WiFi.status() == WL_CONNECTED);
+    doc["ap_running"] = wifi_manager_is_ap_running();
+    doc["uptime_sec"] = millis() / 1000;
     String out;
     serializeJson(doc, out);
     s_server.send(200, "application/json", out);
@@ -342,6 +357,39 @@ static void handle_ota_status() {
     doc["total"] = st->total;
     doc["rollback_armed"] = st->rollback_armed;
     doc["boot_fail_count"] = st->boot_fail_count;
+    // What the IDF bootloader thinks of the currently running image
+    // (pending_verify / valid / invalid). Diagnostic for OTA slot switching.
+    const esp_partition_t* run = esp_ota_get_running_partition();
+    if (run != NULL) {
+        esp_ota_img_states_t st2;
+        if (esp_ota_get_state_partition(run, &st2) == ESP_OK) {
+            switch (st2) {
+                case ESP_OTA_IMG_ABORTED:      doc["image_state"] = "aborted"; break;
+                case ESP_OTA_IMG_UNDEFINED:     doc["image_state"] = "undefined"; break;
+                case ESP_OTA_IMG_INVALID:       doc["image_state"] = "invalid"; break;
+                case ESP_OTA_IMG_VALID:         doc["image_state"] = "valid"; break;
+                case ESP_OTA_IMG_PENDING_VERIFY: doc["image_state"] = "pending_verify"; break;
+                default:                        doc["image_state"] = "unknown"; break;
+            }
+        }
+    }
+    // Run the same image verification the bootloader performs against the
+    // target OTA slot. If the slot holds a valid image this must be ESP_OK,
+    // otherwise it reveals the exact reason the bootloader refuses to boot it.
+    {
+        const esp_partition_t* tgt = esp_ota_get_next_update_partition(NULL);
+        if (tgt != NULL) {
+            esp_partition_pos_t pos = {};
+            pos.offset = tgt->address;
+            pos.size = tgt->size;
+            esp_image_metadata_t meta;
+            memset(&meta, 0, sizeof(meta));
+            esp_err_t ev = esp_image_verify(ESP_IMAGE_VERIFY, &pos, &meta);
+            doc["target_verify"] = esp_err_to_name(ev);
+            doc["target_segments"] = (ev == ESP_OK) ? (int)meta.image.segment_count : -1;
+            doc["target_entry"] = (ev == ESP_OK) ? meta.image.entry_addr : 0;
+        }
+    }
     String out;
     serializeJson(doc, out);
     s_server.send(200, "application/json", out);

@@ -32,8 +32,8 @@ extern "C" {
 // ==========================================
 #define BLE_REMOTE_NAME_PREFIX    "MI RC"
 #define BLE_REMOTE_MAC_PREFIX     "c0:5d:39"
-#define BLE_SCAN_INTERVAL_MS      100
-#define BLE_SCAN_WINDOW_MS        80
+#define BLE_SCAN_INTERVAL_MS      800
+#define BLE_SCAN_WINDOW_MS        200
 #define BLE_KEEP_ALIVE_INTERVAL   2000      // MIC_EXTEND interval during active voice (ms)
 
 // ATVV GATT UUIDs (128-bit)
@@ -74,6 +74,11 @@ extern "C" {
 #define WIFI_DEFAULT_POLICY       1         // default = WIFI_POLICY_ON_DEMAND
 #define WIFI_DEFAULT_TIMEOUT_MIN  5         // Default ON_DEMAND idle timeout (minutes)
 #define WIFI_TIMEOUT_NEVER        0         // 0 = keep radio on until manual off
+
+// 5-press wake gesture: press any remote key N times within the window to wake Wi-Fi
+// after the ON_DEMAND idle power-down.
+#define WIFI_WAKE_PRESS_THRESHOLD 5
+#define WIFI_WAKE_PRESS_WINDOW_MS 5000
 
 #ifdef __cplusplus
 }
