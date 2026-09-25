@@ -112,7 +112,28 @@ CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 ```
+
+## Bootloader-level rollback (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE)
+
+Completes automatic crash recovery for any boot-time failure. The chain requires
+the app-side too — the Arduino-ESP32 core ships with
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` (check `tools/sdk/esp32s3/sdkconfig`),
+and our firmware calls `esp_ota_mark_app_valid_cancel_rollback()` in
+`ota_manager_init()`:
+
+1. After an OTA upload, `esp_ota_set_boot_partition()` writes otadata with
+   `ota_state = ESP_OTA_IMG_NEW (0x0)`.
+2. On the next boot the bootloader sees NEW, marks the entry
+   `ESP_OTA_IMG_PENDING_VERIFY (0x1)` and boots the new slot.
+3. If the app runs, it confirms → state becomes `ESP_OTA_IMG_VALID (0x2)`.
+4. If the app crashes before confirming, the next boot sees PENDING_VERIFY,
+   marks the entry `ESP_OTA_IMG_ABORTED (0x4)` (invalid) and automatically falls
+   back to the other slot.
+
+otadata state values (IDF 4.4, `esp_flash_partitions.h`): NEW=0, PENDING_VERIFY=1,
+VALID=2, INVALID=3, ABORTED=4, UNDEFINED=0xFFFFFFFF.
 
 ## Rescue / unbrick notes
 
