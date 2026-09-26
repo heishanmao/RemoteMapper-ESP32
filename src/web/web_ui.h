@@ -1406,8 +1406,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 }
                 return `[切入: ${tgtName}]`;
             }
-            if (type === 7) return '[语音对讲录音]';
-            if (type === 0 || (!key && !cons && !mod)) return '未映射';
+            if (type === 0 || (!key && !cons && !mod)) {
+                return (type === 7) ? '[语音对讲录音]' : '未映射';
+            }
 
             let parts = [];
             if (mod & 0x01) parts.push('左Ctrl');
@@ -1446,7 +1447,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 }
                 parts.push(name);
             }
-            return parts.join('+');
+            const hotkeyStr = parts.join('+');
+            if (type === 7) {
+                return hotkeyStr ? `[语音: ${hotkeyStr}]` : '[语音对讲录音]';
+            }
+            return hotkeyStr;
         }
 
         function renderLayerTabs() {
@@ -1870,7 +1875,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             if (macInput) macInput.value = mac;
 
             selectedTargetLayer = target_layer;
-            selectActionMode(mode);
+            selectActionMode(mode, true);
             renderTriggerView(mode, mod, key, cons);
             renderTargetLayerButtons();
             document.getElementById('quick-key-select').value = '';
@@ -1885,7 +1890,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             loadTriggerDataToUI(tab);
         }
 
-        function selectActionMode(mode) {
+        function selectActionMode(mode, skipRender = false) {
             currentSelectedMode = mode;
             const inst = document.getElementById('recorder-instruction');
             const quickSelect = document.getElementById('quick-key-select');
@@ -1919,7 +1924,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 if (transBox) transBox.style.display = 'none';
                 if (advActionBox) advActionBox.style.display = 'block';
                 switchAdvSubTab('wol');
-                renderTriggerView(11, 0, 0, 0);
+                if (!skipRender) renderTriggerView(11, 0, 0, 0);
             } else {
                 if (recorderBox) recorderBox.style.display = 'block';
                 if (advContainer) advContainer.style.display = 'block';
@@ -1927,28 +1932,36 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 if (transBox) transBox.style.display = 'none';
                 if (advActionBox) advActionBox.style.display = 'none';
 
-                let curMod = parseInt(document.getElementById('adv-mod').value) || 0;
-                let curCode = parseInt(document.getElementById('adv-code').value) || 0;
+                let curMod = parseHexOrDec(document.getElementById('adv-mod').value) || 0;
+                let curCode = parseHexOrDec(document.getElementById('adv-code').value) || 0;
 
                 if (mode === 4) {
                     if (inst) inst.innerHTML = '<b>多媒体控制模式</b>：在下方下拉框中选择具体的控制功能';
                     let curCons = curCode >= 500 ? curCode : 545;
-                    renderTriggerView(4, 0, 0, curCons);
-                    if (quickSelect) quickSelect.value = `c:0:${curCons}`;
+                    if (!skipRender) {
+                        renderTriggerView(4, 0, 0, curCons);
+                        if (quickSelect) quickSelect.value = `c:0:${curCons}`;
+                    }
                 } else if (mode === 1) {
                     if (inst) inst.innerHTML = '<b>单次点按模式</b>：按下按键发送一次按键或组合快捷键（敲击键盘直接录制）';
-                    let curKey = (curCode > 0 && curCode < 500) ? curCode : 0x28;
-                    renderTriggerView(1, curMod, curKey, 0);
+                    let curKey = (curCode > 0 && curCode < 500) ? curCode : ((curMod > 0) ? 0 : 0x28);
+                    if (!skipRender) renderTriggerView(1, curMod, curKey, 0);
                     startKeyboardRecording();
                 } else if (mode === 2) {
                     if (inst) inst.innerHTML = '<b>键盘直通模式</b>：按住按键时持续发送（敲击键盘直接录制）';
-                    let curKey = (curCode > 0 && curCode < 500) ? curCode : 0x2C;
-                    renderTriggerView(2, curMod, curKey, 0);
+                    let curKey = (curCode > 0 && curCode < 500) ? curCode : ((curMod > 0) ? 0 : 0x2C);
+                    if (!skipRender) renderTriggerView(2, curMod, curKey, 0);
                     startKeyboardRecording();
                 } else if (mode === 7) {
+<<<<<<< HEAD
                     if (inst) inst.innerHTML = '<b>语音按键快捷键</b>：敲击键盘录制录音时发送的快捷键（默认 右Alt+,；支持左/右 Alt、Ctrl、Shift、Win 组合）';
-                    let curKey = (curCode > 0 && curCode < 500) ? curCode : 54;
-                    renderTriggerView(7, curMod || 64, curKey, 0);
+                    let curKey = (curCode > 0 && curCode < 500) ? curCode : ((curMod > 0) ? 0 : 54);
+                    if (!skipRender) renderTriggerView(7, (curMod || curKey) ? curMod : 64, curKey, 0);
+=======
+                    if (inst) inst.innerHTML = '<b>语音按键快捷键</b>：敲击键盘录制录音时发送的快捷键（如 Alt+, 或 Win+H）';
+                    let curKey = (curCode > 0 && curCode < 500) ? curCode : ((curMod > 0) ? 0 : 54);
+                    if (!skipRender) renderTriggerView(7, (curMod || curKey ? curMod : 64), curKey, 0);
+>>>>>>> 5205936 (fix(web): preserve pure modifier keycode 0 on modal open to prevent ghost comma)
                     startKeyboardRecording();
                 }
             }
@@ -2242,8 +2255,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 document.getElementById('long-press-header').style.display = 'none';
                 document.getElementById('double-click-header').style.display = 'none';
                 currentTriggerTab = 'click';
-                selectActionMode(7);
-                renderTriggerView(7, editingBinding.click_mod || 64, editingBinding.click_key || 54, 0);
+                selectActionMode(7, true);
+                const vMod = (editingBinding.click_mod !== undefined) ? editingBinding.click_mod : 64;
+                const vKey = (editingBinding.click_key !== undefined) ? editingBinding.click_key : 54;
+                renderTriggerView(7, vMod, vKey, 0);
             } else {
                 document.getElementById('trigger-tab-bar').style.display = 'flex';
                 document.getElementById('mode-selector-grid').style.display = 'grid';
