@@ -60,6 +60,11 @@ void usb_composite_init(void) {
             for (uint8_t ep = 1; ep <= 4; ep++) {
                 usbd_edpt_clear_stall(0, (uint8_t)(ep | 0x80));
             }
+            // Host (re-)enumerated us: boot, PC reboot, or Device Manager
+            // re-enable. The user is at the PC, so make the web UI reachable
+            // in case the on-demand idle timeout had powered the radio down.
+            // Deferred wake: processed in the main-loop context, race-free.
+            wifi_manager_notify_usb_mounted();
         } else if (id == ARDUINO_USB_STOPPED_EVENT) {
             app_log("USB", "USB Stopped / Bus Reset");
         }

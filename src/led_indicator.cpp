@@ -17,12 +17,34 @@ static uint32_t s_layer_color = 0x00FF00; // Default green for Layer 0
 static bool s_layer_flash = false;
 static bool s_low_battery = false;
 
+// Master brightness levels (0..255). The DevKit's WS2812 is very visible even
+// at low duty, so steady states stay extremely dim and short pulses carry the
+// feedback. Tune these two numbers to taste.
+#define LED_STEADY_BRIGHT   6   // steady/idle states (was ~20-24)
+#define LED_PULSE_BRIGHT    12  // flashes / heartbeat / alert pulses (was ~24-36)
+
+// Last colour actually pushed to the LED. neopixelWrite drives the RMT
+// peripheral with tight timing, so only write when the colour really changes.
+static uint32_t s_last_rgb = 0xFFFFFFFFu;
+
+static uint32_t dim_rgb(uint32_t rgb, uint8_t level) {
+    uint8_t r = (uint8_t)(((rgb >> 16) & 0xFF) * level / 255);
+    uint8_t g = (uint8_t)(((rgb >> 8) & 0xFF) * level / 255);
+    uint8_t b = (uint8_t)((rgb & 0xFF) * level / 255);
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+static void apply_led_color(uint32_t rgb) {
+    if (s_last_rgb == rgb) {
+        return;
+    }
+    s_last_rgb = rgb;
+    neopixelWrite(RGB_BUILTIN, (rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+}
+
 static void update_hardware_led(led_state_t state) {
     if (s_layer_flash && s_is_flashing) {
-        uint8_t r = (uint8_t)(((s_layer_color >> 16) & 0xFF) * 36 / 255);
-        uint8_t g = (uint8_t)(((s_layer_color >> 8) & 0xFF) * 36 / 255);
-        uint8_t b = (uint8_t)((s_layer_color & 0xFF) * 36 / 255);
-        neopixelWrite(RGB_BUILTIN, r, g, b);
+        apply_led_color(dim_rgb(s_layer_color, LED_PULSE_BRIGHT));
         return;
     }
 
@@ -30,40 +52,41 @@ static void update_hardware_led(led_state_t state) {
     if (s_low_battery && state == LED_STATE_CONNECTED) {
         uint32_t phase = millis() % 2000;
         if ((phase < 120) || (phase >= 220 && phase < 340)) {
-            neopixelWrite(RGB_BUILTIN, 32, 32, 32); // Crisp White flash
+            apply_led_color(0x0C0C0Cu); // dim white pulse
             return;
         }
     }
 
     switch (state) {
-        case LED_STATE_WAIT_CONNECTION:
-            neopixelWrite(RGB_BUILTIN, 24, 0, 0); // Red
-            break;
-        case LED_STATE_CONNECTED: {
-            uint8_t r = (uint8_t)(((s_layer_color >> 16) & 0xFF) * 20 / 255);
-            uint8_t g = (uint8_t)(((s_layer_color >> 8) & 0xFF) * 20 / 255);
-            uint8_t b = (uint8_t)((s_layer_color & 0xFF) * 20 / 255);
-            neopixelWrite(RGB_BUILTIN, r, g, b);
+        case LED_STATE_WAIT_CONNECTION: {
+            // Slow heartbeat instead of a steady red LED (150ms pulse / 4s).
+            uint32_t phase = millis() % 4000;
+            apply_led_color((phase < 150) ? 0x0C0000u : 0x020000u);
             break;
         }
+        case LED_STATE_CONNECTED:
+            apply_led_color(dim_rgb(s_layer_color, LED_STEADY_BRIGHT));
+            break;
         case LED_STATE_MIC_STREAMING:
-            neopixelWrite(RGB_BUILTIN, 0, 0, 24); // Blue
+            apply_led_color(0x00000Cu); // dim blue
             break;
         case LED_STATE_HID_KEY_PRESS:
-            neopixelWrite(RGB_BUILTIN, 24, 24, 0); // Yellow
+            apply_led_color(0x0C0C00u); // dim yellow flash
             break;
         case LED_STATE_MIC_KEY_PRESS:
-            neopixelWrite(RGB_BUILTIN, 24, 0, 0); // Red flash
+            apply_led_color(0x0C0000u); // dim red flash
             break;
         default:
-            neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off
+            apply_led_color(0x000000u); // Off
             break;
     }
 }
 
 static void led_task(void *arg) {
     while (1) {
+        bool fast = false;
         if (s_is_flashing) {
+            fast = true;
             if (millis() > s_flash_expire_time) {
                 s_is_flashing = false;
                 update_hardware_led(s_current_base_state);
@@ -73,7 +96,16 @@ static void led_task(void *arg) {
         } else {
             update_hardware_led(s_current_base_state);
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
+
+        // Only animate when needed: flashes and the low-battery pulse run at
+        // 20ms; the wait-connection heartbeat at 50ms; everything else 100ms.
+        uint32_t tick_ms = 100;
+        if (fast || (s_low_battery && s_current_base_state == LED_STATE_CONNECTED)) {
+            tick_ms = 20;
+        } else if (s_current_base_state == LED_STATE_WAIT_CONNECTION) {
+            tick_ms = 50;
+        }
+        vTaskDelay(pdMS_TO_TICKS(tick_ms));
     }
 }
 

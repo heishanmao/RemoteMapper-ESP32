@@ -31,6 +31,11 @@ static uint32_t           s_timeout_min      = WIFI_DEFAULT_TIMEOUT_MIN;
 static wifi_radio_state_t s_radio_state      = WIFI_STATE_OFF;
 static uint32_t           s_last_activity_ms = 0;
 
+// Deferred radio wake requested by the USB stack (host re-enumeration).
+// Consumed by wifi_manager_task() in the main-loop context so it can never
+// race the synchronous radio bring-up inside wifi_manager_init() at boot.
+static volatile bool      s_pending_usb_wake = false;
+
 static bool wifi_is_valid_timeout(uint32_t minutes) {
     return minutes == WIFI_TIMEOUT_NEVER || minutes == 1 || minutes == 5 ||
            minutes == 10 || minutes == 30;
@@ -260,6 +265,13 @@ bool wifi_manager_request_wifi(wifi_wake_reason_t reason) {
     return s_radio_state != WIFI_STATE_OFF;
 }
 
+void wifi_manager_notify_usb_mounted(void) {
+    // Only set the flag; the actual radio wake is deferred to
+    // wifi_manager_task() (main-loop context) to avoid racing the
+    // synchronous bring-up in wifi_manager_init() during boot.
+    s_pending_usb_wake = true;
+}
+
 const char* wifi_manager_policy_str(wifi_policy_t policy) {
     switch (policy) {
         case WIFI_POLICY_ALWAYS_ON: return "always_on";
@@ -288,6 +300,13 @@ void wifi_manager_task(void) {
     }
 
     uint32_t now = millis();
+
+    // Deferred USB wake (host re-enumerated us): safe to act on here because
+    // setup() has completed and wifi_manager_init() is no longer mid-bring-up.
+    if (s_pending_usb_wake) {
+        s_pending_usb_wake = false;
+        wifi_manager_request_wifi(WIFI_WAKE_SYSTEM);
+    }
 
     // ON_DEMAND: power down the STA radio after the idle timeout.
     // Any user input (wifi_manager_request_wifi) wakes it back up.

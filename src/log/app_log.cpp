@@ -10,6 +10,11 @@ extern USBCDC USBSerial;
 #endif
 
 static bool s_cdc_log_enabled = false;
+// Whether routine logs are mirrored to the UART console. Kept on during boot
+// (so bring-up is visible) and muted afterwards to save power and stop the
+// USB-UART bridge activity LED from blinking. The in-memory ring buffer keeps
+// recording regardless, so the web /api/logs view is unaffected.
+static bool s_console_log_enabled = true;
 
 #define STATIC_LOG_LINES 250
 #define LOG_LINE_MAX_LEN 160
@@ -40,7 +45,7 @@ void app_log(const char* tag, const char* format, ...) {
     snprintf(full_line, sizeof(full_line), "[%04u.%03u] [%s] %s", (unsigned int)sec, (unsigned int)ms, tag, msg_buf);
 
     // 1. Output to Serial safely (if USB CDC is ready)
-    if (Serial) {
+    if (s_console_log_enabled && Serial) {
         Serial.println(full_line);
     }
 #if !ARDUINO_USB_CDC_ON_BOOT
@@ -61,18 +66,31 @@ void app_log(const char* tag, const char* format, ...) {
 }
 
 String app_log_get_json(void) {
-    JsonDocument doc;
-    JsonArray arr = doc["logs"].to<JsonArray>();
+    // Snapshot a bounded number of recent lines under the lock, then build the
+    // JSON outside the critical section. This avoids allocating heap while
+    // interrupts are masked (which could stall or crash the web task) and caps
+    // the response size so /api/logs stays responsive.
+    static const size_t MAX_LINES = 120;
+    static char snapshot[MAX_LINES][LOG_LINE_MAX_LEN];
 
+    size_t n = 0;
     taskENTER_CRITICAL(&s_log_mux);
-    size_t start_idx = (s_log_count < STATIC_LOG_LINES) ? 0 : s_log_head;
-    for (size_t i = 0; i < s_log_count; i++) {
-        size_t idx = (start_idx + i) % STATIC_LOG_LINES;
-        arr.add(s_log_lines[idx]);
+    n = (s_log_count < MAX_LINES) ? s_log_count : MAX_LINES;
+    size_t start_idx = (s_log_head + STATIC_LOG_LINES - n) % STATIC_LOG_LINES;
+    for (size_t i = 0; i < n; i++) {
+        strncpy(snapshot[i], s_log_lines[(start_idx + i) % STATIC_LOG_LINES], LOG_LINE_MAX_LEN - 1);
+        snapshot[i][LOG_LINE_MAX_LEN - 1] = '\0';
     }
     taskEXIT_CRITICAL(&s_log_mux);
 
+    JsonDocument doc;
+    JsonArray arr = doc["logs"].to<JsonArray>();
+    for (size_t i = 0; i < n; i++) {
+        arr.add(snapshot[i]);
+    }
+
     String out;
+    out.reserve(n * 64 + 24);
     serializeJson(doc, out);
     return out;
 }
@@ -90,4 +108,12 @@ void app_log_set_cdc_enabled(bool enabled) {
 
 bool app_log_get_cdc_enabled(void) {
     return s_cdc_log_enabled;
+}
+
+void app_log_set_console_enabled(bool enabled) {
+    s_console_log_enabled = enabled;
+}
+
+bool app_log_get_console_enabled(void) {
+    return s_console_log_enabled;
 }

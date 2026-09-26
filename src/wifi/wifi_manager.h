@@ -62,6 +62,10 @@ bool               wifi_manager_set_timeout_min(uint32_t minutes);
 wifi_radio_state_t wifi_manager_get_radio_state(void);
 // Request the radio to be available (wake from idle power-down or broadcast needs).
 bool               wifi_manager_request_wifi(wifi_wake_reason_t reason);
+// Deferred variant safe to call from any task (e.g. the USB event task):
+// the actual wake is processed by wifi_manager_task() in the main-loop
+// context, so it cannot race the synchronous bring-up in wifi_manager_init().
+void               wifi_manager_notify_usb_mounted(void);
 // Refresh the "last user-initiated activity" timestamp (idle timeout anchor).
 void               wifi_manager_mark_activity(void);
 // Milliseconds since boot of the last user-initiated activity (0 = none yet).

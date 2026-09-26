@@ -28,6 +28,7 @@ static void handle_root() {
 }
 
 static void handle_status() {
+    wifi_manager_mark_activity();
     JsonDocument doc;
     doc["firmware"] = FIRMWARE_NAME;
     doc["version"] = FIRMWARE_VERSION;
@@ -68,6 +69,7 @@ static void handle_status() {
 }
 
 static void handle_logs() {
+    wifi_manager_mark_activity();
     String json = app_log_get_json();
     s_server.send(200, "application/json", json);
 }
@@ -164,6 +166,10 @@ static void handle_keymap_telemetry() {
 }
 
 static void handle_ble_scan() {
+    // Connected state keeps the scan radio OFF (power save): ask the BLE task
+    // for a short burst so the next poll returns a fresh device list.
+    wifi_manager_mark_activity();
+    ble_remote_request_scan_burst();
     String json = ble_remote_scan_devices_json();
     s_server.send(200, "application/json", json);
 }

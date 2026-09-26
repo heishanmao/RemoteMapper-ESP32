@@ -38,6 +38,27 @@ struct DiscoveredBleDevice {
 static std::vector<DiscoveredBleDevice> s_discovered_devices;
 static portMUX_TYPE                    s_disc_mux = portMUX_INITIALIZER_UNLOCKED;
 
+// BLE advertisements around the house often carry "names" that are actually
+// binary payloads (temperature counters, control bytes, ...). ArduinoJson only
+// escapes the seven classic sequences, so a raw control character (< 0x20 or
+// 0x7F) inside a name produces invalid JSON and the WebUI device list dies
+// with "Bad control character in string literal". Keep only printable ASCII;
+// UTF-8 lead/continuation bytes (>= 0x80) pass through untouched.
+static String sanitize_ble_name(const String& in) {
+    String out;
+    out.reserve(in.length());
+    for (size_t i = 0; i < in.length(); ++i) {
+        unsigned char c = (unsigned char)in.charAt(i);
+        if (c >= 0x20 && c != 0x7F) {
+            out += (char)c;
+        }
+    }
+    if (out.length() == 0) {
+        return "Unnamed BLE Device";
+    }
+    return out;
+}
+
 // Asynchronous Request flags from other tasks (e.g. WebServer on Core 1)
 static volatile bool                   s_req_unpair = false;
 static volatile bool                   s_req_reconnect = false;
@@ -53,10 +74,26 @@ static uint32_t                        s_last_scan_ms = 0;
 static uint32_t                        s_last_keepalive_ms = 0;
 static size_t                          s_frame_size = AUDIO_DEFAULT_FRAME_BYTES;
 
+// Power save: while connected, no continuous scan. WebUI requests short
+// on-demand bursts (BLE_SCAN_BURST_SECS) to refresh its device list.
+#define BLE_SCAN_BURST_SECS 3
+static volatile bool                   s_req_scan_burst = false;
+static uint32_t                        s_scan_burst_until_ms = 0;
+
+// Disconnected scan backoff: the longer the remote stays away, the less often we
+// scan (window stays BLE_SCAN_WINDOW_MS). Keeps reconnect fast right after a
+// drop while cutting radio duty when the remote is off/asleep.
+#define BLE_SCAN_TIER1_AFTER_MS   30000UL    // >30s away -> medium duty
+#define BLE_SCAN_TIER2_AFTER_MS   300000UL   // >5min away -> low duty
+#define BLE_SCAN_MED_INTERVAL_MS  2400       // 200/2400 = 8.3% duty
+#define BLE_SCAN_SLOW_INTERVAL_MS 4800       // 200/4800 = 4.2% duty
+static uint32_t                        s_disconnected_since_ms = 0;
+static uint8_t                         s_scan_tier = 0;
+
 extern key_mapper_engine_t g_key_engine;
 
 // Forward Declarations
-static void start_scan();
+static void start_scan(uint16_t interval_ms = BLE_SCAN_INTERVAL_MS);
 static bool do_connect_adv_device(NimBLEAdvertisedDevice* advDevice);
 static bool do_connect_mac(const String& mac_str, uint8_t addr_type);
 static bool setup_services_and_handshake();
@@ -291,7 +328,10 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
         bool found = false;
         for (auto& item : s_discovered_devices) {
             if (item.mac.equalsIgnoreCase(addr)) {
-                if (name.length() > 0) item.name = name;
+                if (name.length() > 0) {
+                    String clean = sanitize_ble_name(name);
+                    if (clean.length() > 0) item.name = clean;
+                }
                 item.rssi = advertisedDevice->getRSSI();
                 item.type = (uint8_t)advertisedDevice->getAddress().getType();
                 item.last_seen_ms = now;
@@ -304,7 +344,7 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
                 s_discovered_devices.erase(s_discovered_devices.begin());
             }
             DiscoveredBleDevice d;
-            d.name = (name.length() > 0) ? name : "Unnamed BLE Device";
+            d.name = (name.length() > 0) ? sanitize_ble_name(name) : "Unnamed BLE Device";
             d.mac = addr;
             d.rssi = advertisedDevice->getRSSI();
             d.type = (uint8_t)advertisedDevice->getAddress().getType();
@@ -383,7 +423,7 @@ class ClientCallbacks : public NimBLEClientCallbacks {
     }
 };
 
-static void start_scan() {
+static void start_scan(uint16_t interval_ms) {
     if (s_do_connect || s_ble_state == BLE_STATE_CONNECTING || s_ble_state >= BLE_STATE_CONNECTED) {
         return;
     }
@@ -392,10 +432,37 @@ static void start_scan() {
     s_last_scan_ms = millis();
     NimBLEScan* pScan = NimBLEDevice::getScan();
     pScan->setActiveScan(false); // passive: no probe requests (saves TX power)
+    pScan->setInterval(interval_ms);
+    pScan->setWindow(BLE_SCAN_WINDOW_MS);
+    // Non-blocking continuous scan (3-arg overload, null completion callback):
+    // keeps the BLE task responsive so connect requests and WebUI scan bursts
+    // are still serviced while searching for the remote.
+    pScan->start(0, nullptr, false);
+    app_log("BLE", "Continuous passive scanning active (interval %ums, duty %u%%)...",
+            (unsigned)interval_ms, (unsigned)(BLE_SCAN_WINDOW_MS * 100 / interval_ms));
+}
+
+// Short on-demand scan burst for the WebUI device list. Runs ALONGSIDE an
+// active connection and therefore must not touch s_ble_state; it only feeds
+// the discovered-device cache. Auto-stops after BLE_SCAN_BURST_SECS.
+static void start_web_scan_burst() {
+    uint32_t now = millis();
+    NimBLEScan* pScan = NimBLEDevice::getScan();
+    // The controller's scan state can be stale (isScanning() desync, e.g. after
+    // a handshake or an interrupted continuous scan), so always force a clean
+    // timed burst rather than trusting it. When disconnected the continuous
+    // scan is restarted by step 3 once the burst window closes.
+    if (pScan->isScanning()) {
+        pScan->stop();
+    }
+    pScan->setActiveScan(false);
     pScan->setInterval(BLE_SCAN_INTERVAL_MS);
     pScan->setWindow(BLE_SCAN_WINDOW_MS);
-    pScan->start(0, false); // 0 = continuous scan until stopped
-    app_log("BLE", "Continuous passive scanning for Xiaomi Bluetooth Remote active...");
+    // Non-blocking timed burst (3-arg overload with a null completion callback):
+    // the controller auto-stops after the window, so the BLE task keeps running.
+    pScan->start(BLE_SCAN_BURST_SECS, nullptr, false);
+    s_scan_burst_until_ms = now + BLE_SCAN_BURST_SECS * 1000;
+    app_log("BLE", "WebUI scan burst (%us) started...", (unsigned)BLE_SCAN_BURST_SECS);
 }
 
 static bool setup_services_and_handshake() {
@@ -581,7 +648,9 @@ static bool setup_services_and_handshake() {
 
     // 3. Negotiate data length and connection parameters
     s_client->setDataLen(251);
-    s_client->updateConnParams(30, 30, 0, 400); // 37.5ms interval (was 15ms) to cut idle link TX
+    // 40 units = 50ms connection interval (was 37.5ms): modest increase to cut
+    // idle link TX further while keeping key/voice latency acceptable.
+    s_client->updateConnParams(40, 40, 0, 400);
 
     // 4. ATVV Handshake: query CAPS capability only. Do NOT force mic open at boot.
     if (s_char_cmd) {
@@ -620,10 +689,10 @@ static bool do_connect_adv_device(NimBLEAdvertisedDevice* advDevice) {
         return false;
     }
 
-    s_connected_name = advDevice->getName().c_str();
+    s_connected_name = sanitize_ble_name(advDevice->getName().c_str());
     s_connected_mac = advDevice->getAddress().toString().c_str();
     s_bound_addr_type = advDevice->getAddress().getType();
-    if (s_connected_name.length() == 0) {
+    if (advDevice->getName().length() == 0) {
         s_connected_name = (s_bound_name.length() > 0) ? s_bound_name : "Xiaomi Voice Remote";
     }
 
@@ -753,6 +822,13 @@ void ble_remote_task(void) {
     // 2. Process asynchronous connection requests from FreeRTOS task
     if (s_do_connect) {
         s_do_connect = false;
+        // A continuous-scan restart can slip in between the scan callback
+        // queueing this connect and this tick (the state machine has not
+        // advanced yet). Kill it: scanning through a connect keeps the radio
+        // receiver on for the whole session (major idle power waste).
+        if (NimBLEDevice::getScan()->isScanning()) {
+            NimBLEDevice::getScan()->stop();
+        }
         if (s_client && s_client->isConnected()) {
             s_client->disconnect();
             vTaskDelay(pdMS_TO_TICKS(50));
@@ -770,12 +846,70 @@ void ble_remote_task(void) {
         }
     }
 
-    // 3. Auto Re-scan: If not connected, not connecting, and scan is inactive, restart continuous scan
+    // 3. Auto Re-scan with backoff: while the remote is away, scan less often
+    // the longer it stays away (fast right after a drop, then medium/low duty).
     if (s_ble_state < BLE_STATE_CONNECTING && !s_do_connect && !s_req_unpair && !s_req_reconnect) {
-        if (!NimBLEDevice::getScan()->isScanning()) {
-            start_scan();
+        if (s_disconnected_since_ms == 0) {
+            s_disconnected_since_ms = now;
+        }
+        uint32_t away = now - s_disconnected_since_ms;
+        uint16_t want_interval = BLE_SCAN_INTERVAL_MS;
+        uint8_t tier = 0;
+        if (away >= BLE_SCAN_TIER2_AFTER_MS) {
+            want_interval = BLE_SCAN_SLOW_INTERVAL_MS;
+            tier = 2;
+        } else if (away >= BLE_SCAN_TIER1_AFTER_MS) {
+            want_interval = BLE_SCAN_MED_INTERVAL_MS;
+            tier = 1;
+        }
+
+        bool need_start = !NimBLEDevice::getScan()->isScanning();
+        if (need_start || tier != s_scan_tier) {
+            // Do not fight an active WebUI burst.
+            if (s_scan_burst_until_ms == 0 || now >= s_scan_burst_until_ms) {
+                s_scan_tier = tier;
+                start_scan(want_interval);
+            }
+        }
+    } else {
+        // Connected or connecting: reset the away-timer for the next drop.
+        s_disconnected_since_ms = 0;
+        s_scan_tier = 0;
+    }
+
+    // 3b. Power save: never keep the radio scanning while connecting or
+    // connected. While connected, only an active WebUI burst is tolerated.
+    if (s_ble_state >= BLE_STATE_CONNECTING && NimBLEDevice::getScan()->isScanning()) {
+        bool burst_active = (s_ble_state >= BLE_STATE_CONNECTED) &&
+                            (s_scan_burst_until_ms != 0) && (now < s_scan_burst_until_ms);
+        if (!burst_active) {
+            NimBLEDevice::getScan()->stop();
         }
     }
+
+    // 3c. WebUI requested a scan burst (fresh device list).
+    if (s_req_scan_burst) {
+        s_req_scan_burst = false;
+        // Allowed while disconnected/scanning or connected; not while a
+        // connection is in progress (would disturb the handshake).
+        if (s_ble_state != BLE_STATE_CONNECTING && s_ble_state != BLE_STATE_TALKING &&
+            !s_do_connect && !s_req_unpair && !s_req_reconnect) {
+            start_web_scan_burst();
+        }
+    }
+
+    // 3d. Diagnostic: report how many devices a finished burst collected.
+    static bool s_burst_was_active = false;
+    uint32_t burst_ms = millis();
+    bool burst_now = (s_scan_burst_until_ms != 0) && (burst_ms < s_scan_burst_until_ms);
+    if (s_burst_was_active && !burst_now) {
+        portENTER_CRITICAL(&s_disc_mux);
+        size_t n = s_discovered_devices.size();
+        portEXIT_CRITICAL(&s_disc_mux);
+        app_log("BLE", "Scan burst finished: %u device(s) cached", (unsigned)n);
+        s_scan_burst_until_ms = 0;
+    }
+    s_burst_was_active = burst_now;
 
     // 4. Background recovery if ATVV was missed during handshake (runs safely on Core 0 FreeRTOS task)
     if (s_ble_state >= BLE_STATE_CONNECTED && s_client && s_client->isConnected() && s_char_cmd == nullptr) {
@@ -838,8 +972,14 @@ String ble_remote_scan_devices_json(void) {
     JsonDocument doc;
     JsonArray arr = doc["devices"].to<JsonArray>();
 
+    uint32_t now = millis();
     portENTER_CRITICAL(&s_disc_mux);
     for (const auto& dev : s_discovered_devices) {
+        // Only report devices the scan actually saw recently; without the
+        // continuous scan the cache is no longer self-purging on every event.
+        if (now - dev.last_seen_ms > 20000) {
+            continue;
+        }
         JsonObject obj = arr.add<JsonObject>();
         obj["name"] = dev.name;
         obj["mac"] = dev.mac;
@@ -851,6 +991,10 @@ String ble_remote_scan_devices_json(void) {
     String out;
     serializeJson(doc, out);
     return out;
+}
+
+void ble_remote_request_scan_burst(void) {
+    s_req_scan_burst = true;
 }
 
 bool ble_remote_connect_target(const String& mac_str, uint8_t addr_type, const String& dev_name) {

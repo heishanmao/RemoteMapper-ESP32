@@ -32,7 +32,11 @@ static void ble_task_core0(void* param) {
 }
 
 void setup() {
-    // 0. Initialize Flash NVS with auto-recovery for corrupted partitions
+    // 0. Lower CPU clock to cut dynamic power/heat. Must run before peripheral
+    //    init; the S3 keeps USB and the radios valid at 160 MHz.
+    setCpuFrequencyMhz(160);
+
+    // 0.1 Initialize Flash NVS with auto-recovery for corrupted partitions
     esp_err_t nvs_err = nvs_flash_init();
     if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
@@ -54,6 +58,7 @@ void setup() {
     app_log("SYSTEM", " %s v%s (%s)", FIRMWARE_NAME, FIRMWARE_VERSION, HARDWARE_TARGET);
     app_log("SYSTEM", " Xiaomi Remote Hardware Bridge (BLE -> USB + Web)");
     app_log("SYSTEM", "==================================================");
+    app_log("SYSTEM", "CPU frequency: %u MHz", (unsigned)(getCpuFrequencyMhz()));
 
     // 3. Initialize Audio Pipeline
     audio_pipeline_init(&g_audio_pipeline);
@@ -102,6 +107,13 @@ void setup() {
     } else {
         app_log("SYSTEM", "System initialization complete. Wi-Fi radio off (use CDC/UART: 'wifi on')");
     }
+
+    // Mute routine UART console logs now that bring-up is done: saves power and
+    // stops the USB-UART bridge activity LED from blinking. The web /api/logs
+    // ring buffer keeps recording; re-enable with the CLI command
+    // 'log console on' (or 'log on' to mirror to USB CDC).
+    app_log("SYSTEM", "Console UART logs muted (web /api/logs + 'log console on' still work)");
+    app_log_set_console_enabled(false);
 }
 
 void loop() {
@@ -124,6 +136,8 @@ void loop() {
     // 5. Confirm safe-boot watchdog once the new firmware has run stably
     ota_manager_watchdog_confirm();
 
-    // No delay here — USB audio task handles its own timing via vTaskDelayUntil
-    vTaskDelay(1); // yield to let higher-priority tasks run (USB, BLE)
+    // USB audio task handles its own timing via vTaskDelayUntil. Keep this a
+    // few ms so the loop does not spin (Core 1 wakeups) while still servicing
+    // the web server promptly.
+    vTaskDelay(pdMS_TO_TICKS(3)); // yield to let higher-priority tasks run (USB, BLE)
 }

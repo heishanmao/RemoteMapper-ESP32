@@ -14,6 +14,8 @@ String app_log_get_json(void);
 void app_log_clear(void);
 void app_log_set_cdc_enabled(bool enabled);
 bool app_log_get_cdc_enabled(void);
+void app_log_set_console_enabled(bool enabled);
+bool app_log_get_console_enabled(void);
 
 #ifdef __cplusplus
 }

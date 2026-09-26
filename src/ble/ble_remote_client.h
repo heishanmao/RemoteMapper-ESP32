@@ -44,6 +44,15 @@ void ble_remote_trigger_reconnect(void);
 String ble_remote_scan_devices_json(void);
 
 /**
+ * @brief Ask the BLE task to run a short on-demand scan burst.
+ *
+ * While the remote is connected the continuous background scan is stopped
+ * (radio power save); the WebUI calls this before reading the device list
+ * so it gets a fresh burst instead of a stale cache.
+ */
+void ble_remote_request_scan_burst(void);
+
+/**
  * @brief Manually connect and pair to specific BLE device by MAC address, address type, and optional name
  */
 bool ble_remote_connect_target(const String& mac_str, uint8_t addr_type, const String& dev_name);

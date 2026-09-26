@@ -168,9 +168,18 @@ static void handle_log_command(const String& arg) {
         app_log_set_cdc_enabled(false);
         cli_write_line("{\"status\":\"ok\",\"cdc_log_enabled\":false}");
         cli_write_line("CDC 日志镜像已关闭（UART 日志不受影响）");
+    } else if (arg.equalsIgnoreCase("console on")) {
+        app_log_set_console_enabled(true);
+        cli_write_line("{\"status\":\"ok\",\"console_log_enabled\":true}");
+        cli_write_line("UART 控制台日志已开启");
+    } else if (arg.equalsIgnoreCase("console off")) {
+        app_log_set_console_enabled(false);
+        cli_write_line("{\"status\":\"ok\",\"console_log_enabled\":false}");
+        cli_write_line("UART 控制台日志已关闭（仅影响 UART 输出，网页日志保留）");
     } else {
         JsonDocument doc;
         doc["cdc_log_enabled"] = app_log_get_cdc_enabled();
+        doc["console_log_enabled"] = app_log_get_console_enabled();
         String out;
         serializeJson(doc, out);
         cli_write_line(out);
@@ -233,7 +242,8 @@ static void handle_command(const String& line) {
         cli_write_line("  wifi timeout [1|5|10|30|never] - Get/set ON_DEMAND idle timeout (min)");
         cli_write_line("  wifi status   - Show Wi-Fi radio & connection status (JSON)");
         cli_write_line("  log on|off    - Mirror full logs to USB CDC (default: off)");
-        cli_write_line("  log status    - Show CDC log mirror state (JSON)");
+        cli_write_line("  log console on|off - Mute/enable routine UART console logs (default: muted after boot)");
+        cli_write_line("  log status    - Show log mirror/console state (JSON)");
         cli_write_line("  help          - Show available commands");
     }
     else {
