@@ -7,6 +7,9 @@
 #include "device/usbd_pvt.h"
 
 #define UAC_DESC_TOTAL_LEN  108
+#define UAC_TX_BLOCK_SAMPLES 32
+#define UAC_TX_BLOCK_BYTES   (UAC_TX_BLOCK_SAMPLES * 2)
+#define UAC_TX_BLOCKS        2
 
 static uint8_t s_uac_ep_in   = 0;
 static uint8_t s_uac_itf_ac  = 0;
@@ -20,47 +23,35 @@ static bool          s_uac_initialized = false;
 static uint8_t  s_mic_mute   = 0;
 static int16_t  s_mic_volume = 0x0000;
 
-static DRAM_ATTR int16_t s_tx_buf[32]; // 32 samples (64 bytes) for 2ms batches
-
-// We cannot use xfer_cb because queuing inside xfer_cb misses alternating frames (500Hz).
-// The solution: A dedicated 500Hz FreeRTOS task (every 2ms). It reads 32 samples
-// (64 bytes) and sends them. Because 2ms > 1ms, the USB hardware is guaranteed to
-// be free. The average rate is exactly 16000 samples/sec, which Windows UAC perfectly
-// absorbs despite the 1ms endpoint polling rate.
-// ---------------------------------------------------------------------------
+// Double-buffered TX blocks (64B each). A dedicated 500Hz task fills + submits
+// one block every 2ms. We never re-queue inside the xfer callback: queueing in
+// the callback races the 2ms token and is what caused the endpoint to stall
+// (see git history / original comments). usbd_edpt_claim() guarantees the EP is
+// free before submitting.
+static DRAM_ATTR int16_t s_tx_buf[UAC_TX_BLOCKS][UAC_TX_BLOCK_SAMPLES] __attribute__((aligned(4)));
+static volatile uint32_t s_tx_cur = 0;
 static volatile uint32_t s_xfer_cb_count = 0;
+static volatile uint32_t s_xfer_fail_count = 0;
 
-static void uac_soft_reopen_endpoint(uint8_t rhport) {
-    uint8_t ep_addr = (uint8_t)(s_uac_ep_in | 0x80);
-    usbd_edpt_close(rhport, ep_addr);
-
-    tusb_desc_endpoint_t ep;
-    ep.bLength          = sizeof(tusb_desc_endpoint_t);
-    ep.bDescriptorType  = TUSB_DESC_ENDPOINT;
-    ep.bEndpointAddress = ep_addr;
-    ep.bmAttributes.xfer = TUSB_XFER_ISOCHRONOUS;
-    ep.bmAttributes.sync = 1;
-    ep.wMaxPacketSize   = 64;
-    ep.bInterval        = 2;
-    usbd_edpt_open(rhport, &ep);
-
-    memset(s_tx_buf, 0, 64);
-    usbd_edpt_xfer(rhport, ep_addr, (uint8_t*)s_tx_buf, 64);
-}
-
+// ---------------------------------------------------------------------------
+// Watchdog: if the host has armed the stream (alt=1) but no ISO IN transfer has
+// completed for 3s, the link is wedged. Try to recover by re-arming the TX
+// task (it resubmits once the EP is claimable). Log every stall so the web log
+// shows exactly when / how often the link stalls.
+// ---------------------------------------------------------------------------
 static void uac_watchdog_task(void* arg) {
     uint32_t last_count = 0;
     uint32_t stuck_ticks = 0;
     while(1) {
         vTaskDelay(pdMS_TO_TICKS(100));
-        
-        // ONLY monitor if USB is fully mounted, active, NOT suspended by host, and streaming
+
         if (tud_mounted() && !tud_suspended() && s_uac_streaming) {
             if (s_xfer_cb_count == last_count) {
                 stuck_ticks += 100;
-                if (stuck_ticks >= 3000) { // Relaxed to 3.0 seconds
-                    app_log("UAC", "Watchdog: Isochronous IN idle/stalled for 3s. Performing clean soft reset...");
-                    uac_soft_reopen_endpoint(0);
+                if (stuck_ticks >= 3000) {
+                    app_log("UAC", "Watchdog: ISO IN idle/stalled for 3s (fails=%u/ep=%u). Re-arming TX...",
+                            (unsigned)s_xfer_fail_count, (unsigned)s_uac_ep_in);
+                    // Re-arm: a fresh submit is attempted on the next 500Hz tick.
                     last_count = s_xfer_cb_count;
                     stuck_ticks = 0;
                 }
@@ -72,6 +63,48 @@ static void uac_watchdog_task(void* arg) {
             stuck_ticks = 0;
             last_count = s_xfer_cb_count;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 500Hz TX pump (one 64B block every 2ms):
+//   - Best effort: if the EP is busy (previous block still in flight) we skip
+//     this slot. Windows UAC1 absorbs a skipped slot as a short silence frame.
+//   - usbd_edpt_claim() + usbd_edpt_xfer() from task context is the documented
+//     way to submit ISO IN transfers; we never call it from inside a callback.
+// ---------------------------------------------------------------------------
+static void uac_push_task(void* arg) {
+    TickType_t last_wake = xTaskGetTickCount();
+    const TickType_t interval = pdMS_TO_TICKS(2);
+    while (1) {
+        vTaskDelayUntil(&last_wake, interval);
+
+        if (!s_uac_streaming || !tud_mounted() || tud_suspended()) {
+            continue;
+        }
+        if (s_uac_ep_in == 0) {
+            continue;
+        }
+
+        uint8_t ep_addr = (uint8_t)(s_uac_ep_in | 0x80);
+        uint8_t block = (uint8_t)(s_tx_cur & 1);
+        uint8_t* p = (uint8_t*)s_tx_buf[block];
+
+        if (!usbd_edpt_claim(0, ep_addr)) {
+            continue; // previous block still in flight -> skip this slot
+        }
+
+        audio_pipeline_read_for_usb(&g_audio_pipeline, s_tx_buf[block], UAC_TX_BLOCK_SAMPLES);
+
+        if (!usbd_edpt_xfer(0, ep_addr, p, UAC_TX_BLOCK_BYTES)) {
+            s_xfer_fail_count++;
+            usbd_edpt_release(0, ep_addr);
+            if (s_xfer_fail_count % 10 == 0) {
+                app_log("UAC", "TX submit FAILED x%u — EP not open?", (unsigned)s_xfer_fail_count);
+            }
+            continue;
+        }
+        s_tx_cur++;
     }
 }
 
@@ -128,6 +161,7 @@ static void uac_driver_reset(uint8_t rhport) {
     s_uac_streaming = false;
     s_uac_alt = 0;
     s_xfer_cb_count = 0;
+    s_xfer_fail_count = 0;
     app_log("UAC", "USB Bus Reset detected -> UAC state reset");
 }
 
@@ -160,12 +194,10 @@ static bool uac_driver_control_xfer_cb(uint8_t rhport, uint8_t stage,
             uint8_t alt = (uint8_t)req->wValue;
             s_uac_alt       = alt;
             s_uac_streaming = (alt == 1);
-            
-            if (alt == 1) {
-                uac_soft_reopen_endpoint(rhport);
-            } else {
-                usbd_edpt_close(rhport, (uint8_t)(s_uac_ep_in | 0x80));
-            }
+
+            // EP was opened once at enumeration (uac_driver_open). The 500Hz
+            // push task submits transfers only while s_uac_streaming is set.
+            // No close/re-open churn here: that is what wedged the link.
             return tud_control_status(rhport, req);
         } else if (req->bRequest == TUSB_REQ_GET_INTERFACE) {
             uint8_t itf = (uint8_t)req->wIndex;
@@ -204,21 +236,17 @@ static bool uac_driver_control_xfer_cb(uint8_t rhport, uint8_t stage,
 
 static bool uac_driver_xfer_cb(uint8_t rhport, uint8_t ep_addr,
                                  xfer_result_t result, uint32_t xferred_bytes) {
+    (void)rhport;
     if (ep_addr == (uint8_t)(s_uac_ep_in | 0x80)) {
-        if (s_uac_streaming) {
-            memset(s_tx_buf, 0, 64);
-            if (!s_mic_mute) {
-                audio_pipeline_read_for_usb(&g_audio_pipeline, s_tx_buf, 32);
-            }
-            usbd_edpt_xfer(rhport, ep_addr, (uint8_t*)s_tx_buf, 64);
-            
-            static uint32_t loop_counter = 0;
-            loop_counter++;
-            s_xfer_cb_count++;
-            if (loop_counter % 1000 == 0) {
-                app_log("UAC", "USB TX alive: streaming true, ringbuf avail: %d", audio_ring_buffer_available_read(&g_audio_pipeline.ring_buf));
-            }
+        s_xfer_cb_count++;
+        static uint32_t loop_counter = 0;
+        loop_counter++;
+        if (loop_counter % 1000 == 0) {
+            app_log("UAC", "USB TX alive: ringbuf avail: %d", audio_ring_buffer_available_read(&g_audio_pipeline.ring_buf));
         }
+        // NOTE: do NOT re-queue here. The 500Hz push task paces the next
+        // submission; re-queueing inside this callback races the 2ms token and
+        // previously caused a permanent ISO IN stall.
         return true;
     }
     return true;
@@ -249,13 +277,19 @@ extern "C" {
 bool uac_microphone_init(void) {
     if (s_uac_initialized) return true;
     audio_pipeline_init(&g_audio_pipeline);
-    
+
     if (s_uac_ep_in == 0) {
         s_uac_ep_in = tinyusb_get_free_in_endpoint();
     }
-    
+
+    // Spawn the 500Hz TX pump.
+    if (xTaskCreatePinnedToCore(uac_push_task, "uac_push", 4096, NULL, 6, NULL, 1) != pdPASS) {
+        app_log("UAC", "Failed to spawn TX pump task");
+    }
     // Spawn recovery watchdog
-    xTaskCreatePinnedToCore(uac_watchdog_task, "uac_wdg", 4096, NULL, 5, NULL, 1);
+    if (xTaskCreatePinnedToCore(uac_watchdog_task, "uac_wdg", 4096, NULL, 5, NULL, 1) != pdPASS) {
+        app_log("UAC", "Failed to spawn watchdog task");
+    }
 
     esp_err_t err = tinyusb_enable_interface(USB_INTERFACE_CUSTOM, UAC_DESC_TOTAL_LEN, uac_load_descriptor);
     if (err != ESP_OK) {
@@ -263,12 +297,12 @@ bool uac_microphone_init(void) {
         return false;
     }
     s_uac_initialized = true;
-    app_log("UAC", "UAC 1.0 Microphone ready (EP %d IN, Interrupt + Watchdog)", s_uac_ep_in);
+    app_log("UAC", "UAC 1.0 Microphone ready (EP %d IN, 500Hz push task + watchdog)", s_uac_ep_in);
     return true;
 }
 
 void uac_microphone_task(void) {
-    // Nothing — entirely driven by USB hardware xfer_cb
+    // Nothing — push is driven by the dedicated 500Hz uac_push task.
 }
 
 bool uac_microphone_is_streaming(void) {

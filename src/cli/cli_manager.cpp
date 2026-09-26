@@ -126,6 +126,13 @@ static void handle_wifi_command(const String& arg) {
 
     bool want_on = arg.equalsIgnoreCase("on");
     bool want_off = arg.equalsIgnoreCase("off");
+    if (arg.equalsIgnoreCase("wake")) {
+        bool woke = wifi_manager_request_wifi(WIFI_WAKE_MANUAL);
+        cli_write_line(woke
+            ? "{\"status\":\"ok\",\"wake\":true,\"radio_state\":" + String((int)wifi_manager_get_radio_state()) + "}"
+            : "{\"status\":\"ignored\",\"wake\":false,\"reason\":\"policy_disabled_or_already_on\"}");
+        return;
+    }
     if (want_on || want_off) {
         if (wifi_manager_get_enabled() == want_on) {
             cli_write_line(want_on
@@ -241,6 +248,7 @@ static void handle_command(const String& line) {
         cli_write_line("  wifi policy [always_on|on_demand|disabled] - Get/set Wi-Fi power policy");
         cli_write_line("  wifi timeout [1|5|10|30|never] - Get/set ON_DEMAND idle timeout (min)");
         cli_write_line("  wifi status   - Show Wi-Fi radio & connection status (JSON)");
+        cli_write_line("  wifi wake     - Wake the radio from ON_DEMAND sleep (same path as USB/key gesture)");
         cli_write_line("  log on|off    - Mirror full logs to USB CDC (default: off)");
         cli_write_line("  log console on|off - Mute/enable routine UART console logs (default: muted after boot)");
         cli_write_line("  log status    - Show log mirror/console state (JSON)");

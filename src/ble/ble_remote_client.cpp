@@ -79,6 +79,9 @@ static size_t                          s_frame_size = AUDIO_DEFAULT_FRAME_BYTES;
 #define BLE_SCAN_BURST_SECS 3
 static volatile bool                   s_req_scan_burst = false;
 static uint32_t                        s_scan_burst_until_ms = 0;
+// Set by wifi_manager (Core 1) when the radio wakes; consumed by the BLE task
+// (Core 0) to drop the disconnected-scan backoff back to tier-0 fast scanning.
+static volatile bool                   s_req_wifi_wake_rescan = false;
 
 // Disconnected scan backoff: the longer the remote stays away, the less often we
 // scan (window stays BLE_SCAN_WINDOW_MS). Keeps reconnect fast right after a
@@ -86,7 +89,7 @@ static uint32_t                        s_scan_burst_until_ms = 0;
 #define BLE_SCAN_TIER1_AFTER_MS   30000UL    // >30s away -> medium duty
 #define BLE_SCAN_TIER2_AFTER_MS   300000UL   // >5min away -> low duty
 #define BLE_SCAN_MED_INTERVAL_MS  2400       // 200/2400 = 8.3% duty
-#define BLE_SCAN_SLOW_INTERVAL_MS 4800       // 200/4800 = 4.2% duty
+#define BLE_SCAN_SLOW_INTERVAL_MS 3200       // 200/3200 = 6.25% duty (caps reconnect lag)
 static uint32_t                        s_disconnected_since_ms = 0;
 static uint8_t                         s_scan_tier = 0;
 
@@ -794,6 +797,10 @@ void ble_remote_init(void) {
     start_scan();
 }
 
+void ble_remote_notify_wifi_wake(void) {
+    s_req_wifi_wake_rescan = true;
+}
+
 void ble_remote_task(void) {
     uint32_t now = millis();
 
@@ -849,6 +856,14 @@ void ble_remote_task(void) {
     // 3. Auto Re-scan with backoff: while the remote is away, scan less often
     // the longer it stays away (fast right after a drop, then medium/low duty).
     if (s_ble_state < BLE_STATE_CONNECTING && !s_do_connect && !s_req_unpair && !s_req_reconnect) {
+        if (s_req_wifi_wake_rescan) {
+            // Wi-Fi just woke and may have starved/ dropped the BLE link; the
+            // remote is likely advertising again right now. Drop backoff -> fast.
+            s_req_wifi_wake_rescan = false;
+            s_disconnected_since_ms = 0;
+            s_scan_tier = 0xFF; // force restart below
+            app_log("BLE", "Wi-Fi wake: BLE rescans at fast tier to re-catch remote");
+        }
         if (s_disconnected_since_ms == 0) {
             s_disconnected_since_ms = now;
         }

@@ -77,6 +77,14 @@ String ble_remote_get_connected_info(void);
  */
 int ble_remote_get_battery_pct(void);
 
+/**
+ * @brief Notify the BLE layer that the Wi-Fi radio just woke up (ON_DEMAND wake).
+ * A Wi-Fi re-init can starve BLE coexistence and drop the remote link; if that
+ * happened the remote is likely advertising again, so drop the scan backoff to
+ * tier-0 and rescan fast instead of slowly tiers'ing up.
+ */
+void ble_remote_notify_wifi_wake(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -16,6 +16,7 @@ static bool s_is_flashing = false;
 static uint32_t s_layer_color = 0x00FF00; // Default green for Layer 0
 static bool s_layer_flash = false;
 static bool s_low_battery = false;
+static bool s_wifi_sleep = false;
 
 // Master brightness levels (0..255). The DevKit's WS2812 is very visible even
 // at low duty, so steady states stay extremely dim and short pulses carry the
@@ -55,6 +56,12 @@ static void update_hardware_led(led_state_t state) {
             apply_led_color(0x0C0C0Cu); // dim white pulse
             return;
         }
+    }
+
+    // Wi-Fi sleeping or disabled: steady dim red = device asleep / web unreachable.
+    if (s_wifi_sleep) {
+        apply_led_color(dim_rgb(0xFF0000, LED_STEADY_BRIGHT));
+        return;
     }
 
     switch (state) {
@@ -126,6 +133,14 @@ void led_indicator_trigger_key(bool is_voice_key) {
     s_flash_state = is_voice_key ? LED_STATE_MIC_KEY_PRESS : LED_STATE_HID_KEY_PRESS;
     s_flash_expire_time = millis() + 100; // Flash for 100ms
     s_is_flashing = true;
+}
+
+void led_indicator_set_wifi_sleep(bool is_sleep) {
+    if (s_wifi_sleep == is_sleep) {
+        return;
+    }
+    s_wifi_sleep = is_sleep;
+    update_hardware_led(s_current_base_state);
 }
 
 void led_indicator_set_layer_color(uint32_t rgb_color) {

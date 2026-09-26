@@ -1,6 +1,8 @@
 #include "wifi_manager.h"
 #include "app_config.h"
 #include "log/app_log.h"
+#include "led_indicator.h"
+#include "ble/ble_remote_client.h"
 #include <WiFi.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
@@ -35,6 +37,21 @@ static uint32_t           s_last_activity_ms = 0;
 // Consumed by wifi_manager_task() in the main-loop context so it can never
 // race the synchronous radio bring-up inside wifi_manager_init() at boot.
 static volatile bool      s_pending_usb_wake = false;
+// Manual wake requested by the key-press gesture. fire detected from the
+// BLE/audio task; deferred here so the radio re-init (WiFi.mode/begin, can
+// block for seconds) never stalls audio pumping on Core 0.
+static volatile bool      s_pending_manual_wake = false;
+// Generic on-demand wake requested while the radio was OFF. The ACTUAL radio
+// bring-up must run from wifi_manager_task() (main-loop context). wifi_manager
+// is the single owner of the WiFi stack: waking from a separate task made
+// WiFi.mode()/softAP churn run concurrently with loop()'s wifi_manager_task()
+// and web handlers, which races esp_wifi de-init against itself and deadlocks
+// the driver while NimBLE is active ("timeout when WiFi un-init" + Task WDT
+// panic inside esp_wifi_deinit_internal on the coredump we recovered).
+static volatile bool      s_pending_radio_wake = false;
+
+static void wifi_apply_config(void);    // forward decl (defined below)
+static void wifi_reconnect_light(void); // forward decl (defined below)
 
 static bool wifi_is_valid_timeout(uint32_t minutes) {
     return minutes == WIFI_TIMEOUT_NEVER || minutes == 1 || minutes == 5 ||
@@ -106,6 +123,28 @@ static void wifi_apply_config(void) {
     }
 }
 
+// Light wake for ON_DEMAND radio sleep. Sleep keeps the WiFi driver initialized
+// (only disconnect + modem sleep), so waking must NOT tear the radio down:
+// WiFi.mode()/softAP re-init churn is what deadlocked esp_wifi against NimBLE
+// and hard-froze the device. Here we just reconnect the STA (begin is
+// non-blocking, the link comes up via events) and leave mode/AP untouched.
+static void wifi_reconnect_light(void) {
+    String sta_ssid = s_prefs.getString("ssid", "");
+    String sta_pass = s_prefs.getString("pass", "");
+    if (sta_ssid.length() > 0) {
+        s_sta_configured = true;
+        app_log("WIFI", "Wake: light reconnect to %s (no radio re-init)...", sta_ssid.c_str());
+        WiFi.setSleep(true);
+        WiFi.setTxPower(WIFI_POWER_8_5dBm);
+        WiFi.disconnect(false);
+        WiFi.begin(sta_ssid.c_str(), sta_pass.c_str());
+        return;
+    }
+    // No saved STA network: first-run/config mode, do the full bring-up.
+    app_log("WIFI", "Wake: no STA configured, running full radio config");
+    wifi_apply_config();
+}
+
 void wifi_manager_init(void) {
     s_prefs.begin("wifi_conf", false);
 
@@ -131,6 +170,7 @@ void wifi_manager_init(void) {
         // stop the BLE link from coming up. The radio simply stays uninitialized.
         s_radio_state = WIFI_STATE_OFF;
         app_log("WIFI", "Wi-Fi policy DISABLED; radio left uninitialized (USB CDC/UART: 'wifi on')");
+        led_indicator_set_wifi_sleep(true);
         return;
     }
 
@@ -139,6 +179,7 @@ void wifi_manager_init(void) {
     wifi_apply_config();
     s_radio_state = WIFI_STATE_ON;
     s_last_activity_ms = millis();
+    led_indicator_set_wifi_sleep(false);
     app_log("WIFI", "Wi-Fi policy %s (timeout %u min, state %s)",
             wifi_manager_policy_str(s_policy), (unsigned int)s_timeout_min,
             wifi_manager_state_str(s_radio_state));
@@ -239,7 +280,9 @@ void wifi_manager_notify_key_press(uint16_t gesture_key) {
         app_log("WIFI", "Wake gesture detected (%d quick presses of same key) -> waking radio",
                 (int)WIFI_WAKE_PRESS_THRESHOLD);
         s_press_count = 0;
-        wifi_manager_request_wifi(WIFI_WAKE_MANUAL);
+        // Deferred: the actual radio bring-up runs in wifi_manager_task()
+        // (main-loop context) so it never stalls the BLE/audio task on Core 0.
+        s_pending_manual_wake = true;
     }
 }
 
@@ -253,12 +296,17 @@ bool wifi_manager_request_wifi(wifi_wake_reason_t reason) {
         return false;
     }
     // On-demand wake: radio was powered down after idle timeout, bring it back.
+    // The actual reconnect runs in wifi_manager_task() (main-loop context), the
+    // single owner of the WiFi stack. Here we only mark the request -- safe to
+    // call from the Core 0 BLE task.
     if (s_radio_state != WIFI_STATE_ON) {
-        app_log("WIFI", "On-demand wake (reason=%d): restarting radio...", (int)reason);
+        if (s_radio_state == WIFI_STATE_ENABLING) {
+            wifi_manager_mark_activity(); // already waking
+            return true;
+        }
         s_radio_state = WIFI_STATE_ENABLING;
-        wifi_apply_config();
-        s_radio_state = WIFI_STATE_ON;
-        s_last_activity_ms = millis();
+        s_pending_radio_wake = true;
+        app_log("WIFI", "On-demand wake requested (reason=%d), radio bringing up on main loop...", (int)reason);
         return true;
     }
     wifi_manager_mark_activity();
@@ -301,6 +349,33 @@ void wifi_manager_task(void) {
 
     uint32_t now = millis();
 
+    // Pending on-demand wake (radio was OFF). Performed here, not in a helper
+    // task, so every WiFi call in the system has a single owner (this loop
+    // context: wifi_manager_task + web_server_task + cli_manager_task all run
+    // in main.cpp::loop). That serialization is what prevents the WiFi+BLE
+    // coexistence deadlock that froze the device after radio power-down.
+    if (s_pending_radio_wake) {
+        s_pending_radio_wake = false;
+        if (s_policy == WIFI_POLICY_DISABLED) {
+            s_radio_state = WIFI_STATE_OFF;
+        } else if (s_radio_state == WIFI_STATE_ENABLING || s_radio_state == WIFI_STATE_OFF) {
+            s_sta_disconnected_since = 0;
+            if (s_sta_configured) {
+                wifi_reconnect_light();
+            } else {
+                wifi_apply_config();
+            }
+            s_radio_state = WIFI_STATE_ON;
+            s_last_activity_ms = millis();
+            led_indicator_set_wifi_sleep(false);
+            // The radio transition can starve/drop the BLE link (2.4GHz
+            // coexistence); nudge the BLE task to dump its scan backoff and
+            // search fast again.
+            ble_remote_notify_wifi_wake();
+            app_log("WIFI", "Radio back ON (main-loop wake complete)");
+        }
+    }
+
     // Deferred USB wake (host re-enumerated us): safe to act on here because
     // setup() has completed and wifi_manager_init() is no longer mid-bring-up.
     if (s_pending_usb_wake) {
@@ -308,8 +383,17 @@ void wifi_manager_task(void) {
         wifi_manager_request_wifi(WIFI_WAKE_SYSTEM);
     }
 
+    // Deferred manual wake from the key-press gesture (see notify_key_press).
+    if (s_pending_manual_wake) {
+        s_pending_manual_wake = false;
+        wifi_manager_request_wifi(WIFI_WAKE_MANUAL);
+    }
+
     // ON_DEMAND: power down the STA radio after the idle timeout.
     // Any user input (wifi_manager_request_wifi) wakes it back up.
+    // Sleep only disconnects + modem-sleeps: the WiFi driver stays initialized.
+    // A later light reconnect (wifi_reconnect_light) then needs no radio
+    // re-init, which is the churn that deadlocked esp_wifi against NimBLE.
     if (s_policy == WIFI_POLICY_ON_DEMAND &&
         s_timeout_min != WIFI_TIMEOUT_NEVER &&
         s_radio_state == WIFI_STATE_ON &&
@@ -321,7 +405,14 @@ void wifi_manager_task(void) {
         s_radio_state = WIFI_STATE_SHUTTING_DOWN;
         WiFi.disconnect(true);
         s_radio_state = WIFI_STATE_OFF;
-        app_log("WIFI", "Wi-Fi radio OFF (idle). Press a key to wake it.");
+        app_log("WIFI", "Wi-Fi radio asleep (driver stays up, modem sleep). Press a key to wake it.");
+        return;
+    }
+
+    // STA monitor: skip while the radio is deliberately asleep (ON_DEMAND OFF)
+    // so the poll neither pokes the modem out of sleep nor lets the fail-safe
+    // timer drift until the next wake.
+    if (s_radio_state == WIFI_STATE_OFF) {
         return;
     }
 
@@ -336,8 +427,11 @@ void wifi_manager_task(void) {
             // STA not connected
             if (s_sta_disconnected_since == 0) {
                 s_sta_disconnected_since = now;
-            } else if ((now - s_sta_disconnected_since > 15000) && !s_ap_running) {
-                // Disconnected for more than 15 seconds, fail-safe re-enable AP mode
+            } else if ((now - s_sta_disconnected_since > 15000) && !s_ap_running &&
+                       s_radio_state != WIFI_STATE_OFF) {
+                // Disconnected for more than 15 seconds, fail-safe re-enable AP mode.
+                // Skip while the radio is deliberately asleep (ON_DEMAND OFF): the
+                // whole point of sleep is a quiet radio; waking restores the AP.
                 app_log("WIFI", "Home Wi-Fi disconnected (>15s). Re-enabling AP mode for configuration...");
                 wifi_start_ap(s_prefs.getString("ap_pass", ""));
             }
