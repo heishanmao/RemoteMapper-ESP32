@@ -83,6 +83,12 @@ static uint32_t                        s_scan_burst_until_ms = 0;
 // (Core 0) to drop the disconnected-scan backoff back to tier-0 fast scanning.
 static volatile bool                   s_req_wifi_wake_rescan = false;
 
+// MiOT (0xFE95) advertisement sniffer: while ON we never auto-connect to the
+// remote (a connected remote stops broadcasting) so its burst packets can be
+// captured for gesture analysis (single/double/long).
+static volatile bool                   s_sniff_adv = false;
+static uint32_t                        s_last_sniff_log_ms = 0;
+
 // Disconnected scan backoff: the longer the remote stays away, the less often we
 // scan (window stays BLE_SCAN_WINDOW_MS). Keeps reconnect fast right after a
 // drop while cutting radio duty when the remote is off/asleep.
@@ -319,6 +325,47 @@ static bool is_target_remote(NimBLEAdvertisedDevice* dev) {
     return false;
 }
 
+// MiOT sniffer: dump one advertisement frame (service UUIDs + service data,
+// with the 0xFE95 Xiaomi payload hex) to the ring log. Rate-limited so a
+// burst of contactable duplicates does not flood the log.
+static void sniff_dump_packet(NimBLEAdvertisedDevice* dev) {
+    uint32_t now = millis();
+    if (now - s_last_sniff_log_ms < 150) return;
+    s_last_sniff_log_ms = now;
+
+    String name = dev->getName().c_str();
+    String addr = dev->getAddress().toString().c_str();
+    String tag = is_target_remote(dev) ? "[TARGET]" : "";
+    String line = "SNIFF " + tag + " " + addr + "(" + String(dev->getAddress().getType()) + ", RSSI " + String(dev->getRSSI()) + ")";
+    if (name.length() > 0) line += " name=" + sanitize_ble_name(name);
+
+    if (dev->haveServiceUUID()) {
+        line += " svc=[";
+        int n = dev->getServiceUUIDCount();
+        for (int i = 0; i < n; ++i) {
+            if (i) line += " ";
+            line += dev->getServiceUUID(i).toString().c_str();
+        }
+        line += "]";
+    }
+
+    int sdCount = dev->getServiceDataCount();
+    for (int i = 0; i < sdCount; ++i) {
+        NimBLEUUID u = dev->getServiceDataUUID(i);
+        std::string sd = dev->getServiceData(i);
+        line += " sd(" + String(u.toString().c_str()) + ")=";
+        char hex[8];
+        for (size_t k = 0; k < sd.size(); ++k) {
+            snprintf(hex, sizeof(hex), "%02X", (uint8_t)sd[k]);
+            line += hex;
+        }
+        if (u == NimBLEUUID((uint16_t)0xFE95)) {
+            line += " <-- MiBeacon";
+        }
+    }
+    app_log("ADV", "%s", line.c_str());
+}
+
 // Advertised Device Scan Callbacks
 class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) override {
@@ -365,13 +412,20 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
         }
         portEXIT_CRITICAL(&s_disc_mux);
 
+        // MiOT sniffer: dump payloads and never steal the connection, otherwise
+        // the remote stops broadcasting once we hold a GATT link.
+        if (s_sniff_adv) {
+            sniff_dump_packet(advertisedDevice);
+            return;
+        }
+
         if (name.length() > 0) {
             app_log("BLE_SCAN", "Device: %s (%s, RSSI: %d, Type: %d)", 
                     name.c_str(), addr.c_str(), advertisedDevice->getRSSI(), 
                     (int)advertisedDevice->getAddress().getType());
         }
 
-        if (s_ble_state <= BLE_STATE_SCANNING && is_target_remote(advertisedDevice) && !s_do_connect) {
+        if (s_ble_state <= BLE_STATE_SCANNING && is_target_remote(advertisedDevice) && !s_do_connect && !s_sniff_adv) {
             app_log("BLE", "Matching Target Remote: %s (%s), queueing connection...", name.c_str(), addr.c_str());
             NimBLEDevice::getScan()->stop();
             if (s_pending_adv_device) delete s_pending_adv_device;
@@ -801,8 +855,41 @@ void ble_remote_notify_wifi_wake(void) {
     s_req_wifi_wake_rescan = true;
 }
 
+bool ble_remote_sniff_enabled(void) {
+    return s_sniff_adv;
+}
+
+void ble_remote_sniff_set(bool on) {
+    s_sniff_adv = on;
+    if (!on) {
+        // Normal behaviour resumes next task tick: reconnect flow re-enables
+        // once the remote is seen again.
+        s_disconnected_since_ms = 0;
+    }
+}
+
 void ble_remote_task(void) {
     uint32_t now = millis();
+
+    // 0. MiOT sniffer: never connect, keep fast scanning so we capture the
+    // remote's burst advertisements; if a link somehow exists, drop it.
+    if (s_sniff_adv) {
+        s_do_connect = false;
+        s_pending_mac = "";
+        if (s_pending_adv_device) {
+            delete s_pending_adv_device;
+            s_pending_adv_device = nullptr;
+        }
+        if (s_ble_state >= BLE_STATE_CONNECTING) {
+            if (s_client && s_client->isConnected()) s_client->disconnect();
+            s_ble_state = BLE_STATE_DISCONNECTED;
+            s_is_encrypted = false;
+        }
+        s_disconnected_since_ms = 0; // keep tier-0 fast scanning
+        if (!NimBLEDevice::getScan()->isScanning()) {
+            start_scan(BLE_SCAN_INTERVAL_MS);
+        }
+    }
 
     // 1. Process asynchronous unpair / reconnect requests from Core 1
     if (s_req_unpair || s_req_reconnect) {

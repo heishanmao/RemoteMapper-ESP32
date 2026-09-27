@@ -307,6 +307,32 @@ static void handle_ble_reconnect() {
     s_server.send(200, "application/json", "{\"status\":\"reconnecting\"}");
 }
 
+static void handle_adv_sniff_get() {
+    JsonDocument doc;
+    doc["enabled"] = ble_remote_sniff_enabled();
+    String out;
+    serializeJson(doc, out);
+    s_server.send(200, "application/json", out);
+}
+
+static void handle_adv_sniff_set() {
+    bool on = ble_remote_sniff_enabled();
+    if (s_server.hasArg("enabled")) {
+        String v = s_server.arg("enabled");
+        if (v == "1" || v.equalsIgnoreCase("true") || v.equalsIgnoreCase("on")) on = true;
+        else if (v == "0" || v.equalsIgnoreCase("false") || v.equalsIgnoreCase("off")) on = false;
+    } else {
+        on = !on;
+    }
+    ble_remote_sniff_set(on);
+    app_log("BLE", "MiOT advertisement sniffer %s", on ? "ON (auto-connect suspended; press remote keys to capture 0xFE95)" : "OFF");
+    JsonDocument doc;
+    doc["enabled"] = on;
+    String out;
+    serializeJson(doc, out);
+    s_server.send(200, "application/json", out);
+}
+
 static void handle_system_restart() {
     app_log("SYSTEM", "Rebooting ESP32 via Web API...");
     s_server.send(200, "application/json", "{\"status\":\"rebooting\"}");
@@ -605,6 +631,8 @@ void web_server_init(void) {
     s_server.on("/api/audio", HTTP_GET, handle_audio);
     s_server.on("/api/guard", HTTP_GET, handle_guard);
     s_server.on("/api/guard", HTTP_POST, handle_guard_set);
+    s_server.on("/api/debug/adv-sniff", HTTP_GET, handle_adv_sniff_get);
+    s_server.on("/api/debug/adv-sniff", HTTP_POST, handle_adv_sniff_set);
 
 #if REMOTEMAPPER_OTA
     s_server.on("/api/ota/status", HTTP_GET, handle_ota_status);

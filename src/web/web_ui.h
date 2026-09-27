@@ -835,6 +835,18 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                             ⚠️ 升级期间请勿断电、勿关闭本页面，保持与设备处于同一网络。写入完成后设备自动重启并恢复服务（约 20~40 秒）。升级失败不影响当前运行的固件。
                         </div>
                     </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <span>🔍 MiOT 广播嗅探 (测试)</span>
+                            <span id="sniff-state" style="font-size: 12px; padding: 2px 8px; border-radius: 6px; background: rgba(100,116,139,0.15); color: var(--text-muted); border: 1px solid rgba(100,116,139,0.3);">关闭</span>
+                        </div>
+                        <p style="font-size: 13px; color: var(--text-muted); line-height: 1.6;">
+                            开启后设备<strong>暂停自动连接</strong>遥控器，持续扫描抓取含 <code style="color:var(--accent-cyan);">0xFE95</code>(MiBeacon)的广播包并写入「运行日志」。<br>
+                            请先切到「运行日志」标签，再依次<strong>单击 / 双击 / 长按</strong>遥控器按键，观察是否出现 <code style="color:var(--accent-cyan);">SNIFF</code> / <code style="color:var(--accent-cyan);">&lt;-- MiBeacon</code> 行。测完记得关闭恢复连接。
+                        </p>
+                        <button class="btn" style="width: 100%;" id="sniff-btn" onclick="toggleAdvSniff()">开启 MiOT 广播嗅探</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -3153,6 +3165,41 @@ if (mod & 0x01) chips.push('左Ctrl');
             } catch (e) {}
         }
 
+        async function loadAdvSniffState() {
+            try {
+                const r = await fetch('/api/debug/adv-sniff');
+                const d = await r.json();
+                renderAdvSniff(d.enabled === true);
+            } catch (e) {}
+        }
+
+        function renderAdvSniff(on) {
+            const st = document.getElementById('sniff-state');
+            const btn = document.getElementById('sniff-btn');
+            if (st) {
+                st.innerText = on ? '嗅探中' : '关闭';
+                st.style.background = on ? 'rgba(249,115,22,0.15)' : 'rgba(100,116,139,0.15)';
+                st.style.color = on ? '#fb923c' : 'var(--text-muted)';
+                st.style.borderColor = on ? 'rgba(249,115,22,0.4)' : 'rgba(100,116,139,0.3)';
+            }
+            if (btn) {
+                btn.innerText = on ? '关闭 MiOT 广播嗅探' : '开启 MiOT 广播嗅探';
+            }
+        }
+
+        async function toggleAdvSniff() {
+            try {
+                const r = await fetch('/api/debug/adv-sniff', { method: 'POST' });
+                const d = await r.json();
+                renderAdvSniff(d.enabled === true);
+                if (d.enabled === true) {
+                    showToast('嗅探已开启：请在「运行日志」观察，并操作遥控器 单击/双击/长按');
+                } else {
+                    showToast('嗅探已关闭，恢复自动连接');
+                }
+            } catch (e) { showToast('切换失败: ' + e.message, true); }
+        }
+
         async function saveGuardSettings() {
             const mod = parseInt(document.getElementById('guard-mod').value, 10) || 0;
             const key = parseInt(document.getElementById('guard-key').value, 10) || 0;
@@ -3177,6 +3224,7 @@ if (mod & 0x01) chips.push('左Ctrl');
         setInterval(fetchStatus, 3000);
         setInterval(refreshLogs, 2000);
         loadGuardSettings();
+        loadAdvSniffState();
         loadKeymap();
         fetchStatus();
         refreshOtaStatus();

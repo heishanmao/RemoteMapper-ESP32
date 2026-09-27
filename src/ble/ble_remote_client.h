@@ -85,6 +85,19 @@ int ble_remote_get_battery_pct(void);
  */
 void ble_remote_notify_wifi_wake(void);
 
+/**
+ * @brief Whether MiOT (0xFE95) advertisement sniff mode is currently active
+ */
+bool ble_remote_sniff_enabled(void);
+
+/**
+ * @brief Enable/disable MiOT advertisement sniffer.
+ * While ON the device never auto-connects to the remote (connected remotes
+ * stop broadcasting) and dumps broadcast payloads to the ring log so MiOT
+ * gesture events (single/double/long) can be analyzed.
+ */
+void ble_remote_sniff_set(bool on);
+
 #ifdef __cplusplus
 }
 #endif
