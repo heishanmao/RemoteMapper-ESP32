@@ -239,11 +239,24 @@ static void handle_command(const String& line) {
         key_engine_load_defaults(&g_key_engine);
         cli_write_line("{\"status\":\"keymap_reset_to_defaults\"}");
     }
+    else if (head.equalsIgnoreCase("gattdump")) {
+        tail.toLowerCase();
+        if (tail == "on" || tail == "1" || tail == "true") {
+            ble_remote_gatt_dump_request(true);
+            cli_write_line("{\"status\":\"ok\",\"gatt_dump\":true,\"hint\":\"next remote connection triggers a full GATT enumeration\"}");
+        } else if (tail == "off" || tail == "0" || tail == "false") {
+            ble_remote_gatt_dump_request(false);
+            cli_write_line("{\"status\":\"ok\",\"gatt_dump\":false}");
+        } else {
+            cli_write_line("{\"status\":\"ok\",\"gatt_dump\":" + String(ble_remote_gatt_dump_enabled() ? "true" : "false") + "}");
+        }
+    }
     else if (cmd.equalsIgnoreCase("help")) {
         cli_write_line("Commands:");
         cli_write_line("  status        - Display system info & runtime statistics (JSON)");
         cli_write_line("  reconnect     - Trigger BLE remote re-scan");
         cli_write_line("  reset_keys    - Reset key bindings to factory defaults");
+        cli_write_line("  gattdump on|off - Toggle full GATT enumeration per remote connection (GATTX log)");
         cli_write_line("  wifi on|off   - Enable/disable the whole Wi-Fi radio (persisted, reboots)");
         cli_write_line("  wifi policy [always_on|on_demand|disabled] - Get/set Wi-Fi power policy");
         cli_write_line("  wifi timeout [1|5|10|30|never] - Get/set ON_DEMAND idle timeout (min)");

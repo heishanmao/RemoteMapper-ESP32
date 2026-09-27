@@ -89,6 +89,37 @@ static volatile bool                   s_req_wifi_wake_rescan = false;
 static volatile bool                   s_sniff_adv = false;
 static uint32_t                        s_last_sniff_log_ms = 0;
 
+// GATT explorer: while ON, each fresh connection runs one full enumeration of
+// every service/characteristic/descriptor (properties + readable values). Its
+// whole purpose is to discover REMAINING untapped capabilities of the remote:
+// 0x180A Device Information, HID Report Map (0x2A4A), and the three never
+// decoded vendor services 0xfe59 / 0x01bf / 8a7a0001-2c42-c2a2-0f36-41928c259b78.
+static volatile bool                   s_gatt_dump_enabled = false;
+static volatile bool                   s_gatt_dump_pending = false;
+
+
+// Passive vendor listener: while the explorer is ON we additionally SUBSCRIBE to
+// every NOTIFY characteristic of the never-decoded vendor services so their
+// spontaneous traffic is logged. This is strictly one-way: subscribing only
+// writes the standard 0x2902 CCCD, and no vendor command characteristic is ever
+// written (no OTA / DFU / config payloads are sent).
+static NimBLERemoteCharacteristic*     s_spy_chars[8] = { nullptr };
+static uint8_t                         s_spy_count = 0;
+static const char*                     s_spy_tags[8] = { nullptr };
+
+static void gatt_spy_stop(void);
+static void read_device_information(void);
+static void gatt_explore_all(bool allow_refresh);
+
+// Remote Device Information (0x180A) read on every connect. Read-only queries,
+// never written back. For RC003 (2 Pro) the firmware reports fw "2671" etc.
+static String                          s_dev_model = "";
+static String                          s_dev_manuf = "";
+static String                          s_dev_serial = "";
+static String                          s_dev_hw = "";
+static String                          s_dev_fw = "";
+static String                          s_dev_sw = "";
+
 // Disconnected scan backoff: the longer the remote stays away, the less often we
 // scan (window stays BLE_SCAN_WINDOW_MS). Keeps reconnect fast right after a
 // drop while cutting radio duty when the remote is off/asleep.
@@ -258,15 +289,20 @@ static void on_hogp_report_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pD
             app_log("VOICE", "Voice button event: 0x%02X (%s)", raw_key, is_pressed ? "DOWN" : "UP");
             if (is_pressed) {
                 if (s_char_cmd != nullptr) {
-                    uint8_t cmd_open[] = { 0x0C, 0x00 };
+                    // MIC_OPEN (v1.0): 0x0C + big-endian codec id (0x0001 = 16 kHz).
+                    // The two-byte form {0x0C,0x00} relied on the remote defaulting
+                    // the codec; the explicit 3-byte form is the documented one.
+                    uint8_t cmd_open[] = { 0x0C, 0x00, 0x01 };
                     s_char_cmd->writeValue(cmd_open, sizeof(cmd_open), false);
-                    app_log("ATVV", "Triggered MIC_OPEN on Voice key press");
+                    app_log("ATVV", "Triggered MIC_OPEN (codec=0x0001/16kHz) on Voice key press");
                 } else {
                     app_log("ATVV", "Warning: Voice key pressed but ATVV CMD characteristic unavailable");
                 }
             } else {
                 if (s_char_cmd != nullptr) {
-                    uint8_t cmd_close[] = { 0x00 };
+                    // MIC_CLOSE is opcode 0x0D (0x00 is a control/status opcode, not
+                    // "close"), so the mic can stay hot until the remote times out.
+                    uint8_t cmd_close[] = { 0x0D };
                     s_char_cmd->writeValue(cmd_close, sizeof(cmd_close), false);
                     app_log("ATVV", "Triggered MIC_CLOSE on Voice key release");
                 }
@@ -455,6 +491,13 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         s_char_ctl = nullptr;
         s_char_bat = nullptr;
         s_battery_pct = -1;
+        gatt_spy_stop();
+        s_dev_model = "";
+        s_dev_manuf = "";
+        s_dev_serial = "";
+        s_dev_hw = "";
+        s_dev_fw = "";
+        s_dev_sw = "";
         s_last_hogp_key = 0;
         key_engine_release_all(&g_key_engine, millis());
         usb_hid_keyboard_release();
@@ -553,6 +596,18 @@ static bool setup_services_and_handshake() {
     }
 
     app_log("BLE", "Discovered %d GATT Service(s)", (int)pServices->size());
+
+    // FULL GATT dump, in the one window where re-discovery is still harmless:
+    // services are listed, but nothing has been subscribed yet, so
+    // deleteCharacteristics() cannot invalidate a live notification binding.
+    // Opt-in via `gattdump on`; runs at most once per connection.
+    if (s_gatt_dump_enabled) {
+        app_log("GATTX", "Handshake-window full dump requested");
+        gatt_explore_all(true);
+        // The full dump subsumes the runtime dump, so do not let the task loop
+        // enumerate the vendor services a second time on this same connection.
+        s_gatt_dump_pending = false;
+    }
 
     NimBLERemoteService* atvv_svc = nullptr;
     NimBLERemoteService* hid_svc = nullptr;
@@ -701,6 +756,10 @@ static bool setup_services_and_handshake() {
         app_log("BATTERY", "Battery Service (0x180F) not found in GATT services");
     }
 
+    // Read (never write) the remote's Device Information: model / firmware / hw
+    // version, surfaced in the WebUI pairing card.
+    read_device_information();
+
     app_log("BLE", "Total Subscribed Characteristic(s): %d", sub_count);
 
     // 3. Negotiate data length and connection parameters
@@ -719,6 +778,10 @@ static bool setup_services_and_handshake() {
     s_ble_state = BLE_STATE_CONNECTED;
     led_indicator_set(LED_STATE_CONNECTED);
     s_last_keepalive_ms = millis();
+
+    // Note: an enabled GATT dump was already executed in the handshake window
+    // above (pre-subscription, full coverage). Re-arming s_gatt_dump_pending
+    // here would run a second, vendor-only dump on the same connection.
     return true;
 }
 
@@ -823,7 +886,282 @@ static bool do_connect_mac(const String& mac_str, uint8_t addr_type) {
     return setup_services_and_handshake();
 }
 
+// Read the remote's Device Information Service (0x180A) - read-only, never written.
+// The remote answers 0x180A inconsistently right after pairing: the first pass
+// often comes back empty because the characteristic list has not settled yet, so
+// retry a few times with a short pause before giving up.
+static void read_device_information() {
+    s_dev_model = "";
+    s_dev_manuf = "";
+    s_dev_serial = "";
+    s_dev_hw = "";
+    s_dev_fw = "";
+    s_dev_sw = "";
+    if (!s_client || !s_client->isConnected()) return;
+
+    for (int attempt = 1; attempt <= 4; ++attempt) {
+        NimBLERemoteService* dis = s_client->getService(NimBLEUUID((uint16_t)0x180A));
+        if (!dis) {
+            app_log("GATTX", "Device Information Service (0x180A) not found; remote model info unavailable");
+            return;
+        }
+        std::vector<NimBLERemoteCharacteristic*>* pChars = dis->getCharacteristics(true);
+        if (pChars && !pChars->empty()) {
+            struct { const char* sub; String* dst; } fields[] = {
+                { "2a29", &s_dev_manuf  }, // Manufacturer Name
+                { "2a24", &s_dev_model  }, // Model Number
+                { "2a25", &s_dev_serial }, // Serial Number
+                { "2a27", &s_dev_hw     }, // Hardware Revision
+                { "2a26", &s_dev_fw     }, // Firmware Revision
+                { "2a28", &s_dev_sw     }, // Software Revision
+            };
+            for (auto* pChar : *pChars) {
+                if (!pChar) continue;
+                String cu = pChar->getUUID().toString().c_str();
+                cu.toLowerCase();
+                for (auto& f : fields) {
+                    if (f.dst->length() > 0) continue;
+                    if (cu.indexOf(f.sub) < 0) continue;
+                    if (!pChar->canRead()) break;
+                    NimBLEAttValue val = pChar->readValue();
+                    if (val.length() > 0 && val.length() <= 32) {
+                        String s((const char*)val.data(), val.length());
+                        s.trim();
+                        *f.dst = s;
+                    }
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(15));
+            }
+        }
+        // Model number plus firmware revision identify the remote well enough.
+        if (s_dev_model.length() > 0 && s_dev_fw.length() > 0) break;
+        if (attempt < 4) {
+            app_log("GATTX", "Device info incomplete on pass %d, retrying...", attempt);
+            vTaskDelay(pdMS_TO_TICKS(250));
+        }
+    }
+    app_log("GATTX", "Remote device info: model=%s, mfr=%s, serial=%s, hw=%s, fw=%s, sw=%s",
+            s_dev_model.c_str(), s_dev_manuf.c_str(), s_dev_serial.c_str(),
+            s_dev_hw.c_str(), s_dev_fw.c_str(), s_dev_sw.c_str());
+}
+
+// Hex + printable-ASCII rendering helper for one characteristic/descriptor value.
+static void gatt_dump_bytes(const char* tag, const uint8_t* data, size_t len) {
+    if (!data || len == 0) {
+        app_log(tag, "  value: (empty)");
+        return;
+    }
+    app_log(tag, "  value: len=%u bytes", (unsigned)len);
+    char hex[4];
+    String line = "";
+    for (size_t i = 0; i < len; ++i) {
+        snprintf(hex, sizeof(hex), "%02X", data[i]);
+        line += hex;
+        if ((i % 24) == 23 || i == len - 1) {
+            app_log(tag, "    %s", line.c_str());
+            line = "";
+        }
+    }
+    String ascii;
+    ascii.reserve(len);
+    for (size_t i = 0; i < len; ++i) {
+        char c = (char)data[i];
+        ascii += (c >= 0x20 && c != 0x7F) ? c : '.';
+    }
+    if (ascii.length() > 64) ascii = ascii.substring(0, 64) + "...";
+    app_log(tag, "    ascii: %s", ascii.c_str());
+}
+
+// Passive vendor notify listener. Logs whatever the remote pushes on the
+// never-decoded vendor services. Read-only by design: no command characteristic
+// of these services is ever written.
+static void on_vendor_spy_notify(NimBLERemoteCharacteristic* pChar,
+                                 uint8_t* data, uint16_t len, bool is_notify) {
+    (void)is_notify;
+    const char* tag = "VNDSPY";
+    for (uint8_t i = 0; i < s_spy_count; ++i) {
+        if (s_spy_chars[i] == pChar && s_spy_tags[i]) { tag = s_spy_tags[i]; break; }
+    }
+    app_log(tag, "notify len=%u", (unsigned)len);
+    gatt_dump_bytes(tag, data, (size_t)len);
+}
+
+static void gatt_spy_stop(void) {
+    for (uint8_t i = 0; i < s_spy_count; ++i) {
+        if (s_spy_chars[i]) {
+            s_spy_chars[i]->unsubscribe();
+        }
+        s_spy_chars[i] = nullptr;
+        s_spy_tags[i] = nullptr;
+    }
+    if (s_spy_count > 0) app_log("VNDSPY", "Passive vendor listener stopped");
+    s_spy_count = 0;
+}
+
+// Remember a vendor NOTIFY characteristic for passive listening. Collection
+// happens inside the explorer walk (no second service discovery, which comes
+// back empty right after the intensive dump); the actual subscribe() is done
+// once the walk is finished. Nothing is committed until the walk produced at
+// least one hit, so a degraded re-walk cannot silently kill a live listener.
+static NimBLERemoteCharacteristic*     s_spy_pend[8] = { nullptr };
+static const char*                     s_spy_pend_tag[8] = { nullptr };
+static uint8_t                         s_spy_pend_count = 0;
+
+static void gatt_spy_collect(NimBLERemoteCharacteristic* pChar, const char* tag) {
+    if (!pChar || !pChar->canNotify()) return;
+    for (uint8_t i = 0; i < s_spy_pend_count; ++i) {
+        if (s_spy_pend[i] == pChar) return; // already tracked
+    }
+    if (s_spy_pend_count >= 8) return;
+    s_spy_pend[s_spy_pend_count] = pChar;
+    s_spy_pend_tag[s_spy_pend_count] = tag;
+    s_spy_pend_count++;
+}
+
+// Subscribe to every collected vendor NOTIFY characteristic. Only the standard
+// CCCD is written by NimBLE's subscribe(); no vendor command is ever written.
+static void gatt_spy_subscribe_all(void) {
+    if (s_spy_pend_count == 0) {
+        app_log("VNDSPY", "No vendor NOTIFY characteristic discovered; passive listener unchanged");
+        return;
+    }
+    gatt_spy_stop(); // retire the previous link's subscriptions
+    for (uint8_t i = 0; i < s_spy_pend_count; ++i) {
+        s_spy_chars[i] = s_spy_pend[i];
+        s_spy_tags[i]  = s_spy_pend_tag[i];
+    }
+    s_spy_count = s_spy_pend_count;
+    for (uint8_t i = 0; i < s_spy_count; ++i) {
+        String cu = s_spy_chars[i]->getUUID().toString().c_str();
+        app_log("VNDSPY", "Subscribing (notify only) %s char %s",
+                s_spy_tags[i] ? s_spy_tags[i] : "?", cu.c_str());
+        s_spy_chars[i]->subscribe(true, on_vendor_spy_notify, false);
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    s_spy_pend_count = 0;
+    app_log("VNDSPY", "Passive vendor listener active on %u characteristic(s)", (unsigned)s_spy_count);
+}
+
+// Full GATT enumeration. Only runs on the Core 0 BLE task (like the handshake),
+// when the remote is connected and the ATVV handshake is done.
+//
+// allow_refresh selects HOW MUCH we are allowed to re-discover:
+//   true  -> handshake window, BEFORE any subscription exists. Every service may
+//            be re-discovered, so the dump covers the complete attribute
+//            database. This is the only safe point for a full dump.
+//   false -> runtime, while ATVV/HOGP/battery subscriptions are live. Only
+//            services the handshake never walked may be discovered.
+static void gatt_explore_all(bool allow_refresh) {
+    if (!s_client || !s_client->isConnected()) return;
+
+    app_log("GATTX", "===== GATT EXPLORER: %s dump start =====",
+            allow_refresh ? "FULL (handshake window, pre-subscription)" : "RUNTIME (vendor only)");
+    app_log("GATTX", "Looking for untapped capabilities: 0x180A Device Info / 0x2A4A Report Map / 0xfe59 / 0x01bf / 8a7a0001");
+    s_spy_pend_count = 0;
+    int svc_count = 0;
+    int char_count = 0;
+    int read_count = 0;
+
+    // NEVER refresh the service cache here. getServices(true) purges and rebuilds
+    // every NimBLERemoteService/Characteristic object, which silently invalidates
+    // the ATVV / HOGP / battery pointers subscribed during the handshake - the
+    // remote then stops delivering key reports. The handshake already discovered
+    // the services, so the cached list is complete.
+    std::vector<NimBLERemoteService*>* pServices = s_client->getServices(false);
+    if (!pServices) {
+        app_log("GATTX", "No services discovered on this connection");
+        return;
+    }
+
+    for (auto* pSvc : *pServices) {
+        if (!pSvc) continue;
+        String su = pSvc->getUUID().toString().c_str();
+        app_log("GATTX", "Service %s ...", su.c_str());
+        svc_count++;
+
+        // Identify the three never-decoded vendor services for passive listening.
+        String su_lc = su; su_lc.toLowerCase();
+        const char* vendor_tag = nullptr;
+        if (su_lc.indexOf("fe59") >= 0)      vendor_tag = "V-FE59";
+        else if (su_lc.indexOf("8a7a0001") >= 0) vendor_tag = "V-8A7A";
+        else if (su_lc.indexOf("01bf") >= 0)  vendor_tag = "V-01BF";
+
+        // Refresh rules. getCharacteristics(true) calls deleteCharacteristics(),
+        // which destroys and recreates every NimBLERemoteCharacteristic wrapper.
+        // In the handshake window that is harmless (nothing is subscribed yet) and
+        // gives complete coverage. At runtime it would silently invalidate the
+        // live ATVV/HOGP/battery pointers, so fall back to discovery only for
+        // services the handshake never walked.
+        std::vector<NimBLERemoteCharacteristic*>* pChars =
+            allow_refresh ? pSvc->getCharacteristics(true) : pSvc->getCharacteristics(false);
+        if (!pChars || pChars->empty()) {
+            pChars = pSvc->getCharacteristics(true);
+        }
+        if (!pChars || pChars->empty()) {
+            app_log("GATTX", "  (no characteristics discovered)");
+            continue;
+        }
+
+        for (auto* pChar : *pChars) {
+            if (!pChar) continue;
+            String cu = pChar->getUUID().toString().c_str();
+            String props;
+            if (pChar->canRead())            props += "READ ";
+            if (pChar->canWrite())           props += "WRITE ";
+            if (pChar->canWriteNoResponse()) props += "WRITENR ";
+            if (pChar->canNotify())          props += "NOTIFY ";
+            if (pChar->canIndicate())        props += "INDICATE ";
+            if (pChar->canBroadcast())       props += "BROADCAST ";
+            app_log("GATTX", "  Char %s [%s]", cu.c_str(), props.c_str());
+            char_count++;
+
+            // Vendor services: remember the NOTIFY ones for passive listening.
+            if (vendor_tag != nullptr) {
+                gatt_spy_collect(pChar, vendor_tag);
+            }
+
+            if (pChar->canRead()) {
+                NimBLEAttValue val = pChar->readValue();
+                read_count++;
+                gatt_dump_bytes("GATTX", val.data(), val.length());
+            }
+
+            std::vector<NimBLERemoteDescriptor*>* pDescs = pChar->getDescriptors(true);
+            if (pDescs) {
+                for (auto* pDesc : *pDescs) {
+                    if (!pDesc) continue;
+                    String du = pDesc->getUUID().toString().c_str();
+                    app_log("GATTX", "    Desc %s", du.c_str());
+                    NimBLEAttValue dval = pDesc->readValue();
+                    if (dval.length() > 0) {
+                        gatt_dump_bytes("GATTX", dval.data(), dval.length());
+                    }
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(8));
+        }
+    }
+
+    // Keep the mic pipeline coherent after a long enumeration: re-query caps
+    // so the ATVV link stays awake and voice-ready. In the handshake window
+    // ATVV has not been discovered yet, so the handshake issues GET_CAPS itself.
+    if (!allow_refresh && s_char_cmd) {
+        uint8_t cmd_caps[] = { 0x0A, 0x01, 0x00, 0x00, 0x03, 0x03 };
+        s_char_cmd->writeValue(cmd_caps, sizeof(cmd_caps), false);
+        app_log("GATTX", "Re-sent GET_CAPS after dump");
+    }
+    // One-line summary: a full dump emits several hundred lines and overruns the
+    // 120-entry log ring, so the totals are the only part that survives rotation.
+    app_log("GATTX", "SUMMARY mode=%s services=%d chars=%d values_read=%d vendor_notify=%d",
+            allow_refresh ? "FULL" : "RUNTIME", svc_count, char_count, read_count, (int)s_spy_pend_count);
+    app_log("GATTX", "===== GATT EXPLORER: dump complete =====");
+
+    // From here on, passively log whatever the vendor services push at us.
+    gatt_spy_subscribe_all();
+}
 extern "C" {
+
 
 void ble_remote_init(void) {
     s_ble_prefs.begin("ble_conf", false);
@@ -867,6 +1205,17 @@ void ble_remote_sniff_set(bool on) {
         s_disconnected_since_ms = 0;
     }
 }
+
+bool ble_remote_gatt_dump_enabled(void) {
+    return s_gatt_dump_enabled;
+}
+
+void ble_remote_gatt_dump_request(bool on) {
+    s_gatt_dump_enabled = on;
+    s_gatt_dump_pending = on; // dump on the current (or next) connection
+    if (!on) gatt_spy_stop();
+}
+
 
 void ble_remote_task(void) {
     uint32_t now = millis();
@@ -1059,6 +1408,41 @@ void ble_remote_task(void) {
             }
         }
     }
+
+    // 6. GATT explorer: run the one-shot enumeration once the remote is
+    // connected and the ATVV handshake is complete. Not while talking (disturbs
+    // the voice pipe). Re-dumps on every fresh connection while enabled.
+    if (s_gatt_dump_pending && s_ble_state == BLE_STATE_CONNECTED &&
+        s_client && s_client->isConnected() && s_char_cmd != nullptr) {
+        // Cooldown: a walk hammers the remote with dozens of reads, so a second
+        // trigger arriving right after would walk an unresponsive link and log a
+        // misleading empty dump. Defer instead of running back-to-back.
+        static uint32_t s_last_dump_ms = 0;
+        if (millis() - s_last_dump_ms >= 10000) {
+            s_gatt_dump_pending = false;
+            s_last_dump_ms = millis();
+            gatt_explore_all(false);
+        }
+    }
+
+    // 7. ATVV keepalive: the remote aborts an active microphone session after a
+    // hardware timeout (~15-60s) unless MIC_EXTEND (0x0E 0x00) keeps arriving.
+    // Without it, long voice sessions are cut off by the remote itself. Refresh
+    // the timer whenever audio actually flows so a live session never spams.
+    if (s_ble_state == BLE_STATE_TALKING && s_char_cmd != nullptr &&
+        s_client && s_client->isConnected()) {
+        if (now - s_last_audio_ms > 300) {
+            // No audio for 300ms: the remote is holding the mic open but idle.
+            if (now - s_last_extend_ms >= 10000) {
+                uint8_t cmd_extend[] = { 0x0E, 0x00 };
+                s_char_cmd->writeValue(cmd_extend, sizeof(cmd_extend), false);
+                s_last_extend_ms = now;
+                app_log("ATVV", "MIC_EXTEND keepalive sent (holding voice session open)");
+            }
+        } else {
+            s_last_extend_ms = now; // audio flowing, no keepalive needed
+        }
+    }
 }
 
 ble_remote_state_t ble_remote_get_state(void) {
@@ -1162,6 +1546,12 @@ String ble_remote_get_connected_info(void) {
     doc["bound_mac"] = s_bound_mac;
     doc["bound_name"] = s_bound_name;
     doc["battery_pct"] = s_battery_pct;
+    doc["dev_model"] = s_dev_model;
+    doc["dev_manufacturer"] = s_dev_manuf;
+    doc["dev_serial"] = s_dev_serial;
+    doc["dev_hw"] = s_dev_hw;
+    doc["dev_fw"] = s_dev_fw;
+    doc["dev_sw"] = s_dev_sw;
     String out;
     serializeJson(doc, out);
     return out;
@@ -1169,6 +1559,25 @@ String ble_remote_get_connected_info(void) {
 
 int ble_remote_get_battery_pct(void) {
     return s_battery_pct;
+}
+
+String ble_remote_get_device_info_model(void) {
+    return s_dev_model;
+}
+String ble_remote_get_device_info_manufacturer(void) {
+    return s_dev_manuf;
+}
+String ble_remote_get_device_info_serial(void) {
+    return s_dev_serial;
+}
+String ble_remote_get_device_info_hw(void) {
+    return s_dev_hw;
+}
+String ble_remote_get_device_info_fw(void) {
+    return s_dev_fw;
+}
+String ble_remote_get_device_info_sw(void) {
+    return s_dev_sw;
 }
 
 } // extern "C"

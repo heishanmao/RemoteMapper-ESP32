@@ -78,6 +78,17 @@ String ble_remote_get_connected_info(void);
 int ble_remote_get_battery_pct(void);
 
 /**
+ * @brief Get connected remote device information (if available). All fields are optional.
+ * Returned strings may be empty when not read yet.
+ */
+String ble_remote_get_device_info_model(void);
+String ble_remote_get_device_info_manufacturer(void);
+String ble_remote_get_device_info_serial(void);
+String ble_remote_get_device_info_hw(void);
+String ble_remote_get_device_info_fw(void);
+String ble_remote_get_device_info_sw(void);
+
+/**
  * @brief Notify the BLE layer that the Wi-Fi radio just woke up (ON_DEMAND wake).
  * A Wi-Fi re-init can starve BLE coexistence and drop the remote link; if that
  * happened the remote is likely advertising again, so drop the scan backoff to
@@ -97,6 +108,21 @@ bool ble_remote_sniff_enabled(void);
  * gesture events (single/double/long) can be analyzed.
  */
 void ble_remote_sniff_set(bool on);
+
+/**
+ * @brief Whether GATT full-dump exploration mode is currently active
+ */
+bool ble_remote_gatt_dump_enabled(void);
+
+/**
+ * @brief Enable/disable GATT explorer.
+ * While ON, every fresh remote connection triggers one full GATT enumeration
+ * (services/chars/descriptors + readable values), covering 0x180A Device Info,
+ * the HID Report Map (0x2A4A) and the unexplored vendor services 0xfe59 /
+ * 0x01bf / 8a7a0001-2c42-c2a2-0f36-41928c259b78. Results go to the ring log
+ * under the "GATTX" tag.
+ */
+void ble_remote_gatt_dump_request(bool on);
 
 #ifdef __cplusplus
 }

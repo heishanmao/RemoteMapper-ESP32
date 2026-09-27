@@ -524,6 +524,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                         <div id="ble-detail-bound-info" style="font-size: 16px; font-weight: bold; color: var(--accent-cyan);">正在获取...</div>
                         <div id="ble-detail-bound-mac" style="font-size: 13px; color: var(--text-muted); margin-top: 4px; font-family: monospace;">-</div>
                     </div>
+                    <div style="background: #090d16; border: 1px solid var(--border-color); border-radius: 10px; padding: 14px;">
+                        <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">遥控器本体信息 (0x180A 读取)</div>
+                        <div id="ble-detail-dev-model" style="font-size: 16px; font-weight: bold; color: var(--text-muted);">正在获取...</div>
+                        <div id="ble-detail-dev-extra" style="font-size: 12px; color: var(--text-muted); margin-top: 4px; line-height: 1.6;">-</div>
+                    </div>
                 </div>
             </div>
 
@@ -846,6 +851,18 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                             请先切到「运行日志」标签，再依次<strong>单击 / 双击 / 长按</strong>遥控器按键，观察是否出现 <code style="color:var(--accent-cyan);">SNIFF</code> / <code style="color:var(--accent-cyan);">&lt;-- MiBeacon</code> 行。测完记得关闭恢复连接。
                         </p>
                         <button class="btn" style="width: 100%;" id="sniff-btn" onclick="toggleAdvSniff()">开启 MiOT 广播嗅探</button>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <span>🧬 GATT 全量探测 (探索)</span>
+                            <span id="gatt-state" style="font-size: 12px; padding: 2px 8px; border-radius: 6px; background: rgba(100,116,139,0.15); color: var(--text-muted); border: 1px solid rgba(100,116,139,0.3);">关闭</span>
+                        </div>
+                        <p style="font-size: 13px; color: var(--text-muted); line-height: 1.6;">
+                            开启后，每次连上遥控器自动跑一次<strong>完整 GATT 枚举</strong>：逐个服务的特征 / 属性 / 可读数值 / 描述符，覆盖 <code style="color:var(--accent-cyan);">0x180A</code> 设备信息（型号/固件版本）、HID Report Map（<code style="color:var(--accent-cyan);">0x2A4A</code>）与三个未解密服务 <code style="color:var(--accent-cyan);">0xfe59 / 0x01bf / 8a7a0001</code>。结果写入「运行日志」<code style="color:var(--accent-cyan);">GATTX</code> 行。<br>
+                            探测需遥控器保持连接（先按任一键唤醒）；期间按键 / 语音不受影响。测完关闭。
+                        </p>
+                        <button class="btn" style="width: 100%;" id="gatt-btn" onclick="toggleGattDump()">开启 GATT 全量探测</button>
                     </div>
                 </div>
             </div>
@@ -2601,6 +2618,8 @@ if (mod & 0x01) chips.push('左Ctrl');
                 const batTipEl = document.getElementById('ble-detail-bat-tip');
                 const boundInfoEl = document.getElementById('ble-detail-bound-info');
                 const boundMacEl = document.getElementById('ble-detail-bound-mac');
+                const devModelEl = document.getElementById('ble-detail-dev-model');
+                const devExtraEl = document.getElementById('ble-detail-dev-extra');
                 if (connStateEl) {
                     if (d.connected) {
                         connStateEl.innerText = '已建立物理连接 (在线)';
@@ -2642,6 +2661,23 @@ if (mod & 0x01) chips.push('左Ctrl');
                         boundInfoEl.innerText = '未绑定任何遥控器';
                         boundInfoEl.style.color = 'var(--text-muted)';
                         boundMacEl.innerText = '自由配对模式：按下遥控器组合键将自动配对并绑定';
+                    }
+                }
+                if (devModelEl && devExtraEl) {
+                    if (d.connected && d.dev_model && d.dev_model.length > 0) {
+                        devModelEl.innerText = `${d.dev_model}`;
+                        devModelEl.style.color = 'var(--accent-cyan)';
+                        const parts = [];
+                        if (d.dev_fw)     parts.push('固件 ' + d.dev_fw);
+                        if (d.dev_hw)     parts.push('硬件 ' + d.dev_hw);
+                        if (d.dev_sw)     parts.push('软件 ' + d.dev_sw);
+                        if (d.dev_serial) parts.push('SN ' + d.dev_serial);
+                        if (d.dev_manufacturer) parts.push(d.dev_manufacturer);
+                        devExtraEl.innerText = parts.length > 0 ? parts.join(' · ') : '-';
+                    } else {
+                        devModelEl.innerText = d.connected ? '读取中...' : '未连接';
+                        devModelEl.style.color = 'var(--text-muted)';
+                        devExtraEl.innerText = d.connected ? '等待 0x180A 设备信息服务响应' : '设备离线时无法读取';
                     }
                 }
             } catch (e) {}
@@ -3200,6 +3236,39 @@ if (mod & 0x01) chips.push('左Ctrl');
             } catch (e) { showToast('切换失败: ' + e.message, true); }
         }
 
+        async function loadGattDumpState() {
+            try {
+                const r = await fetch('/api/debug/gatt-dump');
+                const d = await r.json();
+                renderGattDump(d.enabled === true);
+            } catch (e) {}
+        }
+
+        function renderGattDump(on) {
+            const st = document.getElementById('gatt-state');
+            const btn = document.getElementById('gatt-btn');
+            if (st) {
+                st.innerText = on ? '探测中' : '关闭';
+                st.style.background = on ? 'rgba(139,92,246,0.15)' : 'rgba(100,116,139,0.15)';
+                st.style.color = on ? '#a78bfa' : 'var(--text-muted)';
+                st.style.borderColor = on ? 'rgba(139,92,246,0.4)' : 'rgba(100,116,139,0.3)';
+            }
+            if (btn) btn.innerText = on ? '关闭 GATT 全量探测' : '开启 GATT 全量探测';
+        }
+
+        async function toggleGattDump() {
+            try {
+                const r = await fetch('/api/debug/gatt-dump', { method: 'POST' });
+                const d = await r.json();
+                renderGattDump(d.enabled === true);
+                if (d.enabled === true) {
+                    showToast('GATT 探测已开启：遥控器连接后自动枚举，请在「运行日志」查看 GATTX 行');
+                } else {
+                    showToast('GATT 探测已关闭');
+                }
+            } catch (e) { showToast('切换失败: ' + e.message, true); }
+        }
+
         async function saveGuardSettings() {
             const mod = parseInt(document.getElementById('guard-mod').value, 10) || 0;
             const key = parseInt(document.getElementById('guard-key').value, 10) || 0;
@@ -3225,6 +3294,7 @@ if (mod & 0x01) chips.push('左Ctrl');
         setInterval(refreshLogs, 2000);
         loadGuardSettings();
         loadAdvSniffState();
+        loadGattDumpState();
         loadKeymap();
         fetchStatus();
         refreshOtaStatus();
