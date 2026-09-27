@@ -22,6 +22,9 @@ void led_indicator_set(led_state_t state);
 // at-a-glance "device asleep / web unreachable" indication.
 void led_indicator_set_wifi_sleep(bool is_sleep);
 void led_indicator_trigger_key(bool is_voice_key);
+// Long red flash used when the stuck-key guard forces a HID release, so the
+// user sees the safety net fire instead of it being a mystery.
+void led_indicator_trigger_stuck(void);
 void led_indicator_set_layer_color(uint32_t rgb_color);
 void led_indicator_set_low_battery(bool is_low);
 

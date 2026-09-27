@@ -12,6 +12,7 @@
 #include "tusb.h"
 #include "esp32-hal-tinyusb.h"
 #include "esp_system.h"
+#include <Preferences.h>
 
 #if !ARDUINO_USB_CDC_ON_BOOT
 USBCDC USBSerial;
@@ -33,6 +34,255 @@ static uint32_t              s_last_soffn_change_ms = 0;
 static uint32_t              s_boot_grace_until_ms  = 0;
 static uint32_t              s_waiting_reconnect_ms = 0; // non-zero while we await soft re-enumeration
 
+static SemaphoreHandle_t    s_hid_mutex = NULL;
+
+// Non-recursive mutex guarding the USB HID reports + registry. Defined here in
+// plain C++ (file-local helpers): the guard section below lives outside the
+// extern "C" block, so keeping the same linkage avoids a C/C++ conflict.
+static void hid_lock(void) {
+    if (!s_hid_mutex) {
+        s_hid_mutex = xSemaphoreCreateMutex();
+    }
+    if (s_hid_mutex) {
+        xSemaphoreTake(s_hid_mutex, portMAX_DELAY);
+    }
+}
+
+static void hid_unlock(void) {
+    if (s_hid_mutex) {
+        xSemaphoreGive(s_hid_mutex);
+    }
+}
+
+// ===========================================================================
+// Stuck-Key Guard (Anti-Stuck Safety Net)
+// ---------------------------------------------------------------------------
+// Holds are registered when a hold-style action is emitted and cleared on
+// release / force-release. Rules run from usb_composite_task() and, when one
+// trips, force a fully consistent release (engine + USB report + audio + LED).
+// ===========================================================================
+#define HID_HELD_MAX 8
+typedef struct {
+    uint8_t  modifier;   // 0 = none
+    uint8_t  key_code;   // 0 = none
+    uint16_t consumer;   // 0 = none
+    bool     voice;      // true = part of a voice hold (exempt from normal rules)
+    bool     pressed;
+    uint32_t since_ms;
+} hid_held_entry_t;
+
+static hid_held_entry_t s_held[HID_HELD_MAX];
+static uint32_t         s_last_output_ms          = 0;
+static uint32_t         s_last_guard_check_ms     = 0;
+static bool             s_guard_inited            = false;
+static uint32_t         s_guard_mod_ms            = HID_GUARD_MOD_SOLO_MS;
+static uint32_t         s_guard_key_ms            = HID_GUARD_KEY_IDLE_MS;
+static uint32_t         s_guard_voice_ms          = HID_GUARD_VOICE_EXTREME_MS;
+static uint32_t         s_force_release_count     = 0;
+static uint32_t         s_last_force_ms           = 0;
+static char             s_last_force_reason[24]   = "";
+
+static void guard_load_config(void) {
+    if (s_guard_inited) return;
+    s_guard_inited = true;
+    Preferences p;
+    if (p.begin("guard_conf", true)) {
+        s_guard_mod_ms   = p.getUInt("mod_ms", HID_GUARD_MOD_SOLO_MS);
+        s_guard_key_ms   = p.getUInt("key_ms", HID_GUARD_KEY_IDLE_MS);
+        s_guard_voice_ms = p.getUInt("voice_ms", HID_GUARD_VOICE_EXTREME_MS);
+        p.end();
+    }
+}
+
+static void guard_add(uint8_t modifier, uint8_t key_code, uint16_t consumer, bool voice) {
+    uint32_t now = millis();
+    for (int i = 0; i < HID_HELD_MAX; i++) {
+        hid_held_entry_t *e = &s_held[i];
+        if (!e->pressed) {
+            e->modifier = modifier;
+            e->key_code = key_code;
+            e->consumer = consumer;
+            e->voice    = voice;
+            e->pressed  = true;
+            e->since_ms = now;
+            return;
+        }
+    }
+    // Registry full: force everything out rather than risk a stuck key.
+    usb_composite_force_release_all("registry-full");
+}
+
+static void guard_clear_nonvoice(void) {
+    for (int i = 0; i < HID_HELD_MAX; i++) {
+        hid_held_entry_t *e = &s_held[i];
+        if (e->pressed && !e->voice) {
+            e->pressed  = false;
+            e->modifier = 0;
+            e->key_code = 0;
+            e->consumer = 0;
+        }
+    }
+}
+
+static void guard_clear_voice(void) {
+    for (int i = 0; i < HID_HELD_MAX; i++) {
+        hid_held_entry_t *e = &s_held[i];
+        if (e->pressed && e->voice) {
+            e->pressed  = false;
+            e->modifier = 0;
+            e->key_code = 0;
+            e->consumer = 0;
+        }
+    }
+}
+
+static void guard_clear_all(void) {
+    for (int i = 0; i < HID_HELD_MAX; i++) {
+        s_held[i].pressed  = false;
+        s_held[i].modifier = 0;
+        s_held[i].key_code = 0;
+        s_held[i].consumer = 0;
+        s_held[i].voice    = false;
+    }
+}
+
+static bool guard_has_held(void) {
+    for (int i = 0; i < HID_HELD_MAX; i++) {
+        if (s_held[i].pressed) return true;
+    }
+    return false;
+}
+
+// Periodic stuck-key rule evaluation (called from usb_composite_task).
+static void guard_tick(uint32_t now) {
+    guard_load_config();
+
+    if ((now - s_last_guard_check_ms) < 250) {
+        return;
+    }
+    s_last_guard_check_ms = now;
+
+    bool any_held     = false;
+    bool any_voice    = false;
+    uint32_t first_ms      = 0; // earliest press among registered holds
+    uint32_t first_voice_ms = 0;
+    for (int i = 0; i < HID_HELD_MAX; i++) {
+        const hid_held_entry_t *e = &s_held[i];
+        if (!e->pressed) continue;
+        if (e->voice) {
+            any_voice = true;
+            if (first_voice_ms == 0 || e->since_ms < first_voice_ms) first_voice_ms = e->since_ms;
+        } else {
+            any_held = true;
+            if (first_ms == 0 || e->since_ms < first_ms) first_ms = e->since_ms;
+        }
+    }
+
+    // Rule V: absolute ceiling for a voice recording (exempt from normal rules).
+    if (any_voice && s_guard_voice_ms && (now - first_voice_ms >= s_guard_voice_ms)) {
+        usb_composite_force_release_all("voice-extreme");
+        return;
+    }
+
+    // Rule M: any modifier held continuously past the ceiling, regardless of
+    // whatever else is going on (this is the classic "PC thinks Alt is down").
+    for (int i = 0; i < HID_HELD_MAX; i++) {
+        const hid_held_entry_t *e = &s_held[i];
+        if (!e->pressed || e->voice || e->modifier == 0) continue;
+        if (s_guard_mod_ms && (now - e->since_ms >= s_guard_mod_ms)) {
+            usb_composite_force_release_all("modifier-hold");
+            return;
+        }
+    }
+
+    // Rule K: a non-voice key held down with zero further output -> release.
+    if (any_held && s_guard_key_ms && (now - s_last_output_ms >= s_guard_key_ms)) {
+        usb_composite_force_release_all("key-idle");
+    }
+}
+
+bool usb_composite_guard_get(usb_guard_config_t *cfg, usb_guard_stats_t *stats) {
+    guard_load_config();
+    if (cfg) {
+        cfg->mod_ms   = s_guard_mod_ms;
+        cfg->key_ms   = s_guard_key_ms;
+        cfg->voice_ms = s_guard_voice_ms;
+    }
+    if (stats) {
+        stats->forced_releases = s_force_release_count;
+        stats->last_force_ms   = s_last_force_ms;
+        snprintf(stats->last_reason, sizeof(stats->last_reason), "%s", s_last_force_reason);
+        stats->any_held  = false;
+        stats->held_count = 0;
+        for (int i = 0; i < HID_HELD_MAX; i++) {
+            if (s_held[i].pressed) {
+                stats->any_held = true;
+                stats->held_count++;
+            }
+        }
+    }
+    return true;
+}
+
+bool usb_composite_guard_set(const usb_guard_config_t *cfg) {
+    if (!cfg) return false;
+    guard_load_config();
+    s_guard_mod_ms   = cfg->mod_ms;
+    s_guard_key_ms   = cfg->key_ms;
+    s_guard_voice_ms = cfg->voice_ms;
+    Preferences p;
+    if (!p.begin("guard_conf", false)) {
+        return false;
+    }
+    bool ok = p.putUInt("mod_ms", s_guard_mod_ms)   != 0;
+    ok      = p.putUInt("key_ms", s_guard_key_ms)   != 0 && ok;
+    ok      = p.putUInt("voice_ms", s_guard_voice_ms) != 0 && ok;
+    p.end();
+    app_log("GUARD", "Config updated: mod=%ums key=%ums voice=%ums",
+            (unsigned)s_guard_mod_ms, (unsigned)s_guard_key_ms, (unsigned)s_guard_voice_ms);
+    return ok;
+}
+
+void usb_composite_force_release_all(const char* reason) {
+    // Nothing held and nothing recording -> this is a no-op (e.g. the USB bus
+    // stops during the very first enumeration at boot). Don't count/flash.
+    if (!guard_has_held() && !g_audio_pipeline.active) return;
+
+    s_force_release_count++;
+    s_last_force_ms = millis();
+    snprintf(s_last_force_reason, sizeof(s_last_force_reason), "%s", reason);
+    app_log("GUARD", "Forced HID release (reason=%s, count=%u)",
+            reason, (unsigned)s_force_release_count);
+
+    // 1. Stop any running voice/audio session first (engine release will emit
+    //    a VOICE_RELEASE but the session must not outlive the forced release).
+    if (g_audio_pipeline.active) {
+        audio_pipeline_stop_session(&g_audio_pipeline);
+    }
+
+    // 2. Let the key engine release every slot: it emits the proper RELEASE
+    //    actions and clears internal press state consistently.
+    extern key_mapper_engine_t g_key_engine;
+    key_engine_release_all(&g_key_engine, millis());
+
+    // 3. Hard-clear the USB reports so the PC can never see a ghost key/modifier.
+    hid_lock();
+    if (s_usb_ready) {
+        KeyReport clear_report = {0};
+        s_keyboard.sendReport(&clear_report);
+        s_keyboard.releaseAll();
+        s_consumer.release();
+    }
+    hid_unlock();
+
+    // 4. Registry is now empty regardless.
+    guard_clear_all();
+
+    // 5. Visual: red flash so the user sees the guard fired, then normal status.
+    led_indicator_trigger_stuck();
+    led_indicator_set(LED_STATE_CONNECTED);
+}
+
 extern "C" {
 
 void usb_composite_init(void) {
@@ -49,6 +299,9 @@ void usb_composite_init(void) {
     USB.onEvent([](void* arg, esp_event_base_t base, int32_t id, void* data) {
         if (id == ARDUINO_USB_SUSPEND_EVENT) {
             app_log("USB", "USB Suspend Event (PC Sleep/Standby)");
+            // PC cannot see our state while asleep: drop everything we hold so a
+            // ghost key never survives the sleep/wake cycle.
+            usb_composite_force_release_all("usb-suspend");
         } else if (id == ARDUINO_USB_RESUME_EVENT) {
             app_log("USB", "USB Resume Event (PC Woke up)");
             for (uint8_t ep = 1; ep <= 4; ep++) {
@@ -56,12 +309,14 @@ void usb_composite_init(void) {
             }
             s_keyboard.releaseAll();
             s_consumer.release();
+            guard_clear_all();
         } else if (id == ARDUINO_USB_STARTED_EVENT) {
             s_waiting_reconnect_ms = 0; // soft re-enumeration succeeded
             app_log("USB", "USB Started / Mounted");
             for (uint8_t ep = 1; ep <= 4; ep++) {
                 usbd_edpt_clear_stall(0, (uint8_t)(ep | 0x80));
             }
+            guard_clear_all();
             // Host (re-)enumerated us: boot, PC reboot, or Device Manager
             // re-enable. The user is at the PC, so make the web UI reachable
             // in case the on-demand idle timeout had powered the radio down.
@@ -69,6 +324,7 @@ void usb_composite_init(void) {
             wifi_manager_notify_usb_mounted();
         } else if (id == ARDUINO_USB_STOPPED_EVENT) {
             app_log("USB", "USB Stopped / Bus Reset");
+            usb_composite_force_release_all("usb-stopped");
         }
     });
 
@@ -88,6 +344,7 @@ void usb_composite_task(void) {
     uac_microphone_task();
 
     uint32_t now = millis();
+    guard_tick(now);
     // Soft re-enumeration safety net: if the host did not re-mount us within
     // 4s of the D+/D- detach, fall back to a full restart (today's behavior).
     if (s_waiting_reconnect_ms != 0 && (now - s_waiting_reconnect_ms >= 4000)) {
@@ -144,23 +401,6 @@ void usb_composite_task(void) {
         } else {
             s_hw_sleep_detected = false;
         }
-    }
-}
-
-static SemaphoreHandle_t s_hid_mutex = NULL;
-
-static void hid_lock(void) {
-    if (!s_hid_mutex) {
-        s_hid_mutex = xSemaphoreCreateMutex();
-    }
-    if (s_hid_mutex) {
-        xSemaphoreTake(s_hid_mutex, portMAX_DELAY);
-    }
-}
-
-static void hid_unlock(void) {
-    if (s_hid_mutex) {
-        xSemaphoreGive(s_hid_mutex);
     }
 }
 
@@ -240,6 +480,9 @@ bool usb_hid_consumer_tap(uint16_t usage_code) {
 void usb_hid_dispatch_action(const key_action_t *action) {
     if (!action) return;
 
+    // Every emitted action counts as output activity for the stuck-key rules.
+    s_last_output_ms = millis();
+
     // User input feeds ON_DEMAND power management: keeps the radio alive, or
     // triggers the 5-press-of-same-key wake gesture after an idle power-down.
     uint16_t gesture_key = (uint16_t)(((uint16_t)action->type << 8) |
@@ -262,22 +505,27 @@ void usb_hid_dispatch_action(const key_action_t *action) {
             usb_hid_keyboard_tap(action->modifier, action->key_code);
             break;
         case ACTION_KEYBOARD_HOLD:
+            guard_add(action->modifier, action->key_code, 0, false);
             usb_hid_keyboard_press(action->modifier, action->key_code);
             break;
         case ACTION_KEYBOARD_RELEASE:
+            guard_clear_nonvoice();
             usb_hid_keyboard_release();
             break;
         case ACTION_CONSUMER_TAP:
             usb_hid_consumer_tap(action->consumer_code);
             break;
         case ACTION_CONSUMER_HOLD:
+            guard_add(0, 0, action->consumer_code, false);
             usb_hid_consumer_press(action->consumer_code);
             break;
         case ACTION_CONSUMER_RELEASE:
+            guard_clear_nonvoice();
             usb_hid_consumer_release();
             break;
         case ACTION_VOICE_HOLD:
             // Hold Voice Hotkey and start audio session
+            guard_add(action->modifier, action->key_code, 0, true);
             audio_pipeline_start_session(&g_audio_pipeline, 0);
             if (action->modifier != 0 || action->key_code != 0) {
                 usb_hid_keyboard_press(action->modifier, action->key_code);
@@ -285,6 +533,7 @@ void usb_hid_dispatch_action(const key_action_t *action) {
             break;
         case ACTION_VOICE_RELEASE:
             // Release Voice Hotkey and stop audio session
+            guard_clear_voice();
             usb_hid_keyboard_release();
             audio_pipeline_stop_session(&g_audio_pipeline);
             break;

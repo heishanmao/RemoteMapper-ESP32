@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include "keymap/key_config_storage.h"
 #include "keymap/key_state_machine.h"
+#include "usb/usb_composite.h"
 #include "log/app_log.h"
 
 extern key_mapper_engine_t g_key_engine;
@@ -228,6 +229,10 @@ bool nvs_manager_apply_json(const String& json_str, String& err_msg) {
         app_log("NVS", "Keymap reload fallback to safe defaults");
         key_engine_load_defaults(&g_key_engine);
     }
+
+    // The stored keymap may differ from what was held when the config changed:
+    // clear every held HID state so no key ghosts into the reloaded layout.
+    usb_composite_force_release_all("keymap-reload");
 
     app_log("NVS", "NVS configuration validated & updated safely via Web Manager");
     return true;

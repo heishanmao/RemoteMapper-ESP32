@@ -6,6 +6,7 @@
 #include "ble/ble_remote_client.h"
 #include "audio/audio_pipeline.h"
 #include "usb/uac_microphone.h"
+#include "usb/usb_composite.h"
 #include "keymap/key_state_machine.h"
 #include "keymap/key_config_storage.h"
 #include "nvs/nvs_manager.h"
@@ -64,6 +65,16 @@ static void handle_status() {
         doc["ota_target_label"] = next_p->label;
     }
 
+    usb_guard_config_t guard_cfg;
+    usb_guard_stats_t  guard_stats;
+    usb_composite_guard_get(&guard_cfg, &guard_stats);
+    JsonObject guard = doc["guard"].to<JsonObject>();
+    guard["mod_ms"]   = guard_cfg.mod_ms;
+    guard["key_ms"]   = guard_cfg.key_ms;
+    guard["voice_ms"] = guard_cfg.voice_ms;
+    guard["forced"]   = guard_stats.forced_releases;
+    guard["last_reason"] = guard_stats.last_reason;
+
     String out;
     serializeJson(doc, out);
     s_server.send(200, "application/json", out);
@@ -102,6 +113,51 @@ static void handle_audio() {
     String out;
     serializeJson(doc, out);
     s_server.send(200, "application/json", out);
+}
+
+static void handle_guard() {
+    wifi_manager_mark_activity();
+    usb_guard_config_t cfg;
+    usb_guard_stats_t   stats;
+    usb_composite_guard_get(&cfg, &stats);
+    JsonDocument doc;
+    doc["mod_ms"]     = cfg.mod_ms;
+    doc["key_ms"]     = cfg.key_ms;
+    doc["voice_ms"]   = cfg.voice_ms;
+    doc["forced"]     = stats.forced_releases;
+    doc["last_reason"]= stats.last_reason;
+    doc["last_force_ms"] = stats.last_force_ms;
+    doc["any_held"]   = stats.any_held;
+    doc["held_count"] = stats.held_count;
+    String out;
+    serializeJson(doc, out);
+    s_server.send(200, "application/json", out);
+}
+
+static void handle_guard_set() {
+    if (!s_server.hasArg("plain")) {
+        s_server.send(400, "application/json", "{\"error\":\"missing_body\"}");
+        return;
+    }
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, s_server.arg("plain"));
+    if (err) {
+        s_server.send(400, "application/json", "{\"error\":\"invalid_json\"}");
+        return;
+    }
+    usb_guard_config_t cfg;
+    usb_guard_stats_t stats;
+    usb_composite_guard_get(&cfg, &stats);
+    if (doc["mod_ms"].is<int>())   cfg.mod_ms   = doc["mod_ms"];
+    if (doc["key_ms"].is<int>())   cfg.key_ms   = doc["key_ms"];
+    if (doc["voice_ms"].is<int>()) cfg.voice_ms = doc["voice_ms"];
+    if (!usb_composite_guard_set(&cfg)) {
+        s_server.send(500, "application/json", "{\"error\":\"save_failed\"}");
+        return;
+    }
+    String out;
+    serializeJson(doc, out);
+    s_server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
 static void handle_wifi_scan() {
@@ -173,6 +229,9 @@ static void handle_keymap_save() {
     bool ok = key_config_from_json(&g_key_engine, s_server.arg("plain"));
     if (ok) {
         key_config_storage_save(&g_key_engine);
+        // The keymap just changed under possibly-held remote buttons: drop every
+        // held state so old bindings can never ghost into the new layout.
+        usb_composite_force_release_all("keymap-reload");
         s_server.send(200, "application/json", "{\"status\":\"saved\"}");
     } else {
         s_server.send(400, "application/json", "{\"error\":\"invalid_keymap_format\"}");
@@ -181,6 +240,7 @@ static void handle_keymap_save() {
 
 static void handle_keymap_reset() {
     key_config_storage_reset_defaults(&g_key_engine);
+    usb_composite_force_release_all("keymap-reset");
     app_log("KEYMAP", "Reset keymap to factory defaults via Web API");
     s_server.send(200, "application/json", "{\"status\":\"reset_ok\"}");
 }
@@ -540,6 +600,8 @@ void web_server_init(void) {
     s_server.on("/api/config/export", HTTP_GET, handle_config_export);
     s_server.on("/api/config/import", HTTP_POST, handle_config_import);
     s_server.on("/api/audio", HTTP_GET, handle_audio);
+    s_server.on("/api/guard", HTTP_GET, handle_guard);
+    s_server.on("/api/guard", HTTP_POST, handle_guard_set);
 
 #if REMOTEMAPPER_OTA
     s_server.on("/api/ota/status", HTTP_GET, handle_ota_status);

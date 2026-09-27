@@ -60,6 +60,42 @@ void usb_hid_dispatch_action(const key_action_t *action);
  */
 void usb_audio_task(void);
 
+/**
+ * @brief Stuck-key guard configuration (0 disables a rule; units in ms).
+ */
+typedef struct {
+    uint32_t mod_ms;   // Modifier held longer than this -> force release (0 = off)
+    uint32_t key_ms;   // Non-voice key down with zero output -> force release (0 = off)
+    uint32_t voice_ms; // Absolute ceiling for a voice recording (0 = off)
+} usb_guard_config_t;
+
+/**
+ * @brief Stuck-key guard live statistics.
+ */
+typedef struct {
+    uint32_t forced_releases;   // Total times the guard forced a release
+    uint32_t last_force_ms;     // ms tick of the last forced release (0 = never)
+    char     last_reason[24];   // Reason string of the last forced release
+    bool     any_held;          // true while any HID hold is currently registered
+    uint32_t held_count;        // Number of currently registered held entries
+} usb_guard_stats_t;
+
+/**
+ * @brief Get current guard config + live stats.
+ */
+bool usb_composite_guard_get(usb_guard_config_t *cfg, usb_guard_stats_t *stats);
+
+/**
+ * @brief Set guard config (persisted to NVS).
+ */
+bool usb_composite_guard_set(const usb_guard_config_t *cfg);
+
+/**
+ * @brief Immediately force-release all held HID keys/consumer/voice session,
+ *        in a consistent way (engine + USB report + audio + LED) and log the reason.
+ */
+void usb_composite_force_release_all(const char* reason);
+
 #ifdef __cplusplus
 }
 #endif

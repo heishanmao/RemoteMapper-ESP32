@@ -135,6 +135,13 @@ void led_indicator_trigger_key(bool is_voice_key) {
     s_is_flashing = true;
 }
 
+void led_indicator_trigger_stuck(void) {
+    s_layer_flash = false;
+    s_flash_state = LED_STATE_MIC_KEY_PRESS; // red
+    s_flash_expire_time = millis() + 300;     // Long red flash: guard fired
+    s_is_flashing = true;
+}
+
 void led_indicator_set_wifi_sleep(bool is_sleep) {
     if (s_wifi_sleep == is_sleep) {
         return;

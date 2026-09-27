@@ -80,6 +80,16 @@ extern "C" {
 #define WIFI_WAKE_PRESS_THRESHOLD 5
 #define WIFI_WAKE_PRESS_WINDOW_MS 5000
 
+// ==========================================
+// 6. Stuck-Key Guard (Anti-Stuck Safety Net)
+// ==========================================
+// Automatic forced-release rules that keep the PC-side HID state clean even when
+// a release never arrives (dropped BLE packet, remote battery death, etc.).
+// 0 disables a rule. Values are milliseconds.
+#define HID_GUARD_MOD_SOLO_MS      20000    // Any modifier held > 20s (independent of other keys)
+#define HID_GUARD_KEY_IDLE_MS      60000    // Non-voice key held with zero output for > 60s
+#define HID_GUARD_VOICE_EXTREME_MS 900000   // Absolute ceiling for a voice recording (15 min)
+
 #ifdef __cplusplus
 }
 #endif
