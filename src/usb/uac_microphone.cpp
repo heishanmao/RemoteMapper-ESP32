@@ -2,6 +2,7 @@
 #include "esp32-hal-tinyusb.h"
 #include "led_indicator.h"
 #include "audio/audio_pipeline.h"
+#include "wifi/wifi_manager.h"
 #include "log/app_log.h"
 #include "tusb.h"
 #include "device/usbd_pvt.h"
@@ -76,12 +77,22 @@ static void uac_watchdog_task(void* arg) {
 static void uac_push_task(void* arg) {
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t interval = pdMS_TO_TICKS(2);
+    uint32_t last_wifi_mark_ms = 0;
     while (1) {
         vTaskDelayUntil(&last_wake, interval);
 
         if (!s_uac_streaming || !tud_mounted() || tud_suspended()) {
             continue;
         }
+
+        // While the mic stream is live, count it as host activity so the
+        // ON_DEMAND WiFi radio does not sleep under active voice use.
+        uint32_t now = millis();
+        if ((now - last_wifi_mark_ms) >= 500) {
+            last_wifi_mark_ms = now;
+            wifi_manager_mark_activity();
+        }
+
         if (s_uac_ep_in == 0) {
             continue;
         }
@@ -192,6 +203,9 @@ static bool uac_driver_control_xfer_cb(uint8_t rhport, uint8_t stage,
                 return false; // Crucial: Let other class drivers (HID, CDC) handle their own interfaces!
             }
             uint8_t alt = (uint8_t)req->wValue;
+            if (alt != s_uac_alt) {
+                app_log("UAC", alt ? "Stream ARMED by host (alt=1, 16kHz mono)" : "Stream STOPPED by host (alt=0)");
+            }
             s_uac_alt       = alt;
             s_uac_streaming = (alt == 1);
 
@@ -239,10 +253,16 @@ static bool uac_driver_xfer_cb(uint8_t rhport, uint8_t ep_addr,
     (void)rhport;
     if (ep_addr == (uint8_t)(s_uac_ep_in | 0x80)) {
         s_xfer_cb_count++;
-        static uint32_t loop_counter = 0;
-        loop_counter++;
-        if (loop_counter % 1000 == 0) {
-            app_log("UAC", "USB TX alive: ringbuf avail: %d", audio_ring_buffer_available_read(&g_audio_pipeline.ring_buf));
+        // No periodic "TX alive" spam: the steady 2s beat of completions is the
+        // normal healthy case. Only surface real problems here. Log when the
+        // TX path is starving (pushing silence because the ring is empty) at
+        // most once every 5s, so /api/logs stays readable during voice sessions.
+        static uint32_t s_last_starvation_log_ms = 0;
+        uint32_t now = millis();
+        size_t avail = audio_ring_buffer_available_read(&g_audio_pipeline.ring_buf);
+        if (avail == 0 && (now - s_last_starvation_log_ms >= 5000)) {
+            s_last_starvation_log_ms = now;
+            app_log("UAC", "TX starved: ring empty (underruns=%u)", (unsigned)g_audio_pipeline.underrun_count);
         }
         // NOTE: do NOT re-queue here. The 500Hz push task paces the next
         // submission; re-queueing inside this callback races the 2ms token and
@@ -303,6 +323,15 @@ bool uac_microphone_init(void) {
 
 void uac_microphone_task(void) {
     // Nothing — push is driven by the dedicated 500Hz uac_push task.
+}
+
+void uac_microphone_get_control(uint8_t* mute, int16_t* volume) {
+    if (mute)   *mute   = s_mic_mute;
+    if (volume) *volume = s_mic_volume;
+}
+
+uint8_t uac_microphone_get_alt(void) {
+    return s_uac_alt;
 }
 
 bool uac_microphone_is_streaming(void) {

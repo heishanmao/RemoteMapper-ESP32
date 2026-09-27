@@ -982,7 +982,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             <!-- Keyboard Direct Capture Box -->
             <div class="key-recorder-box" id="key-recorder-box" tabindex="0" onclick="startKeyboardRecording()">
                 <div style="font-size: 13px; color: var(--text-muted);" id="recorder-instruction">
-                    在键盘上按下任意按键或快捷键（支持 Ctrl/Alt/Win/Shift 组合键）
+                    在键盘上按下任意按键或快捷键（支持左/右 Ctrl/Alt/Win/Shift 组合键，自动区分左右）
                 </div>
                 <div class="key-badge-display" id="recorded-badge-display">
                     <span style="color: var(--text-muted); font-size: 14px; font-weight: normal;">点击此处开始按键录制</span>
@@ -1011,10 +1011,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                             <option value="k:0x00:0x46">屏幕截图</option>
                         </optgroup>
                         <optgroup label="单修饰键">
-                            <option value="m:0x08:0x00">Win 键</option>
-                            <option value="m:0x01:0x00">Ctrl 键</option>
-                            <option value="m:0x04:0x00">Alt 键</option>
-                            <option value="m:0x02:0x00">Shift 键</option>
+                            <option value="m:0x08:0x00">左Win 键</option>
+                            <option value="m:0x80:0x00">右Win 键</option>
+                            <option value="m:0x01:0x00">左Ctrl 键</option>
+                            <option value="m:0x10:0x00">右Ctrl 键</option>
+                            <option value="m:0x04:0x00">左Alt 键</option>
+                            <option value="m:0x40:0x00">右Alt 键</option>
+                            <option value="m:0x02:0x00">左Shift 键</option>
+                            <option value="m:0x20:0x00">右Shift 键</option>
                         </optgroup>
                         <optgroup label="方向与翻页导航">
                             <option value="k:0x00:0x52">方向上</option>
@@ -1055,11 +1059,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                             <option value="k:0x00:0x73">F24</option>
                         </optgroup>
                         <optgroup label="常用快捷组合键">
-                            <option value="k:0x04:0x36">Alt + ,</option>
+                            <option value="k:0x04:0x36">左Alt + ,</option>
+                            <option value="k:0x40:0x36">右Alt + ,</option>
                             <option value="k:0x08:0x0B">Win + H</option>
                             <option value="k:0x08:0x07">Win + D</option>
-                            <option value="k:0x04:0x2B">Alt + Tab</option>
-                            <option value="k:0x04:0x3D">Alt + F4</option>
+                            <option value="k:0x04:0x2B">左Alt + Tab</option>
+                            <option value="k:0x40:0x2B">右Alt + Tab</option>
+                            <option value="k:0x04:0x3D">左Alt + F4</option>
+                            <option value="k:0x40:0x3D">右Alt + F4</option>
                             <option value="k:0x01:0x06">Ctrl + C</option>
                             <option value="k:0x01:0x19">Ctrl + V</option>
                             <option value="k:0x01:0x1D">Ctrl + Z</option>
@@ -1084,7 +1091,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 <!-- Numerical Inputs -->
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
                     <div>
-                        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">修饰键（0x01=Ctrl, 0x02=Shift, 0x04=Alt, 0x08=Win）</label>
+                        <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">修饰键（0x01=左Ctrl, 0x02=左Shift, 0x04=左Alt, 0x08=左Win, 0x10=右Ctrl, 0x20=右Shift, 0x40=右Alt, 0x80=右Win）</label>
                         <input type="text" id="adv-mod" value="0x00" oninput="onAdvInputChanged()" placeholder="0x00" style="width:100%; padding:8px 10px; background:#151d2a; border:1px solid #243247; color:#fff; border-radius:8px; font-size:13px; outline:none; font-family:monospace;">
                     </div>
                     <div>
@@ -1360,10 +1367,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             if (type === 0 || (!key && !cons && !mod)) return '未映射';
 
             let parts = [];
-            if (mod & 0x01) parts.push('Ctrl');
-            if (mod & 0x04) parts.push('Alt');
-            if (mod & 0x02) parts.push('Shift');
-            if (mod & 0x08) parts.push('Win');
+            if (mod & 0x01) parts.push('左Ctrl');
+            if (mod & 0x10) parts.push('右Ctrl');
+            if (mod & 0x02) parts.push('左Shift');
+            if (mod & 0x20) parts.push('右Shift');
+            if (mod & 0x04) parts.push('左Alt');
+            if (mod & 0x40) parts.push('右Alt');
+            if (mod & 0x08) parts.push('左Win');
+            if (mod & 0x80) parts.push('右Win');
 
             if (cons > 0) {
                 const consMap = {
@@ -1892,7 +1903,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                     renderTriggerView(2, curMod, curKey, 0);
                     startKeyboardRecording();
                 } else if (mode === 7) {
-                    if (inst) inst.innerHTML = '<b>语音按键快捷键</b>：敲击键盘录制录音时发送的快捷键（如 Alt+, 或 Win+H）';
+                    if (inst) inst.innerHTML = '<b>语音按键快捷键</b>：敲击键盘录制录音时发送的快捷键（默认 右Alt+,；支持左/右 Alt、Ctrl、Shift、Win 组合）';
                     let curKey = (curCode > 0 && curCode < 500) ? curCode : 54;
                     renderTriggerView(7, curMod || 64, curKey, 0);
                     startKeyboardRecording();
@@ -2058,10 +2069,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             }
 
             let chips = [];
-            if (mod & 0x01) chips.push('Ctrl');
-            if (mod & 0x04) chips.push('Alt');
-            if (mod & 0x02) chips.push('Shift');
-            if (mod & 0x08) chips.push('Win');
+            if (mod & 0x01) chips.push('左Ctrl');
+            if (mod & 0x10) chips.push('右Ctrl');
+            if (mod & 0x02) chips.push('左Shift');
+            if (mod & 0x20) chips.push('右Shift');
+            if (mod & 0x04) chips.push('左Alt');
+            if (mod & 0x40) chips.push('右Alt');
+            if (mod & 0x08) chips.push('左Win');
+            if (mod & 0x80) chips.push('右Win');
 
             if (cons > 0) {
                 const consMap = {
@@ -2265,14 +2280,21 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             e.preventDefault();
             e.stopPropagation();
 
+            // Track modifier side (left/right) from modifier keydowns so a
+            // recorded 快捷键 can distinguish 左/右 Alt / Ctrl / Shift / Win.
+            const modSideR = (window.__modSideR = window.__modSideR || {});
+            if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) {
+                modSideR[e.key] = (e.location === 2); // location 2 = right side
+            }
+
             // Ignore standalone modifier presses (wait for actual key)
             if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) return;
 
             let mod = 0;
-            if (e.ctrlKey) mod |= 0x01; // LCTRL
-            if (e.shiftKey) mod |= 0x02; // LSHIFT
-            if (e.altKey) mod |= 0x04; // LALT
-            if (e.metaKey) mod |= 0x08; // LGUI (Win)
+            if (e.ctrlKey)  mod |= modSideR['Control'] ? 0x10 : 0x01; // RCTRL / LCTRL
+            if (e.shiftKey) mod |= modSideR['Shift']  ? 0x20 : 0x02; // RSHIFT / LSHIFT
+            if (e.altKey)   mod |= modSideR['Alt']    ? 0x40 : 0x04; // RALT / LALT
+            if (e.metaKey)  mod |= modSideR['Meta']   ? 0x80 : 0x08; // RGUI / LGUI (Win)
 
             const hidCode = DOM_TO_HID[e.code] || 0;
             const isVoice = (editingKey === 0x04 || editingKey === 0x3E);

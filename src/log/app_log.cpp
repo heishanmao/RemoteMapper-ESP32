@@ -1,6 +1,7 @@
 #include "app_log.h"
 #include <ArduinoJson.h>
 #include <USBCDC.h>
+#include <esp_heap_caps.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -18,16 +19,28 @@ static bool s_console_log_enabled = true;
 
 #define STATIC_LOG_LINES 250
 #define LOG_LINE_MAX_LEN 160
+#define LOG_RING_BYTES   (STATIC_LOG_LINES * LOG_LINE_MAX_LEN)
 
-static char   s_log_lines[STATIC_LOG_LINES][LOG_LINE_MAX_LEN];
+// The log ring is 250 x 160 = 40KB. Host it in PSRAM (sparse audio/OTA wakeup
+// traffic makes it OK there) and fall back to internal RAM if PSRAM is absent,
+// keeping internal heap for BLE + web JSON + OTA.
+static char* s_log_lines = NULL;
 static size_t s_log_head = 0;
 static size_t s_log_count = 0;
 static portMUX_TYPE s_log_mux = portMUX_INITIALIZER_UNLOCKED;
 
 void app_log_init(void) {
+    if (!s_log_lines) {
+        s_log_lines = (char*)heap_caps_malloc(LOG_RING_BYTES, MALLOC_CAP_SPIRAM);
+        if (!s_log_lines) {
+            s_log_lines = (char*)malloc(LOG_RING_BYTES); // internal-RAM fallback
+        }
+    }
     s_log_head = 0;
     s_log_count = 0;
-    memset(s_log_lines, 0, sizeof(s_log_lines));
+    if (s_log_lines) {
+        memset(s_log_lines, 0, LOG_RING_BYTES);
+    }
 }
 
 void app_log(const char* tag, const char* format, ...) {
@@ -55,9 +68,13 @@ void app_log(const char* tag, const char* format, ...) {
 #endif
 
     // 2. Store to circular buffer with spinlock protection
+    if (!s_log_lines) {
+        app_log_init(); // lazy-allocate if a driver logs before app_log_init() ran
+    }
     taskENTER_CRITICAL(&s_log_mux);
-    strncpy(s_log_lines[s_log_head], full_line, LOG_LINE_MAX_LEN - 1);
-    s_log_lines[s_log_head][LOG_LINE_MAX_LEN - 1] = '\0';
+    char* line = s_log_lines + s_log_head * LOG_LINE_MAX_LEN;
+    strncpy(line, full_line, LOG_LINE_MAX_LEN - 1);
+    line[LOG_LINE_MAX_LEN - 1] = '\0';
     s_log_head = (s_log_head + 1) % STATIC_LOG_LINES;
     if (s_log_count < STATIC_LOG_LINES) {
         s_log_count++;
@@ -78,7 +95,7 @@ String app_log_get_json(void) {
     n = (s_log_count < MAX_LINES) ? s_log_count : MAX_LINES;
     size_t start_idx = (s_log_head + STATIC_LOG_LINES - n) % STATIC_LOG_LINES;
     for (size_t i = 0; i < n; i++) {
-        strncpy(snapshot[i], s_log_lines[(start_idx + i) % STATIC_LOG_LINES], LOG_LINE_MAX_LEN - 1);
+        strncpy(snapshot[i], s_log_lines + (start_idx + i) * LOG_LINE_MAX_LEN, LOG_LINE_MAX_LEN - 1);
         snapshot[i][LOG_LINE_MAX_LEN - 1] = '\0';
     }
     taskEXIT_CRITICAL(&s_log_mux);

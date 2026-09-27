@@ -101,20 +101,24 @@ size_t audio_pipeline_read_for_usb(audio_pipeline_t *pipeline, int16_t *out_pcm,
     if (!pipeline || !out_pcm || sample_count == 0) return 0;
 
     if (!pipeline->active || pipeline->buffering) {
-        // Feed pure silence while idle or building initial 30ms jitter buffer
+// Feed pure silence while idle or building the initial prefill cushion
+// (AUDIO_JITTER_PREFILL_SAMPLES = 50ms).
         memset(out_pcm, 0, sample_count * sizeof(int16_t));
         return sample_count;
     }
 
     size_t avail = audio_ring_buffer_available_read(&pipeline->ring_buf);
 
-    static uint32_t s_log_counter = 0;
-    if (++s_log_counter % 2000 == 0) { // log every ~2 seconds
-        app_log("AUDIO_DBG", "Ring buffer avail: %d / %d | Underruns: %d | Frames: %d", 
-            (int)avail, AUDIO_RING_BUFFER_SIZE, (int)pipeline->underrun_count, (int)pipeline->total_frames_decoded);
-    }
-
     if (avail < sample_count) {
+        // Surface underruns (starved ring) at most once every 5s so the web log
+        // stays readable during long voice sessions instead of a 2s periodic beat.
+        static uint32_t s_last_underrun_log_ms = 0;
+        uint32_t now = millis();
+        if (now - s_last_underrun_log_ms >= 5000) {
+            s_last_underrun_log_ms = now;
+            app_log("AUDIO_DBG", "Ring underrun: avail %d < %d req (underruns=%d)",
+                (int)avail, (int)sample_count, (int)pipeline->underrun_count);
+        }
         pipeline->underrun_count++;
         size_t n = audio_ring_buffer_read(&pipeline->ring_buf, out_pcm, avail);
         // Smooth hold / fade to 0 to prevent sharp sawtooth click

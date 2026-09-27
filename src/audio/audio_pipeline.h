@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-#define AUDIO_JITTER_PREFILL_SAMPLES  1600  // 100ms prefill cushion to absorb BLE jitter
+#define AUDIO_JITTER_PREFILL_SAMPLES  800   // 50ms prefill cushion to absorb BLE jitter
 
 typedef struct {
     adpcm_state_t        adpcm;

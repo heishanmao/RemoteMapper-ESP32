@@ -5,6 +5,7 @@
 #include "version.h"
 #include "ble/ble_remote_client.h"
 #include "audio/audio_pipeline.h"
+#include "usb/uac_microphone.h"
 #include "keymap/key_state_machine.h"
 #include "keymap/key_config_storage.h"
 #include "nvs/nvs_manager.h"
@@ -77,6 +78,30 @@ static void handle_logs() {
 static void handle_logs_clear() {
     app_log_clear();
     s_server.send(200, "application/json", "{\"status\":\"cleared\"}");
+}
+
+static void handle_audio() {
+    wifi_manager_mark_activity();
+    JsonDocument doc;
+    uint8_t mute = 0;
+    int16_t volume = 0;
+    uac_microphone_get_control(&mute, &volume);
+    doc["streaming"] = uac_microphone_is_streaming();
+    doc["alt"] = (int)uac_microphone_get_alt();
+    doc["muted"] = (bool)(mute != 0);
+    doc["volume_raw"] = volume;
+    doc["session_active"] = g_audio_pipeline.active;
+    doc["session_id"] = (int)g_audio_pipeline.session_id;
+    doc["buffering"] = g_audio_pipeline.buffering;
+    doc["ring_avail"] = (int)audio_ring_buffer_available_read(&g_audio_pipeline.ring_buf);
+    doc["ring_capacity"] = AUDIO_RING_BUFFER_SIZE;
+    doc["underruns"] = (int)g_audio_pipeline.underrun_count;
+    doc["frames_decoded"] = (int)g_audio_pipeline.total_frames_decoded;
+    doc["samples_pushed"] = (int)g_audio_pipeline.total_samples_pushed;
+
+    String out;
+    serializeJson(doc, out);
+    s_server.send(200, "application/json", out);
 }
 
 static void handle_wifi_scan() {
@@ -514,6 +539,7 @@ void web_server_init(void) {
     s_server.on("/api/system/restart", HTTP_POST, handle_system_restart);
     s_server.on("/api/config/export", HTTP_GET, handle_config_export);
     s_server.on("/api/config/import", HTTP_POST, handle_config_import);
+    s_server.on("/api/audio", HTTP_GET, handle_audio);
 
 #if REMOTEMAPPER_OTA
     s_server.on("/api/ota/status", HTTP_GET, handle_ota_status);

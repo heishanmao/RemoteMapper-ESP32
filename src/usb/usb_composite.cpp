@@ -31,6 +31,7 @@ static uint32_t              s_hw_sleep_start_ms    = 0;
 static uint16_t              s_last_soffn           = 0;
 static uint32_t              s_last_soffn_change_ms = 0;
 static uint32_t              s_boot_grace_until_ms  = 0;
+static uint32_t              s_waiting_reconnect_ms = 0; // non-zero while we await soft re-enumeration
 
 extern "C" {
 
@@ -56,6 +57,7 @@ void usb_composite_init(void) {
             s_keyboard.releaseAll();
             s_consumer.release();
         } else if (id == ARDUINO_USB_STARTED_EVENT) {
+            s_waiting_reconnect_ms = 0; // soft re-enumeration succeeded
             app_log("USB", "USB Started / Mounted");
             for (uint8_t ep = 1; ep <= 4; ep++) {
                 usbd_edpt_clear_stall(0, (uint8_t)(ep | 0x80));
@@ -86,6 +88,13 @@ void usb_composite_task(void) {
     uac_microphone_task();
 
     uint32_t now = millis();
+    // Soft re-enumeration safety net: if the host did not re-mount us within
+    // 4s of the D+/D- detach, fall back to a full restart (today's behavior).
+    if (s_waiting_reconnect_ms != 0 && (now - s_waiting_reconnect_ms >= 4000)) {
+        s_waiting_reconnect_ms = 0;
+        app_log("USB_HW", "Soft re-enumeration timed out -> falling back to full restart");
+        esp_restart();
+    }
     if (s_boot_grace_until_ms == 0) {
         s_boot_grace_until_ms = now + 5000; // 5s boot grace period
         s_last_soffn_change_ms = now;
@@ -116,15 +125,22 @@ void usb_composite_task(void) {
     // 2. Detect PC waking up (SOF resumed after sleeping for > 2s)
     else if (s_hw_sleep_detected && !is_hw_suspended && sof_active) {
         if (now - s_hw_sleep_start_ms >= 2000) {
-            app_log("USB_HW", "PC Wakeup Detected! SOF resumed -> performing clean USB hardware re-enumeration...");
+            app_log("USB_HW", "PC Wakeup Detected! SOF resumed -> soft USB re-enumeration (no reboot)...");
             vTaskDelay(pdMS_TO_TICKS(500));
-            // Pull D+ low to signal disconnect to Windows kernel
+            // Signal a disconnect to the Windows kernel by pulling D+(20)/D-(19).
+            // The 350ms SE0 forces Windows to drop and re-enumerate the device.
             pinMode(20, OUTPUT);
             pinMode(19, OUTPUT);
             digitalWrite(20, LOW);
             digitalWrite(19, LOW);
-            vTaskDelay(pdMS_TO_TICKS(250));
-            esp_restart();
+            vTaskDelay(pdMS_TO_TICKS(350));
+            // Release the pads back to the internal USB PHY (hi-Z GPIO no longer
+            // overrides them); the D+ pull-up reappears and the host sees a fresh attach.
+            pinMode(20, INPUT);
+            pinMode(19, INPUT);
+            s_hw_sleep_detected = false;
+            s_waiting_reconnect_ms = millis();
+            app_log("USB_HW", "D+/D- released -> waiting for host re-enumeration (4s fallback before restart)");
         } else {
             s_hw_sleep_detected = false;
         }
