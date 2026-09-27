@@ -330,37 +330,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             </div>
         </div>
 
-        <!-- Stuck-Key Guard (可靠性) -->
-        <div style="background:#0a0f1a; border:1px solid var(--border-color); border-radius:14px; padding:16px 18px; margin-top:14px;">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-                <div>
-                    <div class="stat-title" style="font-size:14px;">🛡️ 防卡键自动释放 (可靠性保护)</div>
-                    <div style="font-size:12px; color:var(--text-muted); margin-top:2px;" id="guard-stats">--</div>
-                </div>
-                <span style="font-size:11px; color:var(--text-muted); background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.3); padding:3px 10px; border-radius:999px;" id="guard-last">--</span>
-            </div>
-            <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px;">
-                <div>
-                    <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">修饰键最长按住 (秒, 0=关闭)</label>
-                    <input type="number" id="guard-mod" min="0" max="600" value="20" style="width:100%; padding:8px 10px; background:#151d2a; border:1px solid #243247; color:#fff; border-radius:8px; font-size:13px; outline:none;">
-                </div>
-                <div>
-                    <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">按键无操作上限 (秒, 0=关闭)</label>
-                    <input type="number" id="guard-key" min="0" max="3600" value="60" style="width:100%; padding:8px 10px; background:#151d2a; border:1px solid #243247; color:#fff; border-radius:8px; font-size:13px; outline:none;">
-                </div>
-                <div>
-                    <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">语音最长录音 (分钟, 0=关闭)</label>
-                    <input type="number" id="guard-voice" min="0" max="120" value="15" style="width:100%; padding:8px 10px; background:#151d2a; border:1px solid #243247; color:#fff; border-radius:8px; font-size:13px; outline:none;">
-                </div>
-                <div style="display:flex; align-items:flex-end;">
-                    <button class="btn" style="width:100%; padding:9px 12px;" onclick="saveGuardSettings()">保存防卡键设置</button>
-                </div>
-            </div>
-            <div style="font-size:11px; color:var(--text-muted); margin-top:10px; line-height:1.6; border-top:1px dashed #243247; padding-top:8px;">
-                语音录音完全豁免普通规则(不会打断你说话);只有长时间只有修饰键、或按键长时间没有任何后续输入、或录音超长兜底时才强制释放,并按 LED 红闪指示。
-            </div>
-        </div>
-
         <div class="tabs">
             <button class="tab-btn active" onclick="switchTab('tab-tester')">遥控器与改键测试</button>
             <button class="tab-btn" onclick="switchTab('tab-ble')">蓝牙配对管理</button>
@@ -809,6 +778,34 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                             当前固件支持 UAC 1.0 USB 麦克风录音设备与标准 HID 键盘/多媒体复合注入。
                         </p>
                         <button class="btn btn-danger" style="width: 100%;" onclick="restartDevice()">重启设备</button>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <span>🛡️ 防卡键自动释放 (可靠性保护)</span>
+                            <span id="guard-last" style="font-size:11px; color:var(--text-muted); background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.3); padding:3px 10px; border-radius:999px;">--</span>
+                        </div>
+                        <div style="font-size:12px; color:var(--text-muted); line-height:1.6; margin-bottom:12px;" id="guard-stats">--</div>
+                        <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px;">
+                            <div>
+                                <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">修饰键最长按住 (秒, 0=关闭)</label>
+                                <input type="number" id="guard-mod" min="0" max="600" value="20" style="width:100%; padding:8px 10px; background:#151d2a; border:1px solid #243247; color:#fff; border-radius:8px; font-size:13px; outline:none;">
+                            </div>
+                            <div>
+                                <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">按键无操作上限 (秒, 0=关闭)</label>
+                                <input type="number" id="guard-key" min="0" max="3600" value="60" style="width:100%; padding:8px 10px; background:#151d2a; border:1px solid #243247; color:#fff; border-radius:8px; font-size:13px; outline:none;">
+                            </div>
+                            <div>
+                                <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">语音最长录音 (分钟, 0=关闭)</label>
+                                <input type="number" id="guard-voice" min="0" max="120" value="15" style="width:100%; padding:8px 10px; background:#151d2a; border:1px solid #243247; color:#fff; border-radius:8px; font-size:13px; outline:none;">
+                            </div>
+                            <div style="display:flex; align-items:flex-end;">
+                                <button class="btn" style="width:100%; padding:9px 12px;" onclick="saveGuardSettings()">保存防卡键设置</button>
+                            </div>
+                        </div>
+                        <div style="font-size:11px; color:var(--text-muted); margin-top:10px; line-height:1.6; border-top:1px dashed #243247; padding-top:8px;">
+                            语音录音完全豁免普通规则(不会打断你说话);只有长时间只有修饰键、或按键长时间没有任何后续输入、或录音超长兜底时才强制释放,并按 LED 红闪指示。
+                        </div>
                     </div>
 
                     <div class="card">
