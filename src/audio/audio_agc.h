@@ -10,10 +10,12 @@ extern "C" {
 
 typedef struct {
     float peak;             // Current peak envelope value
+    float inv_peak;         // Cached target_level / peak, kept in sync by audio_agc_process
     float target_level;     // Target level (default 28000.0)
     float decay_rate;       // Envelope decay multiplier (default 0.9997)
     float max_gain;         // Maximum allowed gain boost (default 30.0)
     float noise_floor;      // Minimum floor to avoid amplifying silence (default 200.0)
+    float inv_floor;        // Cached 1.0 / noise_floor
 } audio_agc_t;
 
 /**

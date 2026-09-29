@@ -14,10 +14,29 @@ bool audio_ring_buffer_init(audio_ring_buffer_t *rb, int16_t *storage, size_t ca
     rb->mask = capacity - 1;
     rb->head = 0;
     rb->tail = 0;
+    rb->clear_pending = false;
     return true;
 }
 
-size_t audio_ring_buffer_available_read(const audio_ring_buffer_t *rb) {
+void audio_ring_buffer_consume_pending_clear(audio_ring_buffer_t *rb) {
+    if (!rb) return;
+    if (!rb->clear_pending) return;
+    rb->clear_pending = false;
+    __sync_synchronize();
+    rb->tail = rb->head;
+    __sync_synchronize();
+}
+
+size_t audio_ring_buffer_available_read(audio_ring_buffer_t *rb) {
+    if (!rb) return 0;
+    // Apply a producer-posted clear here, on the consumer's own thread, before
+    // anyone reads head/tail. Doing it here (rather than in read()) keeps the
+    // reported availability consistent with what read() will actually return.
+    audio_ring_buffer_consume_pending_clear(rb);
+    return rb->head - rb->tail;
+}
+
+size_t audio_ring_buffer_peek_available(const audio_ring_buffer_t *rb) {
     if (!rb) return 0;
     return rb->head - rb->tail;
 }
@@ -61,5 +80,10 @@ size_t audio_ring_buffer_read(audio_ring_buffer_t *rb, int16_t *out_samples, siz
 
 void audio_ring_buffer_clear(audio_ring_buffer_t *rb) {
     if (!rb) return;
-    rb->tail = rb->head;
+    // Producer-side reset. Never touch tail directly: this may run while the
+    // consumer is mid-read, and its post-read "tail = t + to_read" would then
+    // clobber the reset and rewind the cursor into the previous session's
+    // samples. Post a request and let the consumer move its own cursor.
+    rb->clear_pending = true;
+    __sync_synchronize();
 }

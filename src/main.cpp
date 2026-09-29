@@ -136,6 +136,18 @@ void loop() {
     // 5. Confirm safe-boot watchdog once the new firmware has run stably
     ota_manager_watchdog_confirm();
 
+    // 6. Flush audio RX accounting from the loop task. This must never run in
+    // the NimBLE host task, which is the single dispatcher for every BLE
+    // notification (key reports included) and has a shallow stack.
+      ble_audio_rx_diagnostics_tick();
+
+      // 3. Confirm a pending OTA boot so the safe-boot watchdog stops counting.
+      //    Without this the device rolls back to the previous app partition after
+      //    OTA_WATCHDOG_TRIES (3) unconfirmed boots. Self-guarded: it only acts
+      //    once a watchdog boot is armed and OTA_WATCHDOG_CONFIRM_MS has elapsed.
+      ota_manager_watchdog_confirm();
+
+
     // USB audio task handles its own timing via vTaskDelayUntil. Keep this a
     // few ms so the loop does not spin (Core 1 wakeups) while still servicing
     // the web server promptly.

@@ -73,6 +73,30 @@ static uint32_t                        s_last_extend_ms = 0;
 static uint32_t                        s_last_scan_ms = 0;
 static uint32_t                        s_last_keepalive_ms = 0;
 static size_t                          s_frame_size = AUDIO_DEFAULT_FRAME_BYTES;
+static void request_audio_conn_params(void);
+static uint16_t                        s_caps_version = 0;
+static uint8_t                         s_caps_codec_mask = 0;
+static bool                            s_mic_open = false;
+static bool                            s_got_audio_since_open = false;
+static uint32_t                        s_extend_count = 0;
+
+// The remote encodes 16 kHz when the 0x02 codec bit is offered, 8 kHz otherwise
+// (see HD838A/remote-mic-app ATVVCapabilities.parse). We can only play 16 kHz
+// into a Windows capture device, so reject the session loudly rather than
+// resampling 8 kHz speech and producing an unreadable stream.
+#define ATVV_CODEC_MASK_16K 0x02
+#define ATVV_CODEC_8K       0x01
+#define ATVV_CODEC_16K      0x02
+
+static uint8_t atvv_select_codec(uint8_t mask) {
+    if (mask & ATVV_CODEC_16K) return ATVV_CODEC_16K;
+    if (mask & ATVV_CODEC_8K)   return ATVV_CODEC_8K;
+    return 0;
+}
+
+static uint32_t atvv_codec_sample_rate(uint8_t codec) {
+    return (codec == ATVV_CODEC_16K) ? 16000u : 8000u;
+}
 
 // Power save: while connected, no continuous scan. WebUI requests short
 // on-demand bursts (BLE_SCAN_BURST_SECS) to refresh its device list.
@@ -108,7 +132,7 @@ static uint8_t                         s_spy_count = 0;
 static const char*                     s_spy_tags[8] = { nullptr };
 
 static void gatt_spy_stop(void);
-static void read_device_information(void);
+static void read_device_information(uint32_t gen = 0);
 static void gatt_explore_all(bool allow_refresh);
 
 // Remote Device Information (0x180A) read on every connect. Read-only queries,
@@ -137,6 +161,7 @@ static void start_scan(uint16_t interval_ms = BLE_SCAN_INTERVAL_MS);
 static bool do_connect_adv_device(NimBLEAdvertisedDevice* advDevice);
 static bool do_connect_mac(const String& mac_str, uint8_t addr_type);
 static bool setup_services_and_handshake();
+static void log_settled_conn_params();
 
 // Battery Notification Callback (0x180F / 0x2A19)
 static void on_battery_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
@@ -147,11 +172,268 @@ static void on_battery_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData,
     }
 }
 
-// Audio Notification Callback (ATVV Char 0x03)
+// ---------------------------------------------------------------------------
+// Audio RX accounting
+//
+// HARD RULE: nothing in this section may format, log, allocate, or float-format
+// inside the NimBLE notification callback.
+//
+// The NimBLE host task is the single task that dispatches every BLE
+// notification on this connection: audio *and* the HOGP key reports. An earlier
+// revision of this file called app_log() (288 bytes of stack buffers plus
+// float formatting) directly from the callback. That overflowed the host task
+// stack and took the whole stack down, which presented as every key on the
+// remote going dead and the device dropping off the network. Formatting cost is
+// not worth that risk, so the callback now only bumps counters and
+// ble_audio_rx_diagnostics_tick() does the printing from the Arduino loop task.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    volatile uint32_t frames;
+    volatile uint32_t len_other;
+    volatile uint32_t dt_sum;
+    volatile uint32_t dt_max;
+    volatile uint32_t gaps;
+    volatile uint32_t decode_us_sum;
+    volatile uint32_t decode_us_max;
+    volatile uint32_t partial;    // notifications that did not end on a frame boundary
+    volatile uint32_t decode_drop; // frames the pipeline accepted but emitted nothing for
+    uint32_t win_start_ms;   // window start; written by the tick, not the callback
+    uint32_t win_last_ms;    // last notification seen in the window
+} audio_rx_window_t;
+
+static audio_rx_window_t s_rx_win = {0};
+static volatile uint32_t s_rx_prev_ms = 0;
+static volatile bool     s_rx_dirty = false;
+// Bumped on every disconnect. The handshake sleeps ~350 ms in vTaskDelay calls
+// spread across GATT discovery, and NimBLE frees its service/characteristic
+// objects the moment the link drops. isConnected() is not a safe liveness test
+// here because a reconnect can make it true again while the old handshake is
+// still walking freed objects, so the handshake pins the generation it started
+// with and aborts on any change.
+static volatile uint32_t s_conn_generation = 0;
+
+// True while the handshake that captured `gen` may still touch GATT objects.
+static bool handshake_still_valid(uint32_t gen) {
+    if (s_conn_generation != gen) return false;
+    if (!s_client || !s_client->isConnected()) return false;
+    return true;
+}
+static uint32_t          s_link_log_due_ms = 0;   // one-shot settle log after connect
+
+// A 120-byte ADPCM frame is 240 samples = 15 ms at 16 kHz, so anything past
+// 1.5x that means at least one notification went missing.
+static const uint32_t AUDIO_RX_GAP_MS = 22;
+
+// IMA ADPCM is a strong recursive predictor: the decoder carries `predictor` and
+// `step_index` across nibbles, so a single mis-sized input desynchronises it and
+// every later sample is decoded as noise, permanently, until the mic is reopened.
+// We used to hand each notification straight to the decoder assuming it was
+// exactly one aligned frame, which made one lost or coalesced packet ruin the
+// whole utterance and wreck speech recognition.
+//
+// Reassemble to whole frames instead, and count the realignments so the AUDIN
+// line shows how often the link is actually breaking frame alignment.
+#define AUD_FRAME_MAX_BYTES 512
+
+typedef struct {
+    uint8_t  buf[AUDIO_DEFAULT_FRAME_BYTES + AUD_FRAME_MAX_BYTES];
+    size_t   fill;
+    uint32_t realigns;      // times we discarded a partial frame to re-sync
+    uint32_t oversized;     // notifications longer than we can buffer
+    uint32_t frames_out;    // whole frames handed to the decoder
+} audio_frame_acc_t;
+
+static audio_frame_acc_t s_facc = {0};
+
+// Drop any partial frame and start clean. The decoder's state is re-seeded by the
+// remote's AUDIO_SYNC (op 0x0A), so discarding a partial frame is safe.
+static void audio_frame_acc_reset(void) {
+    s_facc.fill = 0;
+    s_facc.realigns++;
+}
+
+// Runs in the NimBLE host task. Deliberately allocation-free and shallow: an
+// overflow of this task's stack previously killed every key on the remote.
 static void on_audio_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
     if (length == 0) return;
-    s_last_audio_ms = millis();
-    audio_pipeline_feed_adpcm(&g_audio_pipeline, pData, length);
+    const uint32_t now = millis();
+    s_last_audio_ms = now;
+
+    uint32_t dt = (s_rx_prev_ms == 0) ? 0 : (now - s_rx_prev_ms);
+    s_rx_prev_ms = now;
+
+    // A notification longer than the buffer cannot be a frame or a pair of
+    // frames, so treat it as a link fault and re-align from the next packet.
+    if (length > AUD_FRAME_MAX_BYTES + AUDIO_DEFAULT_FRAME_BYTES) {
+        s_facc.oversized++;
+        audio_frame_acc_reset();
+        return;
+    }
+
+    if (length != s_frame_size) s_rx_win.len_other++;
+
+    if (s_facc.fill + length > sizeof(s_facc.buf)) {
+        // Cannot happen once the size check above passes, but never memcpy
+        // out of bounds even if a future edit changes the arithmetic.
+        audio_frame_acc_reset();
+    }
+    memcpy(s_facc.buf + s_facc.fill, pData, length);
+    s_facc.fill += length;
+
+    const uint32_t t0 = micros();
+    uint32_t decoded_frames = 0;
+    while (s_facc.fill >= s_frame_size && s_frame_size > 0) {
+        // Always consume exactly one frame's worth of bytes: alignment is a
+        // structural property of the accumulator, not something to infer from
+        // the pipeline's return value.
+        //
+        // audio_pipeline_feed_adpcm() returns 0 for three unrelated reasons --
+        // pipeline inactive (the PC is asleep and UAC is suspended), resampler
+        // not yet primed (normal on the first frame), or a genuine ADPCM decode
+        // failure. Treating all three as misalignment discarded every frame
+        // while the PC slept, and inflated the resync counter to 279 for only
+        // 105 frames delivered. Realigning is therefore only for the structural
+        // cases above, handled at session boundaries; genuine decode failures
+        // are just counted here.
+        if (audio_pipeline_feed_adpcm(&g_audio_pipeline, s_facc.buf, s_frame_size) == 0) {
+            s_rx_win.decode_drop++;
+        }
+        s_facc.fill -= s_frame_size;
+        memmove(s_facc.buf, s_facc.buf + s_frame_size, s_facc.fill);
+        decoded_frames++;
+    }
+    s_facc.frames_out += decoded_frames;
+
+    // The remote is notifying, so the session is alive. Gate MIC_EXTEND on this
+    // rather than on samples actually reaching the UAC ring: with the PC asleep
+    // the pipeline is inactive, nothing is emitted, and the session would never
+    // be renewed -- the remote then stops notifying and recovery is impossible.
+    if (decoded_frames) s_got_audio_since_open = true;
+
+    // A partial frame left over means the link is not delivering whole frames
+    // back to back. Count it once per notification rather than per frame.
+    if (s_facc.fill > 0) {
+        s_rx_win.partial++;
+    }
+
+    const uint32_t us = micros() - t0;   // window-averaged, so 1 us quantisation washes out
+
+    if (dt && decoded_frames) {
+        s_rx_win.frames += decoded_frames;
+        s_rx_win.dt_sum += dt;
+        if (dt > s_rx_win.dt_max) s_rx_win.dt_max = dt;
+        if (dt >= AUDIO_RX_GAP_MS) s_rx_win.gaps++;
+        s_rx_win.decode_us_sum += us;
+        if (us > s_rx_win.decode_us_max) s_rx_win.decode_us_max = us;
+    }
+    s_rx_win.win_last_ms = now;
+    s_rx_dirty = true;
+}
+
+// Called from the Arduino loop task. All formatting and logging happens here so
+// the NimBLE host task stays allocation-free and shallow.
+
+// The remote treats an open mic as a session that has to be renewed. Without
+// MIC_EXTEND it stops notifying partway through a long hold, which silently
+// truncates speech. 8 s is well inside the window the reference implementation
+// uses for the same remotes (HD838A/remote-mic-app, rc003VoiceExtensionInterval).
+#define ATVV_EXTEND_INTERVAL_MS 8000
+// Hard ceiling on one hold, mirroring the reference project's safe timeout so a
+// wedged session cannot hold the radio open forever.
+#define ATVV_MAX_HOLD_MS        120000
+#define ATVV_MAX_EXTENDS        (ATVV_MAX_HOLD_MS / ATVV_EXTEND_INTERVAL_MS)
+
+static void atvv_service_tick(void) {
+    // s_mic_open is set when we send MIC_OPEN; the remote can also start a
+    // session by itself, in which case only the TALKING state tells us.
+    if (!s_mic_open && s_ble_state != BLE_STATE_TALKING) return;
+    if (s_char_cmd == nullptr) return;
+    if (s_caps_version < 0x0100) return;   // opcode 0x0E does not exist pre-1.0
+
+    const uint32_t now = millis();
+    if (now - s_last_extend_ms < ATVV_EXTEND_INTERVAL_MS) return;
+
+    s_last_extend_ms = now;
+    s_extend_count++;
+    if (s_extend_count > ATVV_MAX_EXTENDS) {
+        // Reopen the session: the remote has almost certainly dropped it, and a
+        // fresh MIC_OPEN re-syncs the ADPCM decoder cleanly.
+        app_log("ATVV", "MIC_EXTEND count=%u exceeds max=%u, reopening session",
+                (unsigned)s_extend_count, (unsigned)ATVV_MAX_EXTENDS);
+        uint8_t cmd_open[] = { 0x0C, 0x00 };
+        s_char_cmd->writeValue(cmd_open, sizeof(cmd_open), false);
+        s_extend_count = 0;
+        s_got_audio_since_open = false;
+        s_last_extend_ms = now;
+        audio_frame_acc_reset();
+        return;
+    }
+
+    // Deliberately NOT gated on s_got_audio_since_open, unlike the reference
+    // implementation. That gate deadlocks here: with the PC asleep the audio
+    // pipeline is inactive so nothing is ever emitted, the gate never opens, no
+    // MIC_EXTEND is ever sent, and the remote eventually stops notifying -- an
+    // unrecoverable state. Renewing an open session is harmless when it is alive
+    // and essential when the host is not consuming.
+    uint8_t cmd_extend[] = { 0x0E, s_session_id };
+    s_char_cmd->writeValue(cmd_extend, sizeof(cmd_extend), false);
+    app_log("ATVV", "MIC_EXTEND sent session=%u n=%u audio_seen=%d",
+            (unsigned)s_session_id, (unsigned)s_extend_count,
+            (int)s_got_audio_since_open);
+}
+
+void ble_audio_rx_diagnostics_tick(void) {
+    atvv_service_tick();
+    log_settled_conn_params();   // one-shot, fires even while no audio is flowing
+    if (!s_rx_dirty) return;
+    const uint32_t now = millis();
+    // Close the window on *elapsed* time, and force a flush once audio has been
+    // silent for a while. Gating only on time-since-last-notification stretched
+    // a single window over the whole hold, so "5s: frames=918" actually covered
+    // 13.8 s of audio and the frame rate could not be trusted.
+    const uint32_t elapsed = now - s_rx_win.win_start_ms;
+    const bool timed_out = (now - s_rx_win.win_last_ms) >= AUDIO_RX_GAP_MS * 4;
+    if (elapsed < 5000 && !timed_out) return;
+    s_rx_dirty = false;
+
+    const uint32_t n         = s_rx_win.frames;
+    const uint32_t dt_avg    = n ? (s_rx_win.dt_sum / n) : 0;
+    const uint32_t dec_avg   = n ? (s_rx_win.decode_us_sum / n) : 0;
+    // 66.7 frames/s is a complete 16 kHz stream; anything less is dropped audio.
+    const uint32_t fps_x10   = elapsed ? (n * 10000u / elapsed) : 0;
+    const uint32_t lost_pct  = n ? (s_rx_win.gaps * 100u / n) : 0;
+    app_log("AUDIN",
+             "%ums: frames=%u fps=%u.%u (%u%% of 66.7) len_ok=%u len_other=%u partial=%u "
+             "nodec=%u | dt_avg=%ums dt_max=%ums gaps>=%ums=%u (%u%%) | decode avg=%uus max=%uus @%uMHz",
+             (unsigned)elapsed,
+             (unsigned)n, (unsigned)(fps_x10 / 10), (unsigned)(fps_x10 % 10),
+             (unsigned)((fps_x10 * 100u + 333u) / 667u),
+             (unsigned)(n - s_rx_win.len_other), (unsigned)s_rx_win.len_other,
+             (unsigned)s_rx_win.partial, (unsigned)s_rx_win.decode_drop,
+             (unsigned)dt_avg, (unsigned)s_rx_win.dt_max, (unsigned)AUDIO_RX_GAP_MS,
+             (unsigned)s_rx_win.gaps, (unsigned)lost_pct, (unsigned)dec_avg,
+             (unsigned)s_rx_win.decode_us_max, (unsigned)ESP.getCpuFreqMHz());
+
+    s_rx_win.frames = 0;
+    s_rx_win.len_other = 0;
+    s_rx_win.partial = 0;
+    s_rx_win.decode_drop = 0;
+    s_rx_win.dt_sum = 0;
+    s_rx_win.dt_max = 0;
+    s_rx_win.gaps = 0;
+    s_rx_win.decode_us_sum = 0;
+    s_rx_win.decode_us_max = 0;
+    s_rx_win.win_start_ms = now;
+    // Frame realignments are a cumulative link-health counter, not a per-window
+    // rate, so report and reset them together with the window.
+    if (s_facc.realigns || s_facc.oversized) {
+        app_log("AUDIN", "frame resync: realigns=%u oversized=%u frames_total=%u",
+                (unsigned)s_facc.realigns, (unsigned)s_facc.oversized,
+                (unsigned)s_facc.frames_out);
+        s_facc.realigns = 0;
+        s_facc.oversized = 0;
+    }
 }
 
 // Control Notification Callback (ATVV Char 0x04)
@@ -185,12 +467,35 @@ static void on_ctl_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, siz
         uint16_t ver = (pData[1] << 8) | pData[2];
         uint16_t fs = (pData[5] << 8) | pData[6];
         if (fs > 0) s_frame_size = fs;
-        app_log("ATVV", "CAPS: ver=0x%04X, frame_size=%d", ver, (int)s_frame_size);
+        s_caps_version = ver;
+
+        // Layout differs by version. For >= 0x0100 the codec bitmask is byte 3
+        // and byte 4 is interaction flags; older remotes shift them by one and
+        // need 9 bytes. Some 0x0100 remotes also return 0 in byte 3 and put
+        // the mask in byte 4 when interaction flags are set, so fall back.
+        uint8_t mask = 0;
+        if (ver >= 0x0100) {
+            mask = pData[3];
+            if (mask == 0 && length >= 9 && (pData[4] & 0x03)) {
+                mask = pData[4];
+            }
+        } else if (length >= 9) {
+            mask = pData[4];
+        }
+        s_caps_codec_mask = mask;
+
+        const uint8_t codec = atvv_select_codec(mask);
+        app_log("ATVV", "CAPS: ver=0x%04X frame_size=%d codecs=0x%02X -> codec=0x%02X (%uHz)",
+                ver, (int)s_frame_size, (unsigned)mask, (unsigned)codec,
+                (unsigned)atvv_codec_sample_rate(codec));
     }
     // AUDIO_SYNC: op == 0x0A
     else if (op == 0x0A && length >= 7) {
         int16_t pred = (int16_t)((pData[4] << 8) | pData[5]);
         int8_t step_idx = (int8_t)pData[6];
+        // The remote just told us its decoder state, so any partial frame we were
+        // holding belongs to the previous session and must be discarded.
+        audio_frame_acc_reset();
         audio_pipeline_sync(&g_audio_pipeline, pred, step_idx);
         app_log("ATVV", "SYNC: pred=%d, step=%d", pred, step_idx);
     }
@@ -289,12 +594,36 @@ static void on_hogp_report_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pD
             app_log("VOICE", "Voice button event: 0x%02X (%s)", raw_key, is_pressed ? "DOWN" : "UP");
             if (is_pressed) {
                 if (s_char_cmd != nullptr) {
-                    // MIC_OPEN (v1.0): 0x0C + big-endian codec id (0x0001 = 16 kHz).
-                    // The two-byte form {0x0C,0x00} relied on the remote defaulting
-                    // the codec; the explicit 3-byte form is the documented one.
-                    uint8_t cmd_open[] = { 0x0C, 0x00, 0x01 };
-                    s_char_cmd->writeValue(cmd_open, sizeof(cmd_open), false);
-                    app_log("ATVV", "Triggered MIC_OPEN (codec=0x0001/16kHz) on Voice key press");
+                    // MIC_OPEN. The codec id must match what CAPS advertised,
+                    // otherwise the remote streams at a rate we cannot play.
+                    // 0x0100+ uses the two-byte form and negotiates from the
+                    // capability set; older remotes need an explicit codec byte.
+                    const uint8_t codec = atvv_select_codec(s_caps_codec_mask);
+                    if (atvv_codec_sample_rate(codec) != AUDIO_REMOTE_SAMPLE_RATE) {
+                        app_log("ATVV", "MIC_OPEN refused: remote offers codecs=0x%02X, "
+                                        "need 16kHz (0x%02X)",
+                                (unsigned)s_caps_codec_mask, (unsigned)ATVV_CODEC_16K);
+                    } else if (s_caps_version >= 0x0100) {
+                        uint8_t cmd_open[] = { 0x0C, 0x00 };
+                        s_char_cmd->writeValue(cmd_open, sizeof(cmd_open), false);
+                        s_mic_open = true;
+                        s_got_audio_since_open = false;
+                        s_session_id = 0;
+                        s_last_extend_ms = millis();
+                        audio_frame_acc_reset();
+                        app_log("ATVV", "MIC_OPEN {0x0C,0x00} ver=0x%04X codec=0x%02X/16kHz",
+                                s_caps_version, (unsigned)codec);
+                    } else {
+                        uint8_t cmd_open[] = { 0x0C, 0x00, codec };
+                        s_char_cmd->writeValue(cmd_open, sizeof(cmd_open), false);
+                        s_mic_open = true;
+                        s_got_audio_since_open = false;
+                        s_session_id = 0;
+                        s_last_extend_ms = millis();
+                        audio_frame_acc_reset();
+                        app_log("ATVV", "MIC_OPEN {0x0C,0x00,0x%02X} legacy ver=0x%04X codec=0x%02X/16kHz",
+                                (unsigned)codec, s_caps_version, (unsigned)codec);
+                    }
                 } else {
                     app_log("ATVV", "Warning: Voice key pressed but ATVV CMD characteristic unavailable");
                 }
@@ -302,9 +631,11 @@ static void on_hogp_report_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pD
                 if (s_char_cmd != nullptr) {
                     // MIC_CLOSE is opcode 0x0D (0x00 is a control/status opcode, not
                     // "close"), so the mic can stay hot until the remote times out.
-                    uint8_t cmd_close[] = { 0x0D };
+                    uint8_t cmd_close[] = { 0x0D, s_session_id };
                     s_char_cmd->writeValue(cmd_close, sizeof(cmd_close), false);
-                    app_log("ATVV", "Triggered MIC_CLOSE on Voice key release");
+                    s_mic_open = false;
+                    app_log("ATVV", "MIC_CLOSE {0x0D,0x%02X} on Voice key release",
+                            (unsigned)s_session_id);
                 }
             }
         }
@@ -486,6 +817,10 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         s_ble_state = BLE_STATE_DISCONNECTED;
         s_do_connect = false;
         s_is_encrypted = false;
+        // Must be the first thing this handler invalidates: any in-flight
+        // handshake is currently parked in a vTaskDelay holding pointers that
+        // NimBLE is about to free, and this bump is the signal that stops it.
+        s_conn_generation++;
         s_char_cmd = nullptr;
         s_char_aud = nullptr;
         s_char_ctl = nullptr;
@@ -498,8 +833,26 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         s_dev_hw = "";
         s_dev_fw = "";
         s_dev_sw = "";
-        s_last_hogp_key = 0;
-        key_engine_release_all(&g_key_engine, millis());
+          s_last_hogp_key = 0;
+          s_mic_open = false;
+          s_got_audio_since_open = false;
+          s_extend_count = 0;
+          s_session_id = 0;
+          s_caps_version = 0;
+          s_caps_codec_mask = 0;
+          s_rx_prev_ms = 0;
+          s_rx_dirty = false;
+          s_rx_win.frames = 0;
+          s_rx_win.dt_sum = 0;
+          s_rx_win.dt_max = 0;
+          s_rx_win.gaps = 0;
+          s_rx_win.len_other = 0;
+          s_rx_win.partial = 0;
+          s_rx_win.decode_drop = 0;
+          s_rx_win.win_start_ms = millis();
+          s_rx_win.win_last_ms = s_rx_win.win_start_ms;
+          audio_frame_acc_reset();
+          key_engine_release_all(&g_key_engine, millis());
         usb_hid_keyboard_release();
         usb_hid_consumer_release();
         audio_pipeline_stop_session(&g_audio_pipeline);
@@ -567,6 +920,7 @@ static void start_web_scan_burst() {
 
 static bool setup_services_and_handshake() {
     if (!s_client || !s_client->isConnected()) return false;
+    const uint32_t gen = s_conn_generation;
 
     // 1. Security & Bonding (executed safely on Core 0 task context)
     app_log("BLE_SEC", "Initiating secure connection / bonding...");
@@ -580,7 +934,10 @@ static bool setup_services_and_handshake() {
     uint32_t sec_wait_start = millis();
     while (!s_is_encrypted && (millis() - sec_wait_start < 600)) {
         vTaskDelay(pdMS_TO_TICKS(40));
-        if (!s_client->isConnected()) return false;
+        if (!handshake_still_valid(gen)) {
+            app_log("BLE", "Handshake aborted: link dropped during encryption wait");
+            return false;
+        }
     }
     if (s_is_encrypted) {
         app_log("BLE_SEC", "SMP encryption active, proceeding to GATT discovery");
@@ -590,8 +947,8 @@ static bool setup_services_and_handshake() {
 
     // 2. Discover services
     std::vector<NimBLERemoteService*>* pServices = s_client->getServices(true);
-    if (!pServices) {
-        app_log("BLE", "No GATT services found");
+    if (!handshake_still_valid(gen) || !pServices) {
+        app_log("BLE", "Handshake aborted: link dropped during service discovery");
         return false;
     }
 
@@ -637,10 +994,17 @@ static bool setup_services_and_handshake() {
             pChars = atvv_svc->getCharacteristics(true);
             if (pChars && !pChars->empty()) break;
             vTaskDelay(pdMS_TO_TICKS(60));
+            if (!handshake_still_valid(gen)) return false;
         }
 
-        if (pChars) {
+        if (pChars && handshake_still_valid(gen)) {
             for (auto* pChar : *pChars) {
+                // Re-check on every entry: a link drop inside this loop frees
+                // the very objects being dereferenced here.
+                if (!handshake_still_valid(gen)) {
+                    app_log("BLE", "Handshake aborted mid-ATVV discovery");
+                    return false;
+                }
                 String char_uuid = pChar->getUUID().toString().c_str();
                 char_uuid.toLowerCase();
                 app_log("GATT_CHAR", "  ATVV Char: %s (N:%d, I:%d, W:%d)", 
@@ -682,10 +1046,15 @@ static bool setup_services_and_handshake() {
             pChars = hid_svc->getCharacteristics(true);
             if (pChars && !pChars->empty()) break;
             vTaskDelay(pdMS_TO_TICKS(60));
+            if (!handshake_still_valid(gen)) return false;
         }
 
-        if (pChars) {
+        if (pChars && handshake_still_valid(gen)) {
             for (auto* pChar : *pChars) {
+                if (!handshake_still_valid(gen)) {
+                    app_log("BLE", "Handshake aborted mid-HID discovery");
+                    return false;
+                }
                 String char_uuid = pChar->getUUID().toString().c_str();
                 char_uuid.toLowerCase();
                 bool can_notif = pChar->canNotify();
@@ -726,10 +1095,15 @@ static bool setup_services_and_handshake() {
             pChars = bat_svc->getCharacteristics(true);
             if (pChars && !pChars->empty()) break;
             vTaskDelay(pdMS_TO_TICKS(50));
+            if (!handshake_still_valid(gen)) return false;
         }
 
-        if (pChars) {
+        if (pChars && handshake_still_valid(gen)) {
             for (auto* pChar : *pChars) {
+                if (!handshake_still_valid(gen)) {
+                    app_log("BLE", "Handshake aborted mid-battery discovery");
+                    return false;
+                }
                 String char_uuid = pChar->getUUID().toString().c_str();
                 char_uuid.toLowerCase();
                 if (pChar->getUUID().equals(NimBLEUUID((uint16_t)0x2A19)) || char_uuid.indexOf("2a19") >= 0) {
@@ -757,16 +1131,34 @@ static bool setup_services_and_handshake() {
     }
 
     // Read (never write) the remote's Device Information: model / firmware / hw
-    // version, surfaced in the WebUI pairing card.
-    read_device_information();
+    // version, surfaced in the WebUI pairing card. It performs its own timed
+    // reads, so the generation is re-checked afterwards.
+    read_device_information(gen);
+    if (!handshake_still_valid(gen)) {
+        app_log("BLE", "Handshake aborted: link dropped during device-info read");
+        return false;
+    }
+
+    // A handshake that resolved no ATVV command characteristic used to fall
+    // through and mark the link CONNECTED anyway, leaving every later voice
+    // write aimed at a null handle. Treat that as a failed handshake so the
+    // caller reconnects instead of advertising a dead session.
+    if (s_char_cmd == nullptr) {
+        app_log("BLE", "Handshake incomplete: no ATVV command characteristic, aborting");
+        return false;
+    }
 
     app_log("BLE", "Total Subscribed Characteristic(s): %d", sub_count);
 
-    // 3. Negotiate data length and connection parameters
+    // 3. Negotiate data length, then tune the link for audio.
     s_client->setDataLen(251);
-    // 40 units = 50ms connection interval (was 37.5ms): modest increase to cut
-    // idle link TX further while keeping key/voice latency acceptable.
-    s_client->updateConnParams(40, 40, 0, 400);
+    // Applied here, after every subscription has completed, and not earlier:
+    // the LL connection-update procedure competes with GATT traffic, and issuing
+    // it during the subscription burst is what dropped this link at 7.5 ms
+    // before (handshake aborted with zeroed attribute handles, no audio).
+    // This also replaces a hardcoded 50 ms updateConnParams that used to run
+    // here and silently override the audio interval set at connect time.
+    request_audio_conn_params();
 
     // 4. ATVV Handshake: query CAPS capability only. Do NOT force mic open at boot.
     if (s_char_cmd) {
@@ -783,6 +1175,54 @@ static bool setup_services_and_handshake() {
     // above (pre-subscription, full coverage). Re-arming s_gatt_dump_pending
     // here would run a second, vendor-only dump on the same connection.
     return true;
+}
+
+// The remote streams 16 kHz audio (confirmed twice: the spectral probe found real
+// energy on the 6.5 kHz bin, and CAPS advertises codecs=0x02 = 16 kHz), so a
+// complete stream needs 240 samples every 15 ms = 66.7 notifications/s.
+//
+// At a 15 ms interval the link carries exactly 66.7 events/s, i.e. 100%
+// utilisation with zero headroom. That measured out as ~26% of frames never
+// arriving (gaps>=22ms = 141 of 541 frames) because the ESP32-S3 shares one
+// 2.4 GHz radio with WiFi, and a single collision loses a whole frame: BLE
+// notifications are not retransmitted, and the ADPCM stream then has a hole in
+// it that the decoder cannot fill.
+//
+// 7.5 ms therefore doubles the event budget for the same 66.7 fps, leaving half
+// the events idle so a collided event does not cost audio. Latency stays 0
+// because audio cannot tolerate peripheral latency: it would skip samples, not
+// merely delay them. Units are 1.25 ms for the interval and 10 ms for the
+// supervision timeout.
+#define AUDIO_CONN_MIN_ITVL   6      // 7.5 ms
+#define AUDIO_CONN_MAX_ITVL   6      // 7.5 ms
+#define AUDIO_CONN_LATENCY    0
+#define AUDIO_CONN_TIMEOUT    200    // 2 s
+
+static void request_audio_conn_params() {
+    if (!s_client || !s_client->isConnected()) return;
+    // Drop the inter-frame clock. Without this the first notification after a
+    // reconnect reports the whole offline span as one inter-frame gap, which
+    // produced a bogus dt_max=410464 ms and poisoned the AUDIN statistics.
+    s_rx_prev_ms = 0;
+    s_client->updateConnParams(AUDIO_CONN_MIN_ITVL, AUDIO_CONN_MAX_ITVL,
+                               AUDIO_CONN_LATENCY, AUDIO_CONN_TIMEOUT);
+    // Reading the interval here would report the pre-update value: the LL
+    // connection-update procedure needs a few connection events to land. Defer
+    // the read so the log shows what was actually negotiated.
+    s_link_log_due_ms = millis() + 3000;
+}
+
+// One-shot: print the settled connection parameters a few seconds after connect.
+static void log_settled_conn_params() {
+    if (s_link_log_due_ms == 0 || millis() < s_link_log_due_ms) return;
+    s_link_log_due_ms = 0;
+    if (!s_client || !s_client->isConnected()) return;
+    NimBLEConnInfo info = s_client->getConnInfo();
+    const uint16_t itvl = info.getConnInterval();
+    app_log("BLE", "Settled conn: interval=%u units (%.1f ms) latency=%u timeout=%u (%.1f s) mtu=%u",
+            (unsigned)itvl, itvl * 1.25f,
+            (unsigned)info.getConnLatency(), (unsigned)info.getConnTimeout(),
+            info.getConnTimeout() * 10.0f / 1000.0f, (unsigned)info.getMTU());
 }
 
 static bool do_connect_adv_device(NimBLEAdvertisedDevice* advDevice) {
@@ -808,6 +1248,10 @@ static bool do_connect_adv_device(NimBLEAdvertisedDevice* advDevice) {
         start_scan();
         return false;
     }
+    // NOTE: connection parameters are deliberately NOT tuned here. The audio
+    // interval is applied at the end of setup_services_and_handshake(), once the
+    // subscription burst is done, because an LL connection update issued during
+    // GATT traffic is what previously killed the link mid-handshake.
 
     s_connected_name = sanitize_ble_name(advDevice->getName().c_str());
     s_connected_mac = advDevice->getAddress().toString().c_str();
@@ -863,6 +1307,7 @@ static bool do_connect_mac(const String& mac_str, uint8_t addr_type) {
         start_scan();
         return false;
     }
+    request_audio_conn_params();
 
     s_connected_mac = mac_str;
     s_connected_name = "Xiaomi Voice Remote";
@@ -890,7 +1335,7 @@ static bool do_connect_mac(const String& mac_str, uint8_t addr_type) {
 // The remote answers 0x180A inconsistently right after pairing: the first pass
 // often comes back empty because the characteristic list has not settled yet, so
 // retry a few times with a short pause before giving up.
-static void read_device_information() {
+static void read_device_information(uint32_t gen) {
     s_dev_model = "";
     s_dev_manuf = "";
     s_dev_serial = "";
@@ -898,6 +1343,10 @@ static void read_device_information() {
     s_dev_fw = "";
     s_dev_sw = "";
     if (!s_client || !s_client->isConnected()) return;
+    // Device info is best-effort metadata, so this only needs to stop touching
+    // GATT objects the moment the link drops. gen==0 means "not in a handshake"
+    // (called standalone), and there the liveness check degrades to isConnected.
+    if (gen != 0 && !handshake_still_valid(gen)) return;
 
     for (int attempt = 1; attempt <= 4; ++attempt) {
         NimBLERemoteService* dis = s_client->getService(NimBLEUUID((uint16_t)0x180A));
@@ -917,6 +1366,7 @@ static void read_device_information() {
             };
             for (auto* pChar : *pChars) {
                 if (!pChar) continue;
+                if (gen != 0 && !handshake_still_valid(gen)) return;
                 String cu = pChar->getUUID().toString().c_str();
                 cu.toLowerCase();
                 for (auto& f : fields) {
@@ -1425,24 +1875,14 @@ void ble_remote_task(void) {
         }
     }
 
-    // 7. ATVV keepalive: the remote aborts an active microphone session after a
-    // hardware timeout (~15-60s) unless MIC_EXTEND (0x0E 0x00) keeps arriving.
-    // Without it, long voice sessions are cut off by the remote itself. Refresh
-    // the timer whenever audio actually flows so a live session never spams.
-    if (s_ble_state == BLE_STATE_TALKING && s_char_cmd != nullptr &&
-        s_client && s_client->isConnected()) {
-        if (now - s_last_audio_ms > 300) {
-            // No audio for 300ms: the remote is holding the mic open but idle.
-            if (now - s_last_extend_ms >= 10000) {
-                uint8_t cmd_extend[] = { 0x0E, 0x00 };
-                s_char_cmd->writeValue(cmd_extend, sizeof(cmd_extend), false);
-                s_last_extend_ms = now;
-                app_log("ATVV", "MIC_EXTEND keepalive sent (holding voice session open)");
-            }
-        } else {
-            s_last_extend_ms = now; // audio flowing, no keepalive needed
-        }
-    }
+    // 7. ATVV session renewal lives in atvv_service_tick(), which runs from the
+    //    loop task via ble_audio_rx_diagnostics_tick(). It used to live here
+    //    instead, and was guaranteed never to fire: the `else` branch below
+    //    re-stamped s_last_extend_ms on every pass while audio was flowing,
+    //    which is precisely the condition under which the 10 s threshold could
+    //    never be reached. It also shared s_last_extend_ms with the loop-task
+    //    sender, so whichever ran first starved the other. One sender, one
+    //    timestamp, one cadence.
 }
 
 ble_remote_state_t ble_remote_get_state(void) {

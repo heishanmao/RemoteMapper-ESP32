@@ -15,6 +15,43 @@ extern "C" {
 #define AUDIO_CHANNELS            1         // Mono
 #define AUDIO_DEFAULT_FRAME_BYTES 120       // Default 120 bytes ADPCM per BLE frame
 #define AUDIO_DEFAULT_FRAME_SAMPS 240       // 120 * 2 = 240 PCM samples per frame
+
+// The RC003's true capture rate is 16 kHz, proved by the Goertzel spectral probe
+// in audio_pipeline.c: the 6.5 kHz bin measures 0.0 dB relative to the strongest
+// bin, i.e. as loud as the peak. Under a genuine 12 kHz source 6.5 kHz is above
+// the 6 kHz Nyquist and could not appear at all; Goertzel leakage alone would
+// land 20-40 dB down.
+//
+// What we actually receive is 240 samples per 120-byte frame at ~50 fps, i.e.
+// 12000 samples/s: 75% of what a 16 kHz stream carries. So the earlier
+// "12080 samples/s == 12 kHz content" reading was an arithmetic coincidence, not
+// a sample rate. The audio arriving here is genuine 16 kHz content with about a
+// quarter of the samples missing, which is why:
+//
+//   - 1:1 is the correct ratio. Playback pitch is already right, and the audible
+//     defect is gaps, not pitch. Upsampling cannot restore audio that was never
+//     transmitted, so stretching by 4/3 only buries the gaps while shifting
+//     everything down by ~4 semitones.
+//   - recovering the missing samples is a link problem, not a DSP one. A full
+//     16 kHz stream needs 240 samples every 15 ms = 66.7 notifications/s; we
+//     sustain ~50/s. See AUDIO_CONN_* in ble_remote_client.cpp, which asks for a
+//     7.5-15 ms connection interval to lift that ceiling.
+#define AUDIO_REMOTE_SAMPLE_RATE  16000     // spectral-probe confirmed
+
+// Default output/input ratio as an exact fraction, applied by
+// audio_pipeline_init(). 1/1 is correct per the note above; the runtime
+// /api/audio/resample endpoint can override it for A/B comparison.
+// AUDIO_RS_STEP_Q is retained only for the disabled-resampler sentinel.
+#define AUDIO_RS_STEP_Q           1
+// Accepted resampler ratio window, as a percentage of 1:1. Below 100% the UAC
+// consumer starves; above ~200% the work buffer could overflow. Both bounds are
+// enforced by audio_pipeline_set_resample().
+#define AUDIO_RS_MIN_RATIO_PCT    100
+#define AUDIO_RS_MAX_RATIO_PCT    200
+// Worst case for the resampler is ceil(interval/step)+1 outputs per input
+// sample. At the 2:1 ceiling that is 3x the input frame, so size for that.
+#define AUDIO_WORK_SAMPLES        (AUDIO_DEFAULT_FRAME_SAMPS * 3)
+
 #define AUDIO_RING_BUFFER_SIZE    8192      // Ring buffer capacity (in samples, ~512ms buffer)
 
 // AGC & Filter parameters

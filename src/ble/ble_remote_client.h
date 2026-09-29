@@ -29,6 +29,14 @@ void ble_remote_init(void);
 void ble_remote_task(void);
 
 /**
+ * @brief Emit the periodic audio RX accounting line (frame count, inter-arrival
+ *        cadence, decode cost). Must be called from a normal task, never from a
+ *        NimBLE callback: the host task dispatches every BLE notification on
+ *        this connection, so formatting there kills key and audio delivery.
+ */
+void ble_audio_rx_diagnostics_tick(void);
+
+/**
  * @brief Get current BLE connection state
  */
 ble_remote_state_t ble_remote_get_state(void);

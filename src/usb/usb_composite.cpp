@@ -82,6 +82,81 @@ static uint32_t         s_force_release_count     = 0;
 static uint32_t         s_last_force_ms           = 0;
 static char             s_last_force_reason[24]   = "";
 
+// Bounded report re-assertion.
+//
+// A crash or watchdog reset can leave the host holding a modifier-down state it
+// never sees released, and Windows applies that modifier to *every* keyboard, so
+// the user's own physical keyboard types garbage. The guard above cannot cover
+// this: it only runs while the firmware is alive, and dying is exactly when it
+// stops helping.
+//
+// Re-enumeration normally repairs the host on its own (the mount path sends an
+// all-zero report), so a permanent heartbeat would be both wasteful and a smell:
+// it would also mask any future unbalanced-report bug. Instead we re-assert
+// only inside a short window right after an event that could plausibly have
+// desynchronised the host, then stop for good.
+#define USB_REASSERT_WINDOW_MS 10000
+#define USB_REASSERT_PERIOD_MS 500
+static uint32_t         s_reassert_until_ms        = 0;  // 0 = window closed
+static uint32_t         s_reassert_last_ms         = 0;
+
+// Arm the window. Called from the paths where the host may have missed (or never
+// received) a release report.
+static void reassert_arm(void) {
+    const uint32_t now = millis();
+    s_reassert_until_ms = now + USB_REASSERT_WINDOW_MS;
+    s_reassert_last_ms  = now;
+}
+
+// Per-release re-assertion.
+//
+// Observed failure: `mod=0x08` (LeftAlt) stayed held on the host after the remote
+// key came up. The Arduino USBHIDKeyboard::sendReport() helper is `void` and
+// forwards to HID().SendReport(), whose bool it discards, and `hid` is a *private*
+// member, so we cannot observe whether the host actually accepted a report. That
+// report can legitimately fail: SendReport() returns false when the endpoint is
+// still busy, or when the PC has stopped polling (NAK) - exactly what happens
+// while the screen blanks or the remote is released near a suspend.
+//
+// A tap presses and releases ~15 ms apart, so the press is usually still in
+// flight when the release is submitted, and a busy endpoint is the common case
+// rather than the exotic one. When that release is dropped nothing in the design
+// notices: the registry is cleared locally, the host keeps the modifier, and the
+// only thing that eventually repairs it is the modifier guard after 20 s - by
+// which time Windows has applied Alt to every keystroke on the machine.
+//
+// We cannot see the bool, but we do have one piece of positive evidence: the
+// host draining the interrupt IN endpoint means the report was actually taken.
+// So we re-assert until the endpoint is observed idle after a send, and treat
+// that - not a fixed number of retries - as delivery. Repeats stop as soon as
+// anything is genuinely held again, so this can never truncate a real keypress.
+#define USB_HID_EP_IN 0x81
+#define USB_RELEASE_REASSERT_WINDOW_MS 1000
+#define USB_RELEASE_REASSERT_PERIOD_MS 15
+static uint32_t         s_release_owed_until_ms    = 0;  // 0 = not owed
+static uint32_t         s_release_owed_last_ms     = 0;
+static uint32_t         s_release_owed_modifier    = 0;  // for the forensics log
+static uint32_t         s_release_owed_sent        = 0;
+static bool             s_release_owed_drained     = false;
+static uint32_t         s_release_slow_count       = 0;  // windows needing many repeats
+static uint8_t          s_last_modifier_down       = 0;
+
+// Caller must hold hid_lock().
+static void hid_send_clear_locked(void) {
+    KeyReport clear_report = {0};
+    s_keyboard.sendReport(&clear_report);
+}
+
+// Arm the per-release re-assertion window. Caller must hold hid_lock().
+static void release_owed_arm_locked(uint8_t modifier) {
+    const uint32_t now = millis();
+    s_release_owed_until_ms = now + USB_RELEASE_REASSERT_WINDOW_MS;
+    s_release_owed_last_ms  = now;
+    s_release_owed_modifier = modifier;
+    s_release_owed_sent     = 0;
+    s_release_owed_drained  = false;
+}
+
 static void guard_load_config(void) {
     if (s_guard_inited) return;
     s_guard_inited = true;
@@ -268,17 +343,22 @@ void usb_composite_force_release_all(const char* reason) {
     // 3. Hard-clear the USB reports so the PC can never see a ghost key/modifier.
     hid_lock();
     if (s_usb_ready) {
-        KeyReport clear_report = {0};
-        s_keyboard.sendReport(&clear_report);
+        hid_send_clear_locked();
         s_keyboard.releaseAll();
         s_consumer.release();
     }
+    release_owed_arm_locked(s_last_modifier_down);
+    s_last_modifier_down = 0;
     hid_unlock();
 
     // 4. Registry is now empty regardless.
     guard_clear_all();
 
-    // 5. Visual: red flash so the user sees the guard fired, then normal status.
+    // 5. The host is now receiving a clean report; keep re-asserting briefly in
+    //    case a release was lost in flight, then stop.
+    reassert_arm();
+
+    // 6. Visual: red flash so the user sees the guard fired, then normal status.
     led_indicator_trigger_stuck();
     led_indicator_set(LED_STATE_CONNECTED);
 }
@@ -309,14 +389,34 @@ void usb_composite_init(void) {
             }
             s_keyboard.releaseAll();
             s_consumer.release();
+            release_owed_arm_locked(s_last_modifier_down);
+            s_last_modifier_down = 0;
             guard_clear_all();
+            reassert_arm();   // host may have missed a release across suspend
         } else if (id == ARDUINO_USB_STARTED_EVENT) {
             s_waiting_reconnect_ms = 0; // soft re-enumeration succeeded
             app_log("USB", "USB Started / Mounted");
             for (uint8_t ep = 1; ep <= 4; ep++) {
                 usbd_edpt_clear_stall(0, (uint8_t)(ep | 0x80));
             }
+            // Push an all-zero report to the host as the very first thing after
+            // (re-)enumeration. A crash or watchdog reset can leave the PC
+            // holding a modifier-down state that it never sees released, and
+            // Windows applies a stuck modifier from this HID keyboard to *every*
+            // keyboard on the system, which reads to the user as their own
+            // physical keyboard typing garbage. Clearing our internal registry
+            // is not enough: the host has to be told explicitly.
+            hid_lock();
+            if (s_usb_ready) {
+                hid_send_clear_locked();
+                s_keyboard.releaseAll();
+                s_consumer.release();
+            }
+            release_owed_arm_locked(s_last_modifier_down);
+            s_last_modifier_down = 0;
+            hid_unlock();
             guard_clear_all();
+            reassert_arm();
             // Host (re-)enumerated us: boot, PC reboot, or Device Manager
             // re-enable. The user is at the PC, so make the web UI reachable
             // in case the on-demand idle timeout had powered the radio down.
@@ -345,6 +445,64 @@ void usb_composite_task(void) {
 
     uint32_t now = millis();
     guard_tick(now);
+
+    // Per-release re-assertion. Runs after every release and keeps re-sending the
+    // all-zero report until the host is observed to have drained the interrupt
+    // endpoint, so a release the host never accepted is repaired in milliseconds
+    // rather than waiting out the 20 s modifier guard. Gated on nothing being
+    // held, so a fast follow-up keypress always wins.
+    if (s_release_owed_until_ms == 0) {
+        // nothing owed
+    } else if (guard_has_held()) {
+        // real key down: the new press supersedes the owed clear
+        s_release_owed_until_ms = 0;
+    } else if (now - s_release_owed_last_ms >= USB_RELEASE_REASSERT_PERIOD_MS) {
+        if (now >= s_release_owed_until_ms) {
+            // Window closed before we saw a drain. That is the interesting case:
+            // the host was not taking reports, so the release may well be lost.
+            s_release_owed_until_ms = 0;
+            if (s_release_owed_sent > 0) {
+                s_release_slow_count++;
+                app_log("USB_HID", "!! release NOT confirmed after %u sends (mod=0x%02X) slow=%u",
+                        (unsigned)s_release_owed_sent,
+                        (unsigned)s_release_owed_modifier,
+                        (unsigned)s_release_slow_count);
+            }
+        } else {
+            s_release_owed_last_ms = now;
+            hid_lock();
+            if (s_usb_ready) {
+                hid_send_clear_locked();
+                s_release_owed_sent++;
+                s_release_owed_drained = !usbd_edpt_busy(0, USB_HID_EP_IN);
+            }
+            hid_unlock();
+            // Drain observed after at least one round: the host has the report.
+            if (s_release_owed_drained && s_release_owed_sent >= 2) {
+                s_release_owed_until_ms = 0;
+            }
+        }
+    }
+
+    // Re-assert a clean keyboard report, but only inside the bounded window
+    // armed by mount/resume/force-release. Gated on nothing being held so we can
+    // never truncate a real keypress, and it shuts itself off once the window
+    // closes rather than running forever.
+    if (s_reassert_until_ms == 0) {
+        // window closed: nothing to do
+    } else if (now >= s_reassert_until_ms) {
+        s_reassert_until_ms = 0;
+    } else if (guard_has_held()) {
+        s_reassert_last_ms = now;  // real key down: pause, don't interfere
+    } else if (now - s_reassert_last_ms >= USB_REASSERT_PERIOD_MS) {
+        s_reassert_last_ms = now;
+        hid_lock();
+        if (s_usb_ready) {
+            hid_send_clear_locked();
+        }
+        hid_unlock();
+    }
+
     // Soft re-enumeration safety net: if the host did not re-mount us within
     // 4s of the D+/D- detach, fall back to a full restart (today's behavior).
     if (s_waiting_reconnect_ms != 0 && (now - s_waiting_reconnect_ms >= 4000)) {
@@ -419,6 +577,25 @@ bool usb_hid_keyboard_press(uint8_t modifier, uint8_t keycode) {
     report.keys[0] = keycode;
     s_keyboard.sendReport(&report);
 
+    // A new key down supersedes any owed clear: the re-assert window must never
+    // be able to truncate a press. A tap is not in the guard registry, so the
+    // task loop cannot infer this on its own - disarm it here explicitly.
+    s_release_owed_until_ms = 0;
+
+    // Forensics for the "PC thinks Alt is down" failure mode. Any report with a
+    // non-zero modifier byte is the only way this device can make an unrelated
+    // physical keyboard misbehave, so log those loudly and leave an
+    // unmistakable trail in the ring buffer for the next occurrence.
+    if (modifier != 0) {
+        // Remember which modifier went down: if the matching release is dropped,
+        // the per-release re-assert window can name the culprit in the log.
+        s_last_modifier_down = modifier;
+        app_log("USB_HID", "!! MODIFIER DOWN mod=0x%02X key=0x%02X (guard=%ums)",
+                (unsigned)modifier, (unsigned)keycode, (unsigned)s_guard_mod_ms);
+    } else {
+        app_log("USB_HID", "press key=0x%02X", (unsigned)keycode);
+    }
+
     hid_unlock();
     return true;
 }
@@ -427,9 +604,16 @@ bool usb_hid_keyboard_release(void) {
     if (!s_usb_ready) return false;
     hid_lock();
 
-    KeyReport report = {0}; // All zeroes
-    s_keyboard.sendReport(&report);
-    s_keyboard.releaseAll();
+    // Arm the re-assert window first so that even if this report is dropped the
+    // task loop keeps pushing clears until the host has certainly seen one.
+    release_owed_arm_locked(s_last_modifier_down);
+    s_last_modifier_down = 0;
+
+    // One all-zero report is enough. The previous code additionally called
+    // releaseAll(), which sent a second identical report through the same
+    // fire-and-forget path - it doubled the odds of a NAK without adding any
+    // guarantee, since a dropped release stays dropped either way.
+    hid_send_clear_locked();
 
     hid_unlock();
     return true;

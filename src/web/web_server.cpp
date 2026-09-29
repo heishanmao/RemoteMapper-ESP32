@@ -104,11 +104,40 @@ static void handle_audio() {
     doc["session_active"] = g_audio_pipeline.active;
     doc["session_id"] = (int)g_audio_pipeline.session_id;
     doc["buffering"] = g_audio_pipeline.buffering;
-    doc["ring_avail"] = (int)audio_ring_buffer_available_read(&g_audio_pipeline.ring_buf);
+    doc["ring_avail"] = (int)audio_ring_buffer_peek_available(&g_audio_pipeline.ring_buf);
     doc["ring_capacity"] = AUDIO_RING_BUFFER_SIZE;
     doc["underruns"] = (int)g_audio_pipeline.underrun_count;
+    doc["starve_count"] = (int)g_audio_pipeline.starve_count;
+    doc["partial_count"] = (int)g_audio_pipeline.partial_count;
+    doc["wire_samples"] = (int)g_audio_pipeline.wire_samples;
+    doc["padded_samples"] = (int)g_audio_pipeline.padded_samples;
     doc["frames_decoded"] = (int)g_audio_pipeline.total_frames_decoded;
     doc["samples_pushed"] = (int)g_audio_pipeline.total_samples_pushed;
+
+    // Spectral probe on the decoded sequence: if there is real energy above
+    // 6000 Hz then the remote captured above 12 kHz and ships 1/1 pitch, so the
+    // 1:1 shortfall is dropped samples rather than a rate mismatch.
+    uint16_t spec[AUDIO_SPEC_BINS];
+    audio_pipeline_get_spectrum(&g_audio_pipeline, spec);
+    String specStr = "[";
+    for (int i = 0; i < AUDIO_SPEC_BINS; i++) {
+        if (i) specStr += ',';
+        specStr += String(spec[i]);
+    }
+    specStr += "]";
+    doc["spec_hz_lo"] = (int)AUDIO_SPEC_BIN0_HZ;
+    doc["spec_hz_hi"] = (int)AUDIO_SPEC_MAX_HZ;
+    doc["spec_hz_step"] = (int)AUDIO_SPEC_BIN_HZ_STEP;
+    doc["spec_peak"] = specStr;
+    uint32_t specRaw[AUDIO_SPEC_BINS];
+    audio_pipeline_get_spectrum_raw(&g_audio_pipeline, specRaw);
+    String rawStr = "[";
+    for (int i = 0; i < AUDIO_SPEC_BINS; i++) {
+        if (i) rawStr += ',';
+        rawStr += String(specRaw[i]);
+    }
+    rawStr += "]";
+    doc["spec_raw"] = rawStr;
 
     String out;
     serializeJson(doc, out);
@@ -158,6 +187,56 @@ static void handle_guard_set() {
     String out;
     serializeJson(doc, out);
     s_server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+static void handle_audio_resample() {
+    uint16_t num = 0, den = 0;
+    audio_pipeline_get_resample(&g_audio_pipeline, &num, &den);
+
+    if (s_server.hasArg("plain") && s_server.method() == HTTP_POST) {
+        JsonDocument doc;
+        if (deserializeJson(doc, s_server.arg("plain"))) {
+            s_server.send(400, "application/json", "{\"error\":\"invalid_json\"}");
+            return;
+        }
+        const int n = doc["num"].is<int>() ? doc["num"].as<int>() : (int)num;
+        const int d = doc["den"].is<int>() ? doc["den"].as<int>() : (int)den;
+        if (n < 0 || n > 4096 || d < 0 || d > 4096) {
+            s_server.send(400, "application/json", "{\"error\":\"out_of_range\"}");
+            return;
+        }
+        if (n == 0 || d == 0) {
+            // 0/0 means "no rate conversion". The pipeline has no separate disabled
+            // state: audio_resample_up treats an unset interval as 1:1, so routing
+            // it through the setter keeps the reported value and the actual ratio
+            // in agreement. Previously this only rewrote the local reply, leaving
+            // the pipeline on the old ratio while claiming enabled:false.
+            if (!audio_pipeline_set_resample(&g_audio_pipeline, 1, 1)) {
+                s_server.send(500, "application/json", "{\"error\":\"passthrough_failed\"}");
+                return;
+            }
+            audio_pipeline_get_resample(&g_audio_pipeline, &num, &den);
+        } else if (!audio_pipeline_set_resample(&g_audio_pipeline, (uint16_t)n, (uint16_t)d)) {
+            char body[96];
+            snprintf(body, sizeof(body),
+                     "{\"error\":\"ratio_rejected\",\"allowed_pct\":[%d,%d]}",
+                     AUDIO_RS_MIN_RATIO_PCT, AUDIO_RS_MAX_RATIO_PCT);
+            s_server.send(400, "application/json", body);
+            return;
+        } else {
+            audio_pipeline_get_resample(&g_audio_pipeline, &num, &den);
+        }
+    }
+
+    char body[128];
+    snprintf(body, sizeof(body),
+             "{\"num\":%u,\"den\":%u,\"enabled\":%s,\"ratio_pct\":%d,"
+             "\"outputs_per_frame_est\":%d,\"min_pct\":%d,\"max_pct\":%d}",
+             (unsigned)num, (unsigned)den, (num && den) ? "true" : "false",
+             (num && den) ? (int)((int)num * 100 / (int)den) : 100,
+             (num && den) ? (int)(AUDIO_DEFAULT_FRAME_SAMPS * (int)num / (int)den) : AUDIO_DEFAULT_FRAME_SAMPS,
+             AUDIO_RS_MIN_RATIO_PCT, AUDIO_RS_MAX_RATIO_PCT);
+    s_server.send(200, "application/json", body);
 }
 
 static void handle_wifi_scan() {
@@ -655,6 +734,8 @@ void web_server_init(void) {
     s_server.on("/api/config/export", HTTP_GET, handle_config_export);
     s_server.on("/api/config/import", HTTP_POST, handle_config_import);
     s_server.on("/api/audio", HTTP_GET, handle_audio);
+    s_server.on("/api/audio/resample", HTTP_GET,  handle_audio_resample);
+    s_server.on("/api/audio/resample", HTTP_POST, handle_audio_resample);
     s_server.on("/api/guard", HTTP_GET, handle_guard);
     s_server.on("/api/guard", HTTP_POST, handle_guard_set);
     s_server.on("/api/debug/adv-sniff", HTTP_GET, handle_adv_sniff_get);

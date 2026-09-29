@@ -8,6 +8,7 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+#include <esp_coexist.h>
 
 static_assert((int)WIFI_POLICY_ON_DEMAND == WIFI_DEFAULT_POLICY,
               "WIFI_DEFAULT_POLICY must match WIFI_POLICY_ON_DEMAND");
@@ -147,6 +148,16 @@ static void wifi_reconnect_light(void) {
 
 void wifi_manager_init(void) {
     s_prefs.begin("wifi_conf", false);
+
+    // The ESP32-S3 has a single 2.4 GHz radio shared by WiFi and BLE. With the
+    // default WiFi-preferred arbitration, a WiFi beacon or data TX during a BLE
+    // connection event costs us that event's notification, and BLE notifications
+    // are never retransmitted. For this device BLE carries the microphone stream,
+    // so a lost notification is a permanent hole in the ADPCM stream that no
+    // amount of post-processing can fill, which is what limited speech
+    // recognition accuracy. Prefer BT and let the WebUI take the slower path:
+    // it is all request/response traffic that tolerates a little more latency.
+    esp_coex_preference_set(ESP_COEX_PREFER_BT);
 
     // Policy and timeout are normally seeded by config_manager_init() migration.
     // Defensive defaults keep the manager robust if that ever did not run.

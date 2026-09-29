@@ -259,7 +259,12 @@ static bool uac_driver_xfer_cb(uint8_t rhport, uint8_t ep_addr,
         // most once every 5s, so /api/logs stays readable during voice sessions.
         static uint32_t s_last_starvation_log_ms = 0;
         uint32_t now = millis();
-        size_t avail = audio_ring_buffer_available_read(&g_audio_pipeline.ring_buf);
+        // peek, not available_read: this runs in the TinyUSB task, which is not
+        // the ring's consumer. available_read() applies a producer-posted clear
+        // (tail = head), so calling it here would let a third context race the
+        // 500Hz push task and break the single-consumer invariant the clear
+        // design depends on. This is a diagnostic only, so peek is sufficient.
+        size_t avail = audio_ring_buffer_peek_available(&g_audio_pipeline.ring_buf);
         if (avail == 0 && (now - s_last_starvation_log_ms >= 5000)) {
             s_last_starvation_log_ms = now;
             app_log("UAC", "TX starved: ring empty (underruns=%u)", (unsigned)g_audio_pipeline.underrun_count);
