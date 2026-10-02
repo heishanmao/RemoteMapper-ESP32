@@ -52,7 +52,8 @@ extern "C" {
 // sample. At the 2:1 ceiling that is 3x the input frame, so size for that.
 #define AUDIO_WORK_SAMPLES        (AUDIO_DEFAULT_FRAME_SAMPS * 3)
 
-#define AUDIO_RING_BUFFER_SIZE    8192      // Ring buffer capacity (in samples, ~512ms buffer)
+#define AUDIO_RING_BUFFER_SIZE    32768     // 2.048s in PSRAM: cover slow host mic activation
+#define AUDIO_RING_FALLBACK_SIZE  8192      // Internal-RAM fallback if PSRAM allocation fails
 
 // AGC & Filter parameters
 #define AGC_TARGET_LEVEL          28000.0f
@@ -112,6 +113,12 @@ extern "C" {
 #define WIFI_DEFAULT_TIMEOUT_MIN  5         // Default ON_DEMAND idle timeout (minutes)
 #define WIFI_TIMEOUT_NEVER        0         // 0 = keep radio on until manual off
 
+// Master switch for the ON_DEMAND idle auto-shutdown. Disabled by default: the
+// radio then stays up until the user powers it down or changes the policy.
+// The timeout_min value is still stored while disabled, so re-enabling the
+// switch restores the previously configured minutes.
+#define WIFI_DEFAULT_TIMEOUT_ENABLED 0      // 0 = idle auto-shutdown off (manual control)
+
 // 5-press wake gesture: press any remote key N times within the window to wake Wi-Fi
 // after the ON_DEMAND idle power-down.
 #define WIFI_WAKE_PRESS_THRESHOLD 5
@@ -126,6 +133,7 @@ extern "C" {
 #define HID_GUARD_MOD_SOLO_MS      20000    // Any modifier held > 20s (independent of other keys)
 #define HID_GUARD_KEY_IDLE_MS      60000    // Non-voice key held with zero output for > 60s
 #define HID_GUARD_VOICE_EXTREME_MS 900000   // Absolute ceiling for a voice recording (15 min)
+#define HID_GUARD_VOICE_RX_GAP_MS  5000     // No complete ATVV frames (not acoustic silence)
 
 #ifdef __cplusplus
 }

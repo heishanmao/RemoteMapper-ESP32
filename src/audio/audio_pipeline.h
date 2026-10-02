@@ -35,7 +35,7 @@ typedef struct {
     audio_filter_state_t filter;
     audio_agc_t          agc;
     audio_ring_buffer_t  ring_buf;
-    int16_t              ring_storage[AUDIO_RING_BUFFER_SIZE];
+    int16_t              ring_fallback[AUDIO_RING_FALLBACK_SIZE];
     int16_t              decode_buf[AUDIO_DEFAULT_FRAME_SAMPS];  // native rate, as decoded
     int16_t              temp_pcm[AUDIO_WORK_SAMPLES];           // AUDIO_SAMPLE_RATE, post-resample
     // Rational resampler state, carried across frame boundaries.

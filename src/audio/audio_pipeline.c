@@ -2,6 +2,7 @@
 #include <string.h>
 #include <math.h>
 #include <Arduino.h>
+#include <esp_heap_caps.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -20,7 +21,15 @@ void audio_pipeline_init(audio_pipeline_t *pipeline) {
     adpcm_init_state(&pipeline->adpcm);
     audio_filter_init(&pipeline->filter);
     audio_agc_init(&pipeline->agc);
-    audio_ring_buffer_init(&pipeline->ring_buf, pipeline->ring_storage, AUDIO_RING_BUFFER_SIZE);
+    int16_t *ring_storage = (int16_t *)heap_caps_malloc(
+            AUDIO_RING_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t ring_capacity = ring_storage ? AUDIO_RING_BUFFER_SIZE : AUDIO_RING_FALLBACK_SIZE;
+    if (!ring_storage) {
+        ring_storage = pipeline->ring_fallback;
+        app_log("AUDIO", "PSRAM pre-roll allocation failed; using %u-sample fallback",
+                (unsigned)ring_capacity);
+    }
+    audio_ring_buffer_init(&pipeline->ring_buf, ring_storage, ring_capacity);
     pipeline->active = false;
     pipeline->buffering = false;
     pipeline->session_id = 0;

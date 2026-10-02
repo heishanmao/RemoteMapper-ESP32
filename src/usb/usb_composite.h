@@ -20,6 +20,12 @@ void usb_composite_init(void);
  */
 void usb_composite_task(void);
 
+typedef enum { USB_RECOVERY_NONE, USB_RECOVERY_AUDIO, USB_RECOVERY_HID } usb_recovery_reason_t;
+void usb_composite_request_recovery(usb_recovery_reason_t reason);
+uint32_t usb_composite_recovery_count(void);
+uint32_t usb_composite_boot_reset_reason(void);
+bool usb_composite_boot_usb_recovery_restart(void);
+
 /**
  * @brief Send USB HID Keyboard Key Down (with modifier)
  */
@@ -77,6 +83,14 @@ typedef struct {
     uint32_t last_force_ms;     // ms tick of the last forced release (0 = never)
     char     last_reason[24];   // Reason string of the last forced release
     bool     any_held;          // true while any HID hold is currently registered
+    bool keyboard_pending;
+    bool consumer_pending;
+    uint8_t desired_modifier;
+    uint32_t tx_complete;
+    uint32_t tx_failed;
+    uint32_t pending_ms;
+    uint32_t usb_recoveries;
+    bool recovery_exhausted;
     uint32_t held_count;        // Number of currently registered held entries
 } usb_guard_stats_t;
 

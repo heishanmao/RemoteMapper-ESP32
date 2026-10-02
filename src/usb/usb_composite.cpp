@@ -1,6 +1,8 @@
 #include "usb_composite.h"
+#include "hid_diagnostics.h"
 #include "uac_microphone.h"
 #include "audio/audio_pipeline.h"
+#include "ble/ble_remote_client.h"
 #include "log/app_log.h"
 #include "led_indicator.h"
 #include "wifi/wifi_manager.h"
@@ -12,6 +14,7 @@
 #include "tusb.h"
 #include "esp32-hal-tinyusb.h"
 #include "esp_system.h"
+#include "esp_attr.h"
 #include <Preferences.h>
 
 #if !ARDUINO_USB_CDC_ON_BOOT
@@ -21,9 +24,9 @@ USBCDC USBSerial;
 static USBHIDKeyboard        s_keyboard;
 static USBHIDConsumerControl s_consumer;
 static bool                  s_usb_ready = false;
+// Uses the same framework HID instance/semaphore as keyboard and consumer.
+static USBHID                s_hid_transport;
 
-extern "C" void usbd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr);
-extern "C" bool usbd_edpt_busy(uint8_t rhport, uint8_t ep_addr);
 
 #include "soc/usb_struct.h"
 
@@ -82,79 +85,175 @@ static uint32_t         s_force_release_count     = 0;
 static uint32_t         s_last_force_ms           = 0;
 static char             s_last_force_reason[24]   = "";
 
-// Bounded report re-assertion.
-//
-// A crash or watchdog reset can leave the host holding a modifier-down state it
-// never sees released, and Windows applies that modifier to *every* keyboard, so
-// the user's own physical keyboard types garbage. The guard above cannot cover
-// this: it only runs while the firmware is alive, and dying is exactly when it
-// stops helping.
-//
-// Re-enumeration normally repairs the host on its own (the mount path sends an
-// all-zero report), so a permanent heartbeat would be both wasteful and a smell:
-// it would also mask any future unbalanced-report bug. Instead we re-assert
-// only inside a short window right after an event that could plausibly have
-// desynchronised the host, then stop for good.
-#define USB_REASSERT_WINDOW_MS 10000
-#define USB_REASSERT_PERIOD_MS 500
-static uint32_t         s_reassert_until_ms        = 0;  // 0 = window closed
-static uint32_t         s_reassert_last_ms         = 0;
+// Desired reports and retry state are serialized with hid_lock(). A newer
+// press/release replaces the previous desired state, including pending retries.
+// SendReport waits for TinyUSB's report-complete callback; never infer delivery
+// from an endpoint number (UAC and HID endpoints are allocated dynamically).
+static hid_keyboard_report_t s_keyboard_report = {};
+static uint16_t s_consumer_report = 0;
+static bool s_keyboard_pending = false;
+static bool s_consumer_pending = false;
+static uint32_t s_hid_last_retry_ms = 0;
+static uint32_t s_hid_last_warning_ms = 0;
+static uint32_t s_hid_tx_ok = 0;
+static uint32_t s_hid_tx_failed = 0;
+static bool s_hid_blocked = false;
+static uint32_t s_hid_blocked_since_ms = 0;
+static uint32_t s_usb_recovery_request = USB_RECOVERY_NONE;
+static uint32_t s_usb_recovery_count = 0;
+static bool s_usb_recovery_exhausted = false;
+static uint32_t s_voice_diag_seq = 0;
+static uint32_t s_voice_press_ms = 0;
+static uint32_t s_voice_pcm_samples0 = 0;
+static uint32_t s_voice_pcm_nonzero0 = 0;
+static uint64_t s_voice_pcm_abs0 = 0;
+static uint32_t s_voice_usb_completed0 = 0;
+static uint32_t s_voice_usb_claim_skips0 = 0;
+static bool s_voice_drain_pending = false;
+static uint32_t s_voice_release_ms = 0;
+static bool s_voice_hid_active = false;
+// One isolated 2 ms completion after re-enumeration is not recovery. The
+// incident showed roughly one completion per failed 10 s cycle.
+static constexpr uint32_t USB_RECOVERY_HEALTHY_PACKETS = 100;
+static constexpr uint32_t USB_RECOVERY_RTC_MAGIC = 0x524D5532;
+struct usb_recovery_rtc_t { uint32_t magic, restart_attempted, restart_marker; };
+RTC_NOINIT_ATTR static usb_recovery_rtc_t s_usb_recovery_rtc;
+static uint32_t s_boot_reset_reason = 0;
+static bool s_boot_usb_recovery_restart = false;
 
-// Arm the window. Called from the paths where the host may have missed (or never
-// received) a release report.
-static void reassert_arm(void) {
-    const uint32_t now = millis();
-    s_reassert_until_ms = now + USB_REASSERT_WINDOW_MS;
-    s_reassert_last_ms  = now;
+static void usb_recovery_rtc_init(void) {
+    const esp_reset_reason_t reset = esp_reset_reason();
+    if (s_usb_recovery_rtc.magic != USB_RECOVERY_RTC_MAGIC ||
+            reset == ESP_RST_POWERON || reset == ESP_RST_BROWNOUT) {
+        s_usb_recovery_rtc.magic = USB_RECOVERY_RTC_MAGIC;
+        s_usb_recovery_rtc.restart_attempted = 0;
+        s_usb_recovery_rtc.restart_marker = 0;
+    }
 }
 
-// Per-release re-assertion.
-//
-// Observed failure: `mod=0x08` (LeftAlt) stayed held on the host after the remote
-// key came up. The Arduino USBHIDKeyboard::sendReport() helper is `void` and
-// forwards to HID().SendReport(), whose bool it discards, and `hid` is a *private*
-// member, so we cannot observe whether the host actually accepted a report. That
-// report can legitimately fail: SendReport() returns false when the endpoint is
-// still busy, or when the PC has stopped polling (NAK) - exactly what happens
-// while the screen blanks or the remote is released near a suspend.
-//
-// A tap presses and releases ~15 ms apart, so the press is usually still in
-// flight when the release is submitted, and a busy endpoint is the common case
-// rather than the exotic one. When that release is dropped nothing in the design
-// notices: the registry is cleared locally, the host keeps the modifier, and the
-// only thing that eventually repairs it is the modifier guard after 20 s - by
-// which time Windows has applied Alt to every keystroke on the machine.
-//
-// We cannot see the bool, but we do have one piece of positive evidence: the
-// host draining the interrupt IN endpoint means the report was actually taken.
-// So we re-assert until the endpoint is observed idle after a send, and treat
-// that - not a fixed number of retries - as delivery. Repeats stop as soon as
-// anything is genuinely held again, so this can never truncate a real keypress.
-#define USB_HID_EP_IN 0x81
-#define USB_RELEASE_REASSERT_WINDOW_MS 1000
-#define USB_RELEASE_REASSERT_PERIOD_MS 15
-static uint32_t         s_release_owed_until_ms    = 0;  // 0 = not owed
-static uint32_t         s_release_owed_last_ms     = 0;
-static uint32_t         s_release_owed_modifier    = 0;  // for the forensics log
-static uint32_t         s_release_owed_sent        = 0;
-static bool             s_release_owed_drained     = false;
-static uint32_t         s_release_slow_count       = 0;  // windows needing many repeats
-static uint8_t          s_last_modifier_down       = 0;
+uint32_t usb_composite_boot_reset_reason(void) { return s_boot_reset_reason; }
+bool usb_composite_boot_usb_recovery_restart(void) { return s_boot_usb_recovery_restart; }
 
-// Caller must hold hid_lock().
-static void hid_send_clear_locked(void) {
-    KeyReport clear_report = {0};
-    s_keyboard.sendReport(&clear_report);
+void usb_composite_request_recovery(usb_recovery_reason_t reason) {
+    uint32_t empty = USB_RECOVERY_NONE;
+    __atomic_compare_exchange_n(&s_usb_recovery_request, &empty, (uint32_t)reason,
+            false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
 
-// Arm the per-release re-assertion window. Caller must hold hid_lock().
-static void release_owed_arm_locked(uint8_t modifier) {
-    const uint32_t now = millis();
-    s_release_owed_until_ms = now + USB_RELEASE_REASSERT_WINDOW_MS;
-    s_release_owed_last_ms  = now;
-    s_release_owed_modifier = modifier;
-    s_release_owed_sent     = 0;
-    s_release_owed_drained  = false;
+uint32_t usb_composite_recovery_count(void) {
+    return __atomic_load_n(&s_usb_recovery_count, __ATOMIC_ACQUIRE);
+}
+
+// Loop task owns the physical recovery for both audio and HID. A healthy
+// microphone must not conceal a blocked keyboard release (or vice versa).
+static bool usb_recovery_tick(uint32_t now) {
+    static bool detached = false;
+    static uint32_t detached_ms = 0;
+    static uint32_t last_recovery_ms = 0;
+    static uint32_t last_audio_completions = 0;
+    static uint8_t audio_no_progress_recoveries = 0;
+    if (s_usb_recovery_exhausted) return true;
+    if (s_usb_recovery_rtc.restart_attempted && now >= 120000 &&
+            usb_composite_recovery_count() == 0 && tud_mounted()) {
+        s_usb_recovery_rtc.restart_attempted = 0;
+        app_log("USB", "USB mounted for 2 min; full-restart allowance restored");
+    }
+    if (detached) {
+        if (now - detached_ms >= 350) {
+            tud_connect();
+            detached = false;
+            s_waiting_reconnect_ms = now;
+            app_log("USB", "Recovery: reconnected, waiting for host mount");
+        }
+        return true;
+    }
+    if (!__atomic_load_n(&s_usb_recovery_request, __ATOMIC_ACQUIRE)) return false;
+    if (usb_composite_recovery_count() && now - last_recovery_ms < 10000) return false;
+    uint32_t reason = __atomic_exchange_n(&s_usb_recovery_request, USB_RECOVERY_NONE, __ATOMIC_ACQ_REL);
+    if (reason == USB_RECOVERY_HID) {
+        hid_lock();
+        const bool still_pending = s_keyboard_pending || s_consumer_pending;
+        hid_unlock();
+        if (!still_pending) return false; // it recovered during the cooldown
+    }
+    hid_diagnostics_capture(reason);
+    if (reason == USB_RECOVERY_AUDIO) {
+        uac_tx_stats_t tx = {};
+        uac_microphone_get_stats(&tx);
+        audio_no_progress_recoveries =
+                (uint32_t)(tx.completed - last_audio_completions) >= USB_RECOVERY_HEALTHY_PACKETS
+                ? 1 : (uint8_t)(audio_no_progress_recoveries + 1);
+        last_audio_completions = tx.completed;
+        if (audio_no_progress_recoveries >= 3) {
+            app_log("USB", "Audio still stalled after %u recovery attempts (completed=%u)",
+                    (unsigned)audio_no_progress_recoveries, (unsigned)tx.completed);
+            usb_composite_force_release_all("uac-stalled");
+            if (!s_usb_recovery_rtc.restart_attempted) {
+                s_usb_recovery_rtc.restart_attempted = 1;
+                hid_diagnostics_persist_first_audio_fault();
+                s_usb_recovery_rtc.restart_marker = 1;
+                app_log("USB", "Soft USB recovery failed; restarting MCU once");
+                delay(100);
+                esp_restart();
+            }
+            // If a restart also failed, stop cycling the USB device every 10 s.
+            // Leave it detached so Windows drops the unusable capture device.
+            s_usb_recovery_exhausted = true;
+            tud_disconnect();
+            app_log("USB", "USB recovery exhausted; detached until power cycle");
+            return true;
+        }
+    }
+    usb_composite_force_release_all(reason == USB_RECOVERY_HID ? "hid-tx-stalled" : "uac-stalled");
+    hid_lock();
+    s_hid_blocked = false;
+    hid_unlock();
+    __atomic_add_fetch(&s_usb_recovery_count, 1, __ATOMIC_RELEASE);
+    last_recovery_ms = now;
+    s_hw_sleep_detected = false;
+    s_boot_grace_until_ms = now + 5000;
+    tud_disconnect();
+    detached_ms = now;
+    detached = true;
+    app_log("USB", "Recovery #%u: %s stalled, detach 350ms",
+            (unsigned)usb_composite_recovery_count(), reason == USB_RECOVERY_HID ? "HID" : "audio");
+    return true;
+}
+
+// Caller holds hid_lock(). A failure retains the desired state indefinitely.
+static bool hid_flush_keyboard_locked(void) {
+    if (!s_keyboard_pending) return true;
+    if (!s_usb_ready || !tud_ready()) return false;
+    bool ok = s_hid_transport.SendReport(HID_REPORT_ID_KEYBOARD,
+            &s_keyboard_report, sizeof(s_keyboard_report), 20);
+    if (ok) {
+        s_keyboard_pending = false;
+        s_hid_tx_ok++;
+        if (s_keyboard_report.modifier == 0 && s_keyboard_report.keycode[0] == 0)
+            app_log("USB_HID", "Keyboard release TX complete");
+    } else {
+        s_hid_tx_failed++;
+    }
+    return ok;
+}
+
+static bool hid_flush_consumer_locked(void) {
+    if (!s_consumer_pending) return true;
+    if (!s_usb_ready || !tud_ready()) return false;
+    bool ok = s_hid_transport.SendReport(HID_REPORT_ID_CONSUMER_CONTROL,
+            &s_consumer_report, sizeof(s_consumer_report), 20);
+    if (ok) { s_consumer_pending = false; s_hid_tx_ok++; }
+    else { s_hid_tx_failed++; }
+    return ok;
+}
+
+static void hid_clear_locked(void) {
+    s_keyboard_report = {};
+    s_consumer_report = 0;
+    s_keyboard_pending = true;
+    s_consumer_pending = true;
+    hid_flush_keyboard_locked();
+    hid_flush_consumer_locked();
 }
 
 static void guard_load_config(void) {
@@ -253,6 +352,18 @@ static void guard_tick(uint32_t now) {
         }
     }
 
+    // A new session gets a full startup grace. A timestamp from the previous
+    // hold cannot extend or shorten it. Unsigned ages also handle millis wrap.
+    // Read the cross-core timestamp before sampling the clock: a new RX frame
+    // must not appear "in the future" relative to the earlier loop timestamp.
+    const uint32_t last_frame_ms = ble_remote_last_audio_frame_ms();
+    const uint32_t voice_now = millis();
+    if (any_voice && voice_now - first_voice_ms >= HID_GUARD_VOICE_RX_GAP_MS &&
+            voice_now - last_frame_ms >= HID_GUARD_VOICE_RX_GAP_MS) {
+        usb_composite_force_release_all("voice-rx-timeout");
+        return;
+    }
+
     // Rule V: absolute ceiling for a voice recording (exempt from normal rules).
     if (any_voice && s_guard_voice_ms && (now - first_voice_ms >= s_guard_voice_ms)) {
         usb_composite_force_release_all("voice-extreme");
@@ -284,6 +395,16 @@ bool usb_composite_guard_get(usb_guard_config_t *cfg, usb_guard_stats_t *stats) 
         cfg->voice_ms = s_guard_voice_ms;
     }
     if (stats) {
+        hid_lock();
+        stats->keyboard_pending = s_keyboard_pending;
+        stats->consumer_pending = s_consumer_pending;
+        stats->desired_modifier = s_keyboard_report.modifier;
+        stats->tx_complete = s_hid_tx_ok;
+        stats->tx_failed = s_hid_tx_failed;
+        stats->pending_ms = s_hid_blocked ? millis() - s_hid_blocked_since_ms : 0;
+        stats->usb_recoveries = usb_composite_recovery_count();
+        stats->recovery_exhausted = s_usb_recovery_exhausted;
+        hid_unlock();
         stats->forced_releases = s_force_release_count;
         stats->last_force_ms   = s_last_force_ms;
         snprintf(stats->last_reason, sizeof(stats->last_reason), "%s", s_last_force_reason);
@@ -321,18 +442,24 @@ bool usb_composite_guard_set(const usb_guard_config_t *cfg) {
 void usb_composite_force_release_all(const char* reason) {
     // Nothing held and nothing recording -> this is a no-op (e.g. the USB bus
     // stops during the very first enumeration at boot). Don't count/flash.
-    if (!guard_has_held() && !g_audio_pipeline.active) return;
+    hid_lock();
+    const bool pending = s_keyboard_pending || s_consumer_pending;
+    hid_unlock();
+    if (!guard_has_held() && !g_audio_pipeline.active && !pending) return;
 
     s_force_release_count++;
     s_last_force_ms = millis();
     snprintf(s_last_force_reason, sizeof(s_last_force_reason), "%s", reason);
     app_log("GUARD", "Forced HID release (reason=%s, count=%u)",
             reason, (unsigned)s_force_release_count);
+    s_voice_drain_pending = false;
+    s_voice_hid_active = false;
 
     // 1. Stop any running voice/audio session first (engine release will emit
     //    a VOICE_RELEASE but the session must not outlive the forced release).
     if (g_audio_pipeline.active) {
         audio_pipeline_stop_session(&g_audio_pipeline);
+        ble_remote_request_mic_stop();
     }
 
     // 2. Let the key engine release every slot: it emits the proper RELEASE
@@ -340,23 +467,11 @@ void usb_composite_force_release_all(const char* reason) {
     extern key_mapper_engine_t g_key_engine;
     key_engine_release_all(&g_key_engine, millis());
 
-    // 3. Hard-clear the USB reports so the PC can never see a ghost key/modifier.
+    // Keep the release pending independently of the local held registry.
     hid_lock();
-    if (s_usb_ready) {
-        hid_send_clear_locked();
-        s_keyboard.releaseAll();
-        s_consumer.release();
-    }
-    release_owed_arm_locked(s_last_modifier_down);
-    s_last_modifier_down = 0;
+    hid_clear_locked();
     hid_unlock();
-
-    // 4. Registry is now empty regardless.
     guard_clear_all();
-
-    // 5. The host is now receiving a clean report; keep re-asserting briefly in
-    //    case a release was lost in flight, then stop.
-    reassert_arm();
 
     // 6. Visual: red flash so the user sees the guard fired, then normal status.
     led_indicator_trigger_stuck();
@@ -365,7 +480,26 @@ void usb_composite_force_release_all(const char* reason) {
 
 extern "C" {
 
+static void finish_voice_drain(const char* reason) {
+    if (!s_voice_drain_pending) return;
+    s_voice_drain_pending = false;
+    const size_t remaining = audio_ring_buffer_peek_available(&g_audio_pipeline.ring_buf);
+    audio_pipeline_stop_session(&g_audio_pipeline);
+    app_log("VOICE_DRAIN", "seq=%u reason=%s delay=%ums remaining=%u",
+            (unsigned)s_voice_diag_seq, reason,
+            (unsigned)(millis() - s_voice_release_ms), (unsigned)remaining);
+}
+
 void usb_composite_init(void) {
+    usb_recovery_rtc_init();
+    s_boot_reset_reason = (uint32_t)esp_reset_reason();
+    s_boot_usb_recovery_restart = s_usb_recovery_rtc.restart_marker != 0;
+    s_usb_recovery_rtc.restart_marker = 0;
+    app_log("BOOT", "reset_reason=%u usb_recovery_restart=%u",
+            (unsigned)s_boot_reset_reason, s_boot_usb_recovery_restart ? 1u : 0u);
+    // Create the mutex before USB/BLE callbacks can race its initialization.
+    hid_lock();
+    hid_unlock();
     USB.VID(0x303A);
     USB.PID(0x8089);
     USB.productName("RemoteMapper Audio & Remote Bridge");
@@ -384,43 +518,17 @@ void usb_composite_init(void) {
             usb_composite_force_release_all("usb-suspend");
         } else if (id == ARDUINO_USB_RESUME_EVENT) {
             app_log("USB", "USB Resume Event (PC Woke up)");
-            for (uint8_t ep = 1; ep <= 4; ep++) {
-                usbd_edpt_clear_stall(0, (uint8_t)(ep | 0x80));
-            }
-            s_keyboard.releaseAll();
-            s_consumer.release();
-            release_owed_arm_locked(s_last_modifier_down);
-            s_last_modifier_down = 0;
-            guard_clear_all();
-            reassert_arm();   // host may have missed a release across suspend
-        } else if (id == ARDUINO_USB_STARTED_EVENT) {
-            s_waiting_reconnect_ms = 0; // soft re-enumeration succeeded
-            app_log("USB", "USB Started / Mounted");
-            for (uint8_t ep = 1; ep <= 4; ep++) {
-                usbd_edpt_clear_stall(0, (uint8_t)(ep | 0x80));
-            }
-            // Push an all-zero report to the host as the very first thing after
-            // (re-)enumeration. A crash or watchdog reset can leave the PC
-            // holding a modifier-down state that it never sees released, and
-            // Windows applies a stuck modifier from this HID keyboard to *every*
-            // keyboard on the system, which reads to the user as their own
-            // physical keyboard typing garbage. Clearing our internal registry
-            // is not enough: the host has to be told explicitly.
+            usb_composite_force_release_all("usb-resume");
             hid_lock();
-            if (s_usb_ready) {
-                hid_send_clear_locked();
-                s_keyboard.releaseAll();
-                s_consumer.release();
-            }
-            release_owed_arm_locked(s_last_modifier_down);
-            s_last_modifier_down = 0;
+            hid_clear_locked();
             hid_unlock();
-            guard_clear_all();
-            reassert_arm();
-            // Host (re-)enumerated us: boot, PC reboot, or Device Manager
-            // re-enable. The user is at the PC, so make the web UI reachable
-            // in case the on-demand idle timeout had powered the radio down.
-            // Deferred wake: processed in the main-loop context, race-free.
+        } else if (id == ARDUINO_USB_STARTED_EVENT) {
+            s_waiting_reconnect_ms = 0;
+            app_log("USB", "USB Started / Mounted");
+            usb_composite_force_release_all("usb-mounted");
+            hid_lock();
+            hid_clear_locked();
+            hid_unlock();
             wifi_manager_notify_usb_mounted();
         } else if (id == ARDUINO_USB_STOPPED_EVENT) {
             app_log("USB", "USB Stopped / Bus Reset");
@@ -436,72 +544,56 @@ void usb_composite_init(void) {
 
     s_keyboard.begin();
     s_consumer.begin();
-    USB.begin();
+    s_hid_transport.begin();
     s_usb_ready = true;
+    USB.begin();
 }
 
 void usb_composite_task(void) {
     uac_microphone_task();
 
     uint32_t now = millis();
+    if (usb_recovery_tick(now)) return;
     guard_tick(now);
+    if (s_voice_drain_pending) {
+        const size_t queued = audio_ring_buffer_peek_available(&g_audio_pipeline.ring_buf);
+        if (now - s_voice_release_ms >= 1800) {
+            finish_voice_drain("timeout");
+        } else if (queued <= 32 && now - s_voice_press_ms >= 1400) {
+            finish_voice_drain("empty");
+        }
+    }
 
-    // Per-release re-assertion. Runs after every release and keeps re-sending the
-    // all-zero report until the host is observed to have drained the interrupt
-    // endpoint, so a release the host never accepted is repaired in milliseconds
-    // rather than waiting out the 20 s modifier guard. Gated on nothing being
-    // held, so a fast follow-up keypress always wins.
-    if (s_release_owed_until_ms == 0) {
-        // nothing owed
-    } else if (guard_has_held()) {
-        // real key down: the new press supersedes the owed clear
-        s_release_owed_until_ms = 0;
-    } else if (now - s_release_owed_last_ms >= USB_RELEASE_REASSERT_PERIOD_MS) {
-        if (now >= s_release_owed_until_ms) {
-            // Window closed before we saw a drain. That is the interesting case:
-            // the host was not taking reports, so the release may well be lost.
-            s_release_owed_until_ms = 0;
-            if (s_release_owed_sent > 0) {
-                s_release_slow_count++;
-                app_log("USB_HID", "!! release NOT confirmed after %u sends (mod=0x%02X) slow=%u",
-                        (unsigned)s_release_owed_sent,
-                        (unsigned)s_release_owed_modifier,
-                        (unsigned)s_release_slow_count);
+    // Checking pending state and sending are one critical section: no stale
+    // all-zero retry can race a newly pressed key. Retry at most every 50 ms;
+    // disconnect/suspend retains the debt without blocking or flooding logs.
+    hid_lock();
+    if (now - s_hid_last_retry_ms >= 50) {
+        s_hid_last_retry_ms = now;
+        hid_flush_keyboard_locked();
+        hid_flush_consumer_locked();
+        // An idle local registry does NOT imply Windows received the release.
+        // Keep this deadline independent of new presses and audio activity.
+        if ((s_keyboard_pending || s_consumer_pending) && tud_ready()) {
+            const uint32_t checked_ms = millis();
+            if (!s_hid_blocked) {
+                s_hid_blocked = true;
+                s_hid_blocked_since_ms = checked_ms;
+            } else if (checked_ms - s_hid_blocked_since_ms >= 1000) {
+                usb_composite_request_recovery(USB_RECOVERY_HID);
             }
         } else {
-            s_release_owed_last_ms = now;
-            hid_lock();
-            if (s_usb_ready) {
-                hid_send_clear_locked();
-                s_release_owed_sent++;
-                s_release_owed_drained = !usbd_edpt_busy(0, USB_HID_EP_IN);
-            }
-            hid_unlock();
-            // Drain observed after at least one round: the host has the report.
-            if (s_release_owed_drained && s_release_owed_sent >= 2) {
-                s_release_owed_until_ms = 0;
-            }
+            s_hid_blocked = false;
+        }
+        if ((s_keyboard_pending || s_consumer_pending) &&
+                now - s_hid_last_warning_ms >= 5000) {
+            s_hid_last_warning_ms = now;
+            app_log("USB_HID", "TX pending: keyboard=%d consumer=%d mod=0x%02X ready=%d failures=%u",
+                    s_keyboard_pending, s_consumer_pending,
+                    s_keyboard_report.modifier, tud_ready(), (unsigned)s_hid_tx_failed);
         }
     }
-
-    // Re-assert a clean keyboard report, but only inside the bounded window
-    // armed by mount/resume/force-release. Gated on nothing being held so we can
-    // never truncate a real keypress, and it shuts itself off once the window
-    // closes rather than running forever.
-    if (s_reassert_until_ms == 0) {
-        // window closed: nothing to do
-    } else if (now >= s_reassert_until_ms) {
-        s_reassert_until_ms = 0;
-    } else if (guard_has_held()) {
-        s_reassert_last_ms = now;  // real key down: pause, don't interfere
-    } else if (now - s_reassert_last_ms >= USB_REASSERT_PERIOD_MS) {
-        s_reassert_last_ms = now;
-        hid_lock();
-        if (s_usb_ready) {
-            hid_send_clear_locked();
-        }
-        hid_unlock();
-    }
+    hid_unlock();
 
     // Soft re-enumeration safety net: if the host did not re-mount us within
     // 4s of the D+/D- detach, fall back to a full restart (today's behavior).
@@ -572,59 +664,32 @@ bool usb_hid_keyboard_press(uint8_t modifier, uint8_t keycode) {
         vTaskDelay(pdMS_TO_TICKS(15));
     }
 
-    KeyReport report = {0};
-    report.modifiers = modifier;
-    report.keys[0] = keycode;
-    s_keyboard.sendReport(&report);
-
-    // A new key down supersedes any owed clear: the re-assert window must never
-    // be able to truncate a press. A tap is not in the guard registry, so the
-    // task loop cannot infer this on its own - disarm it here explicitly.
-    s_release_owed_until_ms = 0;
-
-    // Forensics for the "PC thinks Alt is down" failure mode. Any report with a
-    // non-zero modifier byte is the only way this device can make an unrelated
-    // physical keyboard misbehave, so log those loudly and leave an
-    // unmistakable trail in the ring buffer for the next occurrence.
-    if (modifier != 0) {
-        // Remember which modifier went down: if the matching release is dropped,
-        // the per-release re-assert window can name the culprit in the log.
-        s_last_modifier_down = modifier;
-        app_log("USB_HID", "!! MODIFIER DOWN mod=0x%02X key=0x%02X (guard=%ums)",
-                (unsigned)modifier, (unsigned)keycode, (unsigned)s_guard_mod_ms);
-    } else {
-        app_log("USB_HID", "press key=0x%02X", (unsigned)keycode);
-    }
-
+    s_keyboard_report = {};
+    s_keyboard_report.modifier = modifier;
+    s_keyboard_report.keycode[0] = keycode;
+    s_keyboard_pending = true;
+    bool ok = hid_flush_keyboard_locked();
+    app_log("USB_HID", "Keyboard DOWN mod=0x%02X key=0x%02X tx=%s",
+            modifier, keycode, ok ? "complete" : "pending");
     hid_unlock();
-    return true;
+    return ok;
 }
 
 bool usb_hid_keyboard_release(void) {
-    if (!s_usb_ready) return false;
     hid_lock();
-
-    // Arm the re-assert window first so that even if this report is dropped the
-    // task loop keeps pushing clears until the host has certainly seen one.
-    release_owed_arm_locked(s_last_modifier_down);
-    s_last_modifier_down = 0;
-
-    // One all-zero report is enough. The previous code additionally called
-    // releaseAll(), which sent a second identical report through the same
-    // fire-and-forget path - it doubled the odds of a NAK without adding any
-    // guarantee, since a dropped release stays dropped either way.
-    hid_send_clear_locked();
-
+    s_keyboard_report = {};
+    s_keyboard_pending = true;
+    bool ok = hid_flush_keyboard_locked();
     hid_unlock();
-    return true;
+    return ok;
 }
 
 bool usb_hid_keyboard_tap(uint8_t modifier, uint8_t keycode) {
     if (!s_usb_ready) return false;
-    usb_hid_keyboard_press(modifier, keycode);
+    bool down = usb_hid_keyboard_press(modifier, keycode);
     delay(15);
-    usb_hid_keyboard_release();
-    return true;
+    bool up = usb_hid_keyboard_release();
+    return down && up;
 }
 
 bool usb_hid_consumer_press(uint16_t usage_code) {
@@ -637,28 +702,30 @@ bool usb_hid_consumer_press(uint16_t usage_code) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    s_consumer.press(usage_code);
-
+    s_consumer_report = usage_code;
+    s_consumer_pending = true;
+    bool ok = hid_flush_consumer_locked();
     hid_unlock();
-    return true;
+    return ok;
 }
 
 bool usb_hid_consumer_release(void) {
     if (!s_usb_ready) return false;
     hid_lock();
 
-    s_consumer.release();
-
+    s_consumer_report = 0;
+    s_consumer_pending = true;
+    bool ok = hid_flush_consumer_locked();
     hid_unlock();
-    return true;
+    return ok;
 }
 
 bool usb_hid_consumer_tap(uint16_t usage_code) {
     if (!s_usb_ready) return false;
-    usb_hid_consumer_press(usage_code);
+    bool down = usb_hid_consumer_press(usage_code);
     delay(15);
-    usb_hid_consumer_release();
-    return true;
+    bool up = usb_hid_consumer_release();
+    return down && up;
 }
 
 void usb_hid_dispatch_action(const key_action_t *action) {
@@ -709,18 +776,61 @@ void usb_hid_dispatch_action(const key_action_t *action) {
             break;
         case ACTION_VOICE_HOLD:
             // Hold Voice Hotkey and start audio session
-            guard_add(action->modifier, action->key_code, 0, true);
+            finish_voice_drain("new-press");
+            ++s_voice_diag_seq;
+            s_voice_press_ms = millis();
+            uac_microphone_get_pcm_stats(&s_voice_pcm_samples0,
+                    &s_voice_pcm_nonzero0, &s_voice_pcm_abs0, nullptr);
+            {
+                uac_tx_stats_t tx = {};
+                uac_microphone_get_stats(&tx);
+                s_voice_usb_completed0 = tx.completed;
+                s_voice_usb_claim_skips0 = tx.claim_skips;
+            }
             audio_pipeline_start_session(&g_audio_pipeline, 0);
-            if (action->modifier != 0 || action->key_code != 0) {
+            s_voice_hid_active = action->modifier != 0 || action->key_code != 0;
+            if (s_voice_hid_active) {
+                guard_add(action->modifier, action->key_code, 0, true);
                 usb_hid_keyboard_press(action->modifier, action->key_code);
             }
             break;
-        case ACTION_VOICE_RELEASE:
-            // Release Voice Hotkey and stop audio session
+        case ACTION_VOICE_RELEASE: {
+            // Release Right Alt with the physical button. Some input methods
+            // distinguish a tap from a hold, and keeping Alt down for audio
+            // drain makes the keyboard appear stuck after a short press.
+            // Keep only the audio pipeline alive for a bounded drain period;
+            // apps that continue capture can consume it without holding HID.
+            s_voice_release_ms = millis();
+            const bool hid_was_active = s_voice_hid_active;
+            s_voice_hid_active = false;
+            s_voice_drain_pending = hid_was_active && g_audio_pipeline.active;
             guard_clear_voice();
-            usb_hid_keyboard_release();
-            audio_pipeline_stop_session(&g_audio_pipeline);
+            if (hid_was_active) {
+                usb_hid_keyboard_release();
+            } else {
+                audio_pipeline_stop_session(&g_audio_pipeline);
+            }
+            {
+                uint32_t samples = 0, nonzero = 0;
+                uint64_t absolute_sum = 0;
+                uac_tx_stats_t tx = {};
+                uac_microphone_get_pcm_stats(&samples, &nonzero, &absolute_sum, nullptr);
+                uac_microphone_get_stats(&tx);
+                const uint32_t arm = uac_microphone_get_stream_start_ms();
+                const int32_t arm_delay = arm >= s_voice_press_ms && arm <= millis()
+                        ? (int32_t)(arm - s_voice_press_ms) : -1;
+                const uint32_t pcm_n = samples - s_voice_pcm_samples0;
+                app_log("VOICE_AUDIO", "seq=%u hold=%u arm=%d ble=%u push=%u usb=%u skip=%u pcm=%u nz=%u avg=%u",
+                        (unsigned)s_voice_diag_seq, (unsigned)(millis() - s_voice_press_ms),
+                        (int)arm_delay, (unsigned)g_audio_pipeline.total_frames_decoded,
+                        (unsigned)g_audio_pipeline.total_samples_pushed,
+                        (unsigned)(tx.completed - s_voice_usb_completed0),
+                        (unsigned)(tx.claim_skips - s_voice_usb_claim_skips0),
+                        (unsigned)pcm_n, (unsigned)(nonzero - s_voice_pcm_nonzero0),
+                        (unsigned)(pcm_n ? (absolute_sum - s_voice_pcm_abs0) / pcm_n : 0));
+            }
             break;
+        }
         default:
             break;
     }

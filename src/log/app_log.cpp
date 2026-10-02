@@ -95,7 +95,8 @@ String app_log_get_json(void) {
     n = (s_log_count < MAX_LINES) ? s_log_count : MAX_LINES;
     size_t start_idx = (s_log_head + STATIC_LOG_LINES - n) % STATIC_LOG_LINES;
     for (size_t i = 0; i < n; i++) {
-        strncpy(snapshot[i], s_log_lines + (start_idx + i) * LOG_LINE_MAX_LEN, LOG_LINE_MAX_LEN - 1);
+        const size_t ring_idx = (start_idx + i) % STATIC_LOG_LINES;
+        strncpy(snapshot[i], s_log_lines + ring_idx * LOG_LINE_MAX_LEN, LOG_LINE_MAX_LEN - 1);
         snapshot[i][LOG_LINE_MAX_LEN - 1] = '\0';
     }
     taskEXIT_CRITICAL(&s_log_mux);
@@ -103,6 +104,11 @@ String app_log_get_json(void) {
     JsonDocument doc;
     JsonArray arr = doc["logs"].to<JsonArray>();
     for (size_t i = 0; i < n; i++) {
+        // BLE advertised names can contain raw C0 bytes. ArduinoJson's string
+        // writer does not escape every C0 value; keep exported JSON valid.
+        for (size_t j = 0; snapshot[i][j]; ++j) {
+            if ((unsigned char)snapshot[i][j] < 0x20) snapshot[i][j] = '?';
+        }
         arr.add(snapshot[i]);
     }
 

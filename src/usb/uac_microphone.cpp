@@ -1,4 +1,5 @@
 #include "usb/uac_microphone.h"
+#include "usb/usb_composite.h"
 #include "esp32-hal-tinyusb.h"
 #include "led_indicator.h"
 #include "audio/audio_pipeline.h"
@@ -6,6 +7,12 @@
 #include "log/app_log.h"
 #include "tusb.h"
 #include "device/usbd_pvt.h"
+#include "soc/usb_struct.h"
+#include "soc/usb_reg.h"
+
+#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+extern "C" bool remotemapper_dwc2_close_failed(void);
+#endif
 
 #define UAC_DESC_TOTAL_LEN  108
 #define UAC_TX_BLOCK_SAMPLES 32
@@ -24,98 +31,123 @@ static bool          s_uac_initialized = false;
 static uint8_t  s_mic_mute   = 0;
 static int16_t  s_mic_volume = 0x0000;
 
-// Double-buffered TX blocks (64B each). A dedicated 500Hz task fills + submits
-// one block every 2ms. We never re-queue inside the xfer callback: queueing in
-// the callback races the 2ms token and is what caused the endpoint to stall
-// (see git history / original comments). usbd_edpt_claim() guarantees the EP is
-// free before submitting.
+// Submit from TinyUSB task context, serialized with SET_INTERFACE/reset and
+// transfer completion. The pacing task only queues one deferred service call.
 static DRAM_ATTR int16_t s_tx_buf[UAC_TX_BLOCKS][UAC_TX_BLOCK_SAMPLES] __attribute__((aligned(4)));
-static volatile uint32_t s_tx_cur = 0;
+static uint32_t s_tx_cur = 0;
 static volatile uint32_t s_xfer_cb_count = 0;
 static volatile uint32_t s_xfer_fail_count = 0;
+static volatile uint32_t s_claim_skip_count = 0;
+static volatile uint32_t s_last_complete_ms = 0;
+static volatile uint32_t s_stream_start_ms = 0;
+static volatile bool s_service_queued = false;
+static volatile bool s_recovery_requested = false;
+static uint32_t s_last_progress_ms = 0;
+static uint32_t s_seen_completions = 0;
+static volatile uint32_t s_fifo_rearms = 0;
+static volatile uint32_t s_fifo_rearm_completions = 0;
+static volatile bool s_fifo_rearm_waiting = false;
+static uint32_t s_last_fifo_rearm_ms = 0;
+static volatile uint32_t s_pcm_samples = 0;
+static volatile uint32_t s_pcm_nonzero = 0;
+static volatile uint64_t s_pcm_absolute_sum = 0;
+static volatile uint16_t s_pcm_peak = 0;
+#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+static tusb_desc_endpoint_t s_uac_ep_desc = {};
+static bool s_uac_ep_open = false;
+#endif
 
-// ---------------------------------------------------------------------------
-// Watchdog: if the host has armed the stream (alt=1) but no ISO IN transfer has
-// completed for 3s, the link is wedged. Try to recover by re-arming the TX
-// task (it resubmits once the EP is claimable). Log every stall so the web log
-// shows exactly when / how often the link stalls.
-// ---------------------------------------------------------------------------
-static void uac_watchdog_task(void* arg) {
-    uint32_t last_count = 0;
-    uint32_t stuck_ticks = 0;
-    while(1) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-
-        if (tud_mounted() && !tud_suspended() && s_uac_streaming) {
-            if (s_xfer_cb_count == last_count) {
-                stuck_ticks += 100;
-                if (stuck_ticks >= 3000) {
-                    app_log("UAC", "Watchdog: ISO IN idle/stalled for 3s (fails=%u/ep=%u). Re-arming TX...",
-                            (unsigned)s_xfer_fail_count, (unsigned)s_uac_ep_in);
-                    // Re-arm: a fresh submit is attempted on the next 500Hz tick.
-                    last_count = s_xfer_cb_count;
-                    stuck_ticks = 0;
-                }
-            } else {
-                last_count = s_xfer_cb_count;
-                stuck_ticks = 0;
-            }
-        } else {
-            stuck_ticks = 0;
-            last_count = s_xfer_cb_count;
-        }
+static void uac_service(void*);
+static void queue_uac_service(void) {
+    if (!__atomic_exchange_n(&s_service_queued, true, __ATOMIC_ACQ_REL)) {
+        usbd_defer_func(uac_service, nullptr, false);
     }
 }
 
-// ---------------------------------------------------------------------------
-// 500Hz TX pump (one 64B block every 2ms):
-//   - Best effort: if the EP is busy (previous block still in flight) we skip
-//     this slot. Windows UAC1 absorbs a skipped slot as a short silence frame.
-//   - usbd_edpt_claim() + usbd_edpt_xfer() from task context is the documented
-//     way to submit ISO IN transfers; we never call it from inside a callback.
-// ---------------------------------------------------------------------------
-static void uac_push_task(void* arg) {
+static void uac_service(void*) {
+    // Even if the endpoint is stuck or Windows closed capture, honor resets on
+    // the ring's one consumer. Otherwise a full old ring blocks new sessions.
+    audio_ring_buffer_consume_pending_clear(&g_audio_pipeline.ring_buf);
+    const uint32_t now = millis();
+    if (!s_uac_streaming || !tud_ready() || s_recovery_requested || !s_uac_ep_in) {
+        s_last_progress_ms = now;
+        __atomic_store_n(&s_service_queued, false, __ATOMIC_RELEASE);
+        return;
+    }
+    if (s_seen_completions != s_xfer_cb_count) {
+        s_seen_completions = s_xfer_cb_count;
+        s_last_progress_ms = now;
+    }
+    // The bundled ESP32-S3 DCD sets this FIFO-empty mask in dcd_edpt_xfer()
+    // and clears it in the IN ISR using separate read/modify/write operations.
+    // If an ISR clear wins over a new transfer's set, a full packet remains
+    // pending with an empty FIFO and no enabled TXFE interrupt. The saved fault
+    // had exactly this state (EP3, DIEPTSIZ=0x80040, DIEPINT TXFE, mask=0).
+    // Re-arm only that precise state, from the serialized TinyUSB task, and
+    // leave the 500 ms full-recovery path intact if it does not make progress.
+#if !defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+    if (now - s_last_progress_ms >= 30 &&
+            now - s_last_fifo_rearm_ms >= 40 &&
+            usbd_edpt_busy(0, s_uac_ep_in | 0x80)) {
+        const uint32_t bit = 1u << s_uac_ep_in;
+        const auto& ep = USB0.in_ep_reg[s_uac_ep_in];
+        if (!(USB0.dtknqr4_fifoemptymsk & bit) &&
+                (ep.diepctl & USB_D_EPENA1_M) &&
+                (ep.diepint & USB_D_TXFEMP0_M) &&
+                (ep.dieptsiz & USB_D_XFERSIZE1_M) == UAC_TX_BLOCK_BYTES &&
+                ep.dtxfsts >= UAC_TX_BLOCK_BYTES / 4) {
+            s_last_fifo_rearm_ms = now;
+            s_fifo_rearm_waiting = true;
+            ++s_fifo_rearms;
+            USB0.dtknqr4_fifoemptymsk |= bit;
+        }
+    }
+#endif
+    // 500ms is far beyond the 2ms packet cadence. This driver cannot close an
+    // individual endpoint; request a full stack-managed disconnect/reconnect
+    // from the loop task rather than corrupting endpoint/FIFO bookkeeping.
+    if (now - s_last_progress_ms >= 500) {
+        s_recovery_requested = true;
+        usb_composite_request_recovery(USB_RECOVERY_AUDIO);
+        app_log("UAC", "No USB audio completions for 500ms: ep=0x%02X busy=%d skips=%u; requesting USB reconnect",
+                s_uac_ep_in | 0x80, usbd_edpt_busy(0, s_uac_ep_in | 0x80),
+                (unsigned)s_claim_skip_count);
+        __atomic_store_n(&s_service_queued, false, __ATOMIC_RELEASE);
+        return;
+    }
+    const uint8_t ep = s_uac_ep_in | 0x80;
+    if (usbd_edpt_claim(0, ep)) {
+        const uint8_t block = s_tx_cur & 1;
+        audio_pipeline_read_for_usb(&g_audio_pipeline, s_tx_buf[block], UAC_TX_BLOCK_SAMPLES);
+        if (usbd_edpt_xfer(0, ep, (uint8_t*)s_tx_buf[block], UAC_TX_BLOCK_BYTES)) {
+            if (g_audio_pipeline.active) {
+                for (unsigned i = 0; i < UAC_TX_BLOCK_SAMPLES; ++i) {
+                    const int32_t v = s_tx_buf[block][i];
+                    const uint32_t amplitude = v < 0 ? (uint32_t)-v : (uint32_t)v;
+                    s_pcm_samples++;
+                    s_pcm_nonzero += amplitude != 0;
+                    s_pcm_absolute_sum += amplitude;
+                    if (amplitude > s_pcm_peak) s_pcm_peak = amplitude;
+                }
+            }
+            s_tx_cur++;
+        } else {
+            s_xfer_fail_count++;
+            usbd_edpt_release(0, ep);
+        }
+    } else {
+        s_claim_skip_count++;
+    }
+    __atomic_store_n(&s_service_queued, false, __ATOMIC_RELEASE);
+}
+
+static void uac_push_task(void*) {
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t interval = pdMS_TO_TICKS(2);
-    uint32_t last_wifi_mark_ms = 0;
     while (1) {
         vTaskDelayUntil(&last_wake, interval);
-
-        if (!s_uac_streaming || !tud_mounted() || tud_suspended()) {
-            continue;
-        }
-
-        // While the mic stream is live, count it as host activity so the
-        // ON_DEMAND WiFi radio does not sleep under active voice use.
-        uint32_t now = millis();
-        if ((now - last_wifi_mark_ms) >= 500) {
-            last_wifi_mark_ms = now;
-            wifi_manager_mark_activity();
-        }
-
-        if (s_uac_ep_in == 0) {
-            continue;
-        }
-
-        uint8_t ep_addr = (uint8_t)(s_uac_ep_in | 0x80);
-        uint8_t block = (uint8_t)(s_tx_cur & 1);
-        uint8_t* p = (uint8_t*)s_tx_buf[block];
-
-        if (!usbd_edpt_claim(0, ep_addr)) {
-            continue; // previous block still in flight -> skip this slot
-        }
-
-        audio_pipeline_read_for_usb(&g_audio_pipeline, s_tx_buf[block], UAC_TX_BLOCK_SAMPLES);
-
-        if (!usbd_edpt_xfer(0, ep_addr, p, UAC_TX_BLOCK_BYTES)) {
-            s_xfer_fail_count++;
-            usbd_edpt_release(0, ep_addr);
-            if (s_xfer_fail_count % 10 == 0) {
-                app_log("UAC", "TX submit FAILED x%u — EP not open?", (unsigned)s_xfer_fail_count);
-            }
-            continue;
-        }
-        s_tx_cur++;
+        if (!tud_inited()) continue;
+        queue_uac_service();
     }
 }
 
@@ -152,7 +184,7 @@ static uint16_t uac_load_descriptor(uint8_t *dst, uint8_t *itf) {
         0x07, 0x24, 0x01, 0x03, 0x01, 0x01, 0x00,
         // 10. Format Type I (16kHz, 16-bit, Mono) — 11 bytes
         0x0B, 0x24, 0x02, 0x01, 0x01, 0x02, 0x10, 0x01, 0x80, 0x3E, 0x00,
-        // 11. Isochronous Endpoint — 9 bytes (wMaxPacketSize=64, bInterval=2)
+        // 11. Isochronous Endpoint — 9 bytes (64 bytes each 2 ms frame).
         0x09, 0x05, (uint8_t)(s_uac_ep_in | 0x80), 0x05, 0x40, 0x00, 0x02, 0x00, 0x00,
         // 12. CS Endpoint General — 7 bytes
         0x07, 0x25, 0x01, 0x00, 0x00, 0x00, 0x00
@@ -171,8 +203,11 @@ static void uac_driver_reset(uint8_t rhport) {
     (void)rhport;
     s_uac_streaming = false;
     s_uac_alt = 0;
-    s_xfer_cb_count = 0;
-    s_xfer_fail_count = 0;
+    s_last_progress_ms = millis();
+    s_recovery_requested = false;
+#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+    s_uac_ep_open = false;
+#endif
     app_log("UAC", "USB Bus Reset detected -> UAC state reset");
 }
 
@@ -184,7 +219,13 @@ static uint16_t uac_driver_open(uint8_t rhport, tusb_desc_interface_t const *des
         if (p[1] == TUSB_DESC_INTERFACE) {
             if (((tusb_desc_interface_t const*)p)->bInterfaceClass != TUSB_CLASS_AUDIO) break;
         } else if (p[1] == TUSB_DESC_ENDPOINT) {
+#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+            // Alternate setting 0 has no audio endpoint. Save its descriptor
+            // and activate only when the host selects alternate setting 1.
+            memcpy(&s_uac_ep_desc, p, sizeof(s_uac_ep_desc));
+#else
             usbd_edpt_open(rhport, (tusb_desc_endpoint_t const *)p);
+#endif
         }
         len += p[0]; p += p[0];
     }
@@ -203,6 +244,40 @@ static bool uac_driver_control_xfer_cb(uint8_t rhport, uint8_t stage,
                 return false; // Crucial: Let other class drivers (HID, CDC) handle their own interfaces!
             }
             uint8_t alt = (uint8_t)req->wValue;
+            if (itf == s_uac_itf_ac) {
+                return alt == 0 && tud_control_status(rhport, req);
+            }
+            if (req->wValue > 1) return false;
+#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+            if (alt == 0 && s_uac_ep_open) {
+                s_uac_streaming = false;
+                usbd_edpt_close(rhport, s_uac_ep_in | 0x80);
+                s_uac_ep_open = false;
+                s_fifo_rearm_waiting = false;
+                if (remotemapper_dwc2_close_failed()) {
+                    s_recovery_requested = true;
+                    usb_composite_request_recovery(USB_RECOVERY_AUDIO);
+                    app_log("UAC", "ISO endpoint did not disable in 2ms; requesting USB recovery");
+                }
+            } else if (alt == 1 && !s_uac_ep_open) {
+                if (s_recovery_requested) return false;
+                app_log("UAC", "Opening ISO EP 0x%02X size=%u interval=%u",
+                        s_uac_ep_desc.bEndpointAddress,
+                        (unsigned)tu_edpt_packet_size(&s_uac_ep_desc),
+                        (unsigned)s_uac_ep_desc.bInterval);
+                if (!usbd_edpt_open(rhport, &s_uac_ep_desc)) {
+                    app_log("UAC", "ISO EP open failed at alt=1");
+                    return false;
+                }
+                s_uac_ep_open = true;
+            }
+#endif
+            if (alt == 1 && s_uac_alt == 0) {
+                s_stream_start_ms = millis();
+                s_last_progress_ms = s_stream_start_ms;
+                s_seen_completions = s_xfer_cb_count;
+                s_fifo_rearm_waiting = false;
+            }
             if (alt != s_uac_alt) {
                 app_log("UAC", alt ? "Stream ARMED by host (alt=1, 16kHz mono)" : "Stream STOPPED by host (alt=0)");
             }
@@ -218,7 +293,9 @@ static bool uac_driver_control_xfer_cb(uint8_t rhport, uint8_t stage,
             if (itf != s_uac_itf_as && itf != s_uac_itf_ac) {
                 return false; // Crucial: Let other class drivers handle their own interfaces!
             }
-            return tud_control_xfer(rhport, req, &s_uac_alt, 1);
+            static uint8_t ac_alt = 0;
+            return tud_control_xfer(rhport, req,
+                    itf == s_uac_itf_ac ? &ac_alt : &s_uac_alt, 1);
         }
         return false;
     }
@@ -252,26 +329,22 @@ static bool uac_driver_xfer_cb(uint8_t rhport, uint8_t ep_addr,
                                  xfer_result_t result, uint32_t xferred_bytes) {
     (void)rhport;
     if (ep_addr == (uint8_t)(s_uac_ep_in | 0x80)) {
-        s_xfer_cb_count++;
-        // No periodic "TX alive" spam: the steady 2s beat of completions is the
-        // normal healthy case. Only surface real problems here. Log when the
-        // TX path is starving (pushing silence because the ring is empty) at
-        // most once every 5s, so /api/logs stays readable during voice sessions.
-        static uint32_t s_last_starvation_log_ms = 0;
-        uint32_t now = millis();
-        // peek, not available_read: this runs in the TinyUSB task, which is not
-        // the ring's consumer. available_read() applies a producer-posted clear
-        // (tail = head), so calling it here would let a third context race the
-        // 500Hz push task and break the single-consumer invariant the clear
-        // design depends on. This is a diagnostic only, so peek is sufficient.
-        size_t avail = audio_ring_buffer_peek_available(&g_audio_pipeline.ring_buf);
-        if (avail == 0 && (now - s_last_starvation_log_ms >= 5000)) {
-            s_last_starvation_log_ms = now;
-            app_log("UAC", "TX starved: ring empty (underruns=%u)", (unsigned)g_audio_pipeline.underrun_count);
+        if (result == XFER_RESULT_SUCCESS && xferred_bytes == UAC_TX_BLOCK_BYTES) {
+            s_xfer_cb_count++;
+            s_last_complete_ms = millis();
+            if (s_fifo_rearm_waiting) {
+                s_fifo_rearm_waiting = false;
+                ++s_fifo_rearm_completions;
+            }
+            // Schedule the next packet from the USB completion, keeping its
+            // cadence locked to host polls. The 2 ms task remains a fallback
+            // when an endpoint is busy or a completion is missed.
+#if !defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+            if (s_uac_streaming) queue_uac_service();
+#endif
+        } else {
+            s_xfer_fail_count++;
         }
-        // NOTE: do NOT re-queue here. The 500Hz push task paces the next
-        // submission; re-queueing inside this callback races the 2ms token and
-        // previously caused a permanent ISO IN stall.
         return true;
     }
     return true;
@@ -311,23 +384,23 @@ bool uac_microphone_init(void) {
     if (xTaskCreatePinnedToCore(uac_push_task, "uac_push", 4096, NULL, 6, NULL, 1) != pdPASS) {
         app_log("UAC", "Failed to spawn TX pump task");
     }
-    // Spawn recovery watchdog
-    if (xTaskCreatePinnedToCore(uac_watchdog_task, "uac_wdg", 4096, NULL, 5, NULL, 1) != pdPASS) {
-        app_log("UAC", "Failed to spawn watchdog task");
-    }
-
     esp_err_t err = tinyusb_enable_interface(USB_INTERFACE_CUSTOM, UAC_DESC_TOTAL_LEN, uac_load_descriptor);
     if (err != ESP_OK) {
         app_log("UAC", "Failed to enable UAC interface: %d", err);
         return false;
     }
     s_uac_initialized = true;
-    app_log("UAC", "UAC 1.0 Microphone ready (EP %d IN, 500Hz push task + watchdog)", s_uac_ep_in);
+    app_log("UAC", "UAC 1.0 Microphone ready (EP %d IN, 500Hz serialized TX + recovery)", s_uac_ep_in);
     return true;
 }
 
 void uac_microphone_task(void) {
-    // Nothing — push is driven by the dedicated 500Hz uac_push task.
+    static uint32_t last_activity_ms = 0;
+    const uint32_t now = millis();
+    if (s_uac_streaming && now - last_activity_ms >= 500) {
+        wifi_manager_mark_activity();
+        last_activity_ms = now;
+    }
 }
 
 void uac_microphone_get_control(uint8_t* mute, int16_t* volume) {
@@ -339,8 +412,35 @@ uint8_t uac_microphone_get_alt(void) {
     return s_uac_alt;
 }
 
+uint32_t uac_microphone_get_stream_start_ms(void) {
+    return s_stream_start_ms;
+}
+
 bool uac_microphone_is_streaming(void) {
     return s_uac_streaming;
 }
 
 } // extern "C"
+void uac_microphone_get_stats(uac_tx_stats_t* stats) {
+    if (!stats) return;
+    stats->completed = s_xfer_cb_count;
+    stats->failed = s_xfer_fail_count;
+    stats->claim_skips = s_claim_skip_count;
+    stats->recoveries = usb_composite_recovery_count();
+    stats->last_complete_ms = s_last_complete_ms;
+    stats->endpoint = s_uac_ep_in | 0x80;
+    stats->recovery_pending = s_recovery_requested;
+}
+
+void uac_microphone_get_fifo_rearm_stats(uint32_t* attempts, uint32_t* completions) {
+    if (attempts) *attempts = s_fifo_rearms;
+    if (completions) *completions = s_fifo_rearm_completions;
+}
+
+void uac_microphone_get_pcm_stats(uint32_t* samples, uint32_t* nonzero,
+                                  uint64_t* absolute_sum, uint16_t* peak) {
+    if (samples) *samples = s_pcm_samples;
+    if (nonzero) *nonzero = s_pcm_nonzero;
+    if (absolute_sum) *absolute_sum = s_pcm_absolute_sum;
+    if (peak) *peak = s_pcm_peak;
+}
