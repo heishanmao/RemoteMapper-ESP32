@@ -23,6 +23,12 @@ typedef enum {
  */
 void ble_remote_init(void);
 
+// Last complete ATVV frame received (independent of volume/USB backpressure).
+uint32_t ble_remote_last_audio_frame_ms(void);
+// Defer mic close to the BLE task; a new active session supersedes this request.
+void ble_remote_request_mic_stop(void);
+
+
 /**
  * @brief Main BLE task tick (handles state machine, watchdogs, and keep-alive packets)
  */
@@ -103,19 +109,6 @@ String ble_remote_get_device_info_sw(void);
  * tier-0 and rescan fast instead of slowly tiers'ing up.
  */
 void ble_remote_notify_wifi_wake(void);
-
-/**
- * @brief Whether MiOT (0xFE95) advertisement sniff mode is currently active
- */
-bool ble_remote_sniff_enabled(void);
-
-/**
- * @brief Enable/disable MiOT advertisement sniffer.
- * While ON the device never auto-connects to the remote (connected remotes
- * stop broadcasting) and dumps broadcast payloads to the ring log so MiOT
- * gesture events (single/double/long) can be analyzed.
- */
-void ble_remote_sniff_set(bool on);
 
 /**
  * @brief Whether GATT full-dump exploration mode is currently active

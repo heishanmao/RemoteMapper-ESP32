@@ -18,6 +18,27 @@ static NimBLERemoteCharacteristic*     s_char_ctl = nullptr;
 static NimBLERemoteCharacteristic*     s_char_bat = nullptr;
 static int                             s_battery_pct = -1;
 static uint32_t                        s_last_battery_poll_ms = 0;
+
+// Link-liveness probe (zombie-connection watchdog).
+//
+// Observed live: HID notifications silently stopped arriving for 2000+ seconds
+// while the stack still reported CONNECTED - the user's key presses did
+// nothing, and the last press before the silence left its modifier stranded on
+// the host until the 20 s guard fired. Notifications alone cannot detect this
+// state, because a healthy idle connection also has zero traffic. So after a
+// key press, if nothing at all (release, audio frame, battery notify) arrives
+// within a short window, send ONE cheap battery read as a liveness probe. On a
+// healthy link it succeeds in milliseconds - and harmlessly fires once during
+// a legitimate long hold, which also has silent press/release gaps. On a
+// zombie link it fails; two consecutive failures force a reconnect, whose
+// disconnect path also releases the stranded keys.
+#define BLE_LINK_PROBE_SILENCE_MS 3000
+#define BLE_LINK_PROBE_MAX_FAILS  2
+static uint32_t s_link_probe_deadline_ms = 0;   // 0 = not armed
+static uint32_t s_link_probe_press_ms    = 0;
+static uint32_t s_last_link_rx_ms        = 0;
+static uint8_t  s_link_probe_fails       = 0;
+static uint32_t s_link_recovered_count   = 0;
 static volatile bool                   s_is_encrypted = false;
 
 static Preferences                     s_ble_prefs;
@@ -69,7 +90,8 @@ static uint8_t                         s_pending_addr_type = BLE_ADDR_RANDOM;
 
 static uint8_t                         s_session_id = 0;
 static uint32_t                        s_last_audio_ms = 0;
-static uint32_t                        s_last_extend_ms = 0;
+static uint32_t                        s_last_audio_frame_ms = 0;
+static bool                            s_req_mic_stop = false;
 static uint32_t                        s_last_scan_ms = 0;
 static uint32_t                        s_last_keepalive_ms = 0;
 static size_t                          s_frame_size = AUDIO_DEFAULT_FRAME_BYTES;
@@ -77,8 +99,6 @@ static void request_audio_conn_params(void);
 static uint16_t                        s_caps_version = 0;
 static uint8_t                         s_caps_codec_mask = 0;
 static bool                            s_mic_open = false;
-static bool                            s_got_audio_since_open = false;
-static uint32_t                        s_extend_count = 0;
 
 // The remote encodes 16 kHz when the 0x02 codec bit is offered, 8 kHz otherwise
 // (see HD838A/remote-mic-app ATVVCapabilities.parse). We can only play 16 kHz
@@ -106,12 +126,6 @@ static uint32_t                        s_scan_burst_until_ms = 0;
 // Set by wifi_manager (Core 1) when the radio wakes; consumed by the BLE task
 // (Core 0) to drop the disconnected-scan backoff back to tier-0 fast scanning.
 static volatile bool                   s_req_wifi_wake_rescan = false;
-
-// MiOT (0xFE95) advertisement sniffer: while ON we never auto-connect to the
-// remote (a connected remote stops broadcasting) so its burst packets can be
-// captured for gesture analysis (single/double/long).
-static volatile bool                   s_sniff_adv = false;
-static uint32_t                        s_last_sniff_log_ms = 0;
 
 // GATT explorer: while ON, each fresh connection runs one full enumeration of
 // every service/characteristic/descriptor (properties + readable values). Its
@@ -165,6 +179,7 @@ static void log_settled_conn_params();
 
 // Battery Notification Callback (0x180F / 0x2A19)
 static void on_battery_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
+    s_last_link_rx_ms = millis();
     if (pData && length >= 1) {
         s_battery_pct = (int)pData[0];
         app_log("BATTERY", "Remote battery level updated: %d%%", s_battery_pct);
@@ -256,6 +271,7 @@ static void audio_frame_acc_reset(void) {
 // Runs in the NimBLE host task. Deliberately allocation-free and shallow: an
 // overflow of this task's stack previously killed every key on the remote.
 static void on_audio_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
+    s_last_link_rx_ms = millis();
     if (length == 0) return;
     const uint32_t now = millis();
     s_last_audio_ms = now;
@@ -304,12 +320,9 @@ static void on_audio_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, s
         decoded_frames++;
     }
     s_facc.frames_out += decoded_frames;
-
-    // The remote is notifying, so the session is alive. Gate MIC_EXTEND on this
-    // rather than on samples actually reaching the UAC ring: with the PC asleep
-    // the pipeline is inactive, nothing is emitted, and the session would never
-    // be renewed -- the remote then stops notifying and recovery is impossible.
-    if (decoded_frames) s_got_audio_since_open = true;
+    if (decoded_frames) {
+        __atomic_store_n(&s_last_audio_frame_ms, now, __ATOMIC_RELEASE);
+    }
 
     // A partial frame left over means the link is not delivering whole frames
     // back to back. Count it once per notification rather than per frame.
@@ -334,57 +347,12 @@ static void on_audio_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, s
 // Called from the Arduino loop task. All formatting and logging happens here so
 // the NimBLE host task stays allocation-free and shallow.
 
-// The remote treats an open mic as a session that has to be renewed. Without
-// MIC_EXTEND it stops notifying partway through a long hold, which silently
-// truncates speech. 8 s is well inside the window the reference implementation
-// uses for the same remotes (HD838A/remote-mic-app, rc003VoiceExtensionInterval).
-#define ATVV_EXTEND_INTERVAL_MS 8000
-// Hard ceiling on one hold, mirroring the reference project's safe timeout so a
-// wedged session cannot hold the radio open forever.
-#define ATVV_MAX_HOLD_MS        120000
-#define ATVV_MAX_EXTENDS        (ATVV_MAX_HOLD_MS / ATVV_EXTEND_INTERVAL_MS)
-
-static void atvv_service_tick(void) {
-    // s_mic_open is set when we send MIC_OPEN; the remote can also start a
-    // session by itself, in which case only the TALKING state tells us.
-    if (!s_mic_open && s_ble_state != BLE_STATE_TALKING) return;
-    if (s_char_cmd == nullptr) return;
-    if (s_caps_version < 0x0100) return;   // opcode 0x0E does not exist pre-1.0
-
-    const uint32_t now = millis();
-    if (now - s_last_extend_ms < ATVV_EXTEND_INTERVAL_MS) return;
-
-    s_last_extend_ms = now;
-    s_extend_count++;
-    if (s_extend_count > ATVV_MAX_EXTENDS) {
-        // Reopen the session: the remote has almost certainly dropped it, and a
-        // fresh MIC_OPEN re-syncs the ADPCM decoder cleanly.
-        app_log("ATVV", "MIC_EXTEND count=%u exceeds max=%u, reopening session",
-                (unsigned)s_extend_count, (unsigned)ATVV_MAX_EXTENDS);
-        uint8_t cmd_open[] = { 0x0C, 0x00 };
-        s_char_cmd->writeValue(cmd_open, sizeof(cmd_open), false);
-        s_extend_count = 0;
-        s_got_audio_since_open = false;
-        s_last_extend_ms = now;
-        audio_frame_acc_reset();
-        return;
-    }
-
-    // Deliberately NOT gated on s_got_audio_since_open, unlike the reference
-    // implementation. That gate deadlocks here: with the PC asleep the audio
-    // pipeline is inactive so nothing is ever emitted, the gate never opens, no
-    // MIC_EXTEND is ever sent, and the remote eventually stops notifying -- an
-    // unrecoverable state. Renewing an open session is harmless when it is alive
-    // and essential when the host is not consuming.
-    uint8_t cmd_extend[] = { 0x0E, s_session_id };
-    s_char_cmd->writeValue(cmd_extend, sizeof(cmd_extend), false);
-    app_log("ATVV", "MIC_EXTEND sent session=%u n=%u audio_seen=%d",
-            (unsigned)s_session_id, (unsigned)s_extend_count,
-            (int)s_got_audio_since_open);
-}
+// This remote uses HTT (AUDIO_START reason 0x03). Its physical button owns
+// the session lifetime. Do not send AUDIO_EXTEND or reopen it from a timer:
+// either can disrupt a legitimate continuous hold. The voice guard remains
+// the configurable maximum-duration safety net.
 
 void ble_audio_rx_diagnostics_tick(void) {
-    atvv_service_tick();
     log_settled_conn_params();   // one-shot, fires even while no audio is flowing
     if (!s_rx_dirty) return;
     const uint32_t now = millis();
@@ -439,6 +407,7 @@ void ble_audio_rx_diagnostics_tick(void) {
 // Control Notification Callback (ATVV Char 0x04)
 static void on_ctl_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
     if (length < 1) return;
+    s_last_link_rx_ms = millis();
     uint8_t op = pData[0];
 
     // AUDIO_START with HTT reason: byte1 == 0x03
@@ -446,14 +415,15 @@ static void on_ctl_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, siz
         s_session_id = (length >= 4) ? pData[3] : 0;
         s_ble_state = BLE_STATE_TALKING;
         s_last_audio_ms = millis();
-        s_last_extend_ms = millis();
 
         key_engine_feed_key(&g_key_engine, MI_KEY_VOICE, true, millis());
         app_log("ATVV", ">>> Voice button PRESSED (session %d)", s_session_id);
     }
     // AUDIO_STOP / MIC_CLOSED / release op (0x00 or 0x08):
     else if (op == 0x00 || op == 0x08) {
-        if (s_ble_state == BLE_STATE_TALKING) {
+        const bool was_open = s_mic_open;
+        s_mic_open = false;
+        if (s_ble_state == BLE_STATE_TALKING || was_open) {
             s_ble_state = BLE_STATE_CONNECTED;
             key_engine_feed_key(&g_key_engine, MI_KEY_VOICE, false, millis());
             app_log("ATVV", "<<< Voice button RELEASED (op=0x%02X)", op);
@@ -506,6 +476,7 @@ static uint8_t s_last_hogp_key = 0;
 // HOGP HID Report Notification Callback
 static void on_hogp_report_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
     if (length < 1) return;
+    s_last_link_rx_ms = millis();
 
     // 1. Non-keyboard / vendor packets (len > 8, e.g. fallback HOGP voice or sensor reports)
     // NEVER feed these into audio_pipeline! Legitimate voice strictly arrives via on_audio_notify (ATVV Char ab5e0003).
@@ -607,9 +578,7 @@ static void on_hogp_report_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pD
                         uint8_t cmd_open[] = { 0x0C, 0x00 };
                         s_char_cmd->writeValue(cmd_open, sizeof(cmd_open), false);
                         s_mic_open = true;
-                        s_got_audio_since_open = false;
                         s_session_id = 0;
-                        s_last_extend_ms = millis();
                         audio_frame_acc_reset();
                         app_log("ATVV", "MIC_OPEN {0x0C,0x00} ver=0x%04X codec=0x%02X/16kHz",
                                 s_caps_version, (unsigned)codec);
@@ -617,9 +586,7 @@ static void on_hogp_report_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pD
                         uint8_t cmd_open[] = { 0x0C, 0x00, codec };
                         s_char_cmd->writeValue(cmd_open, sizeof(cmd_open), false);
                         s_mic_open = true;
-                        s_got_audio_since_open = false;
                         s_session_id = 0;
-                        s_last_extend_ms = millis();
                         audio_frame_acc_reset();
                         app_log("ATVV", "MIC_OPEN {0x0C,0x00,0x%02X} legacy ver=0x%04X codec=0x%02X/16kHz",
                                 (unsigned)codec, s_caps_version, (unsigned)codec);
@@ -640,6 +607,15 @@ static void on_hogp_report_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pD
             }
         }
         key_engine_feed_key(&g_key_engine, raw_key, is_pressed, millis());
+        if (is_pressed) {
+            // Arm the link-liveness probe: if nothing at all arrives within the
+            // window (release lost, or the notification stream died), the tick
+            // sends one battery read as a probe. Legitimate holds also go
+            // silent, but the probe succeeds there, so no false reconnect.
+            s_link_probe_deadline_ms = millis() + BLE_LINK_PROBE_SILENCE_MS;
+            s_link_probe_press_ms    = millis();
+            s_link_probe_fails       = 0;
+        }
     }
 }
 
@@ -692,47 +668,6 @@ static bool is_target_remote(NimBLEAdvertisedDevice* dev) {
     return false;
 }
 
-// MiOT sniffer: dump one advertisement frame (service UUIDs + service data,
-// with the 0xFE95 Xiaomi payload hex) to the ring log. Rate-limited so a
-// burst of contactable duplicates does not flood the log.
-static void sniff_dump_packet(NimBLEAdvertisedDevice* dev) {
-    uint32_t now = millis();
-    if (now - s_last_sniff_log_ms < 150) return;
-    s_last_sniff_log_ms = now;
-
-    String name = dev->getName().c_str();
-    String addr = dev->getAddress().toString().c_str();
-    String tag = is_target_remote(dev) ? "[TARGET]" : "";
-    String line = "SNIFF " + tag + " " + addr + "(" + String(dev->getAddress().getType()) + ", RSSI " + String(dev->getRSSI()) + ")";
-    if (name.length() > 0) line += " name=" + sanitize_ble_name(name);
-
-    if (dev->haveServiceUUID()) {
-        line += " svc=[";
-        int n = dev->getServiceUUIDCount();
-        for (int i = 0; i < n; ++i) {
-            if (i) line += " ";
-            line += dev->getServiceUUID(i).toString().c_str();
-        }
-        line += "]";
-    }
-
-    int sdCount = dev->getServiceDataCount();
-    for (int i = 0; i < sdCount; ++i) {
-        NimBLEUUID u = dev->getServiceDataUUID(i);
-        std::string sd = dev->getServiceData(i);
-        line += " sd(" + String(u.toString().c_str()) + ")=";
-        char hex[8];
-        for (size_t k = 0; k < sd.size(); ++k) {
-            snprintf(hex, sizeof(hex), "%02X", (uint8_t)sd[k]);
-            line += hex;
-        }
-        if (u == NimBLEUUID((uint16_t)0xFE95)) {
-            line += " <-- MiBeacon";
-        }
-    }
-    app_log("ADV", "%s", line.c_str());
-}
-
 // Advertised Device Scan Callbacks
 class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) override {
@@ -779,20 +714,13 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
         }
         portEXIT_CRITICAL(&s_disc_mux);
 
-        // MiOT sniffer: dump payloads and never steal the connection, otherwise
-        // the remote stops broadcasting once we hold a GATT link.
-        if (s_sniff_adv) {
-            sniff_dump_packet(advertisedDevice);
-            return;
-        }
-
         if (name.length() > 0) {
             app_log("BLE_SCAN", "Device: %s (%s, RSSI: %d, Type: %d)", 
                     name.c_str(), addr.c_str(), advertisedDevice->getRSSI(), 
                     (int)advertisedDevice->getAddress().getType());
         }
 
-        if (s_ble_state <= BLE_STATE_SCANNING && is_target_remote(advertisedDevice) && !s_do_connect && !s_sniff_adv) {
+        if (s_ble_state <= BLE_STATE_SCANNING && is_target_remote(advertisedDevice) && !s_do_connect) {
             app_log("BLE", "Matching Target Remote: %s (%s), queueing connection...", name.c_str(), addr.c_str());
             NimBLEDevice::getScan()->stop();
             if (s_pending_adv_device) delete s_pending_adv_device;
@@ -835,8 +763,6 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         s_dev_sw = "";
           s_last_hogp_key = 0;
           s_mic_open = false;
-          s_got_audio_since_open = false;
-          s_extend_count = 0;
           s_session_id = 0;
           s_caps_version = 0;
           s_caps_codec_mask = 0;
@@ -1643,19 +1569,6 @@ void ble_remote_notify_wifi_wake(void) {
     s_req_wifi_wake_rescan = true;
 }
 
-bool ble_remote_sniff_enabled(void) {
-    return s_sniff_adv;
-}
-
-void ble_remote_sniff_set(bool on) {
-    s_sniff_adv = on;
-    if (!on) {
-        // Normal behaviour resumes next task tick: reconnect flow re-enables
-        // once the remote is seen again.
-        s_disconnected_since_ms = 0;
-    }
-}
-
 bool ble_remote_gatt_dump_enabled(void) {
     return s_gatt_dump_enabled;
 }
@@ -1670,24 +1583,16 @@ void ble_remote_gatt_dump_request(bool on) {
 void ble_remote_task(void) {
     uint32_t now = millis();
 
-    // 0. MiOT sniffer: never connect, keep fast scanning so we capture the
-    // remote's burst advertisements; if a link somehow exists, drop it.
-    if (s_sniff_adv) {
-        s_do_connect = false;
-        s_pending_mac = "";
-        if (s_pending_adv_device) {
-            delete s_pending_adv_device;
-            s_pending_adv_device = nullptr;
+    if (__atomic_exchange_n(&s_req_mic_stop, false, __ATOMIC_ACQ_REL) &&
+            !g_audio_pipeline.active) {
+        if (s_client && s_client->isConnected() && s_char_cmd &&
+                (s_mic_open || s_ble_state == BLE_STATE_TALKING)) {
+            uint8_t close[] = {0x0D, s_session_id};
+            s_char_cmd->writeValue(close, sizeof(close), false);
+            app_log("ATVV", "MIC_CLOSE after forced voice stop");
         }
-        if (s_ble_state >= BLE_STATE_CONNECTING) {
-            if (s_client && s_client->isConnected()) s_client->disconnect();
-            s_ble_state = BLE_STATE_DISCONNECTED;
-            s_is_encrypted = false;
-        }
-        s_disconnected_since_ms = 0; // keep tier-0 fast scanning
-        if (!NimBLEDevice::getScan()->isScanning()) {
-            start_scan(BLE_SCAN_INTERVAL_MS);
-        }
+        s_mic_open = false;
+        if (s_ble_state == BLE_STATE_TALKING) s_ble_state = BLE_STATE_CONNECTED;
     }
 
     // 1. Process asynchronous unpair / reconnect requests from Core 1
@@ -1859,6 +1764,48 @@ void ble_remote_task(void) {
         }
     }
 
+    // 5b. Link-liveness probe (zombie-connection watchdog). Armed by a key
+    // press; fires only after total radio silence following that press. One
+    // battery read decides: success = link alive (also covers legitimate
+    // holds, which are silent by design), failure x2 = zombie connection ->
+    // force a reconnect, whose disconnect path also releases stranded keys.
+    if (s_link_probe_deadline_ms != 0) {
+        if (s_ble_state < BLE_STATE_CONNECTED || !s_client || !s_client->isConnected()) {
+            s_link_probe_deadline_ms = 0;   // link already gone: nothing to probe
+        } else if (now < s_link_probe_deadline_ms) {
+            // still inside the silence window
+        } else if (s_last_link_rx_ms > s_link_probe_press_ms) {
+            s_link_probe_deadline_ms = 0;   // traffic arrived after the press: alive
+        } else if (s_char_bat == nullptr || !s_char_bat->canRead()) {
+            s_link_probe_deadline_ms = 0;   // no probe available: never false-reconnect
+        } else {
+            bool alive = false;
+            try {
+                NimBLEAttValue val = s_char_bat->readValue();
+                alive = (val.length() >= 1);
+            } catch (...) {
+                alive = false;
+            }
+            if (alive) {
+                s_link_probe_deadline_ms = 0;
+                s_link_probe_fails = 0;
+            } else {
+                s_link_probe_fails++;
+                if (s_link_probe_fails >= BLE_LINK_PROBE_MAX_FAILS) {
+                    app_log("BLE", "!! link probe failed x%u after silence - zombie connection, forcing reconnect (recovered=%u)",
+                            (unsigned)s_link_probe_fails,
+                            (unsigned)(s_link_recovered_count + 1));
+                    s_link_recovered_count++;
+                    s_link_probe_deadline_ms = 0;
+                    s_link_probe_fails = 0;
+                    s_req_reconnect = true;   // processed at the top of this task
+                } else {
+                    s_link_probe_deadline_ms = now + BLE_LINK_PROBE_SILENCE_MS;
+                }
+            }
+        }
+    }
+
     // 6. GATT explorer: run the one-shot enumeration once the remote is
     // connected and the ATVV handshake is complete. Not while talking (disturbs
     // the voice pipe). Re-dumps on every fresh connection while enabled.
@@ -1875,18 +1822,19 @@ void ble_remote_task(void) {
         }
     }
 
-    // 7. ATVV session renewal lives in atvv_service_tick(), which runs from the
-    //    loop task via ble_audio_rx_diagnostics_tick(). It used to live here
-    //    instead, and was guaranteed never to fire: the `else` branch below
-    //    re-stamped s_last_extend_ms on every pass while audio was flowing,
-    //    which is precisely the condition under which the 10 s threshold could
-    //    never be reached. It also shared s_last_extend_ms with the loop-task
-    //    sender, so whichever ran first starved the other. One sender, one
-    //    timestamp, one cadence.
+
 }
 
 ble_remote_state_t ble_remote_get_state(void) {
     return s_ble_state;
+}
+
+uint32_t ble_remote_last_audio_frame_ms(void) {
+    return __atomic_load_n(&s_last_audio_frame_ms, __ATOMIC_ACQUIRE);
+}
+
+void ble_remote_request_mic_stop(void) {
+    __atomic_store_n(&s_req_mic_stop, true, __ATOMIC_RELEASE);
 }
 
 void ble_remote_trigger_reconnect(void) {
