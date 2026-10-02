@@ -312,10 +312,20 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             </div>
             <div class="stat-card">
                 <div class="stat-title">Wi-Fi 局域网 IP / 域名</div>
+                <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" id="stat-sta-ssid" title="">未连接</div>
                 <div class="stat-val" id="stat-sta-ip">--</div>
                 <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px; display: flex; justify-content: space-between; align-items: center;" id="stat-ap-status">
                     <span id="stat-ap-badge">热点: 192.168.4.1</span>
                     <a href="http://remotemapper.local" target="_blank" style="color: var(--accent-cyan); text-decoration: none; font-size: 11px;">域名访问 ↗</a>
+                </div>
+                <div style="font-size: 12px; color: var(--text-muted); margin-top: 6px; display: flex; align-items: center; gap: 6px;">
+                    <span style="white-space: nowrap;">空闲自动关</span>
+                    <select id="wifi-pwr-mode" onchange="applyWifiPowerMode(this.value)"
+                            style="flex:1; min-width:0; background:#0b0f17; border:1px solid var(--border-color); color:var(--text-main); border-radius:6px; padding:3px 6px; font-size:11px; outline:none; cursor:pointer;">
+                        <option value="off">永久连接</option>
+                        <option value="1">1 分钟后</option>
+                        <option value="2">2 分钟后</option>
+                    </select>
                 </div>
             </div>
             <div class="stat-card">
@@ -777,6 +787,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                         <button class="btn" style="width: 100%; margin-top:14px;" onclick="saveApConfig()">保存 AP 配置</button>
                     </div>
 
+
                     <div class="card">
                         <div class="card-header"><span>系统控制</span></div>
                         <p style="font-size: 14px; color: var(--text-muted); margin-bottom: 20px;">
@@ -809,7 +820,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                             </div>
                         </div>
                         <div style="font-size:11px; color:var(--text-muted); margin-top:10px; line-height:1.6; border-top:1px dashed #243247; padding-top:8px;">
-                            语音录音完全豁免普通规则(不会打断你说话);只有长时间只有修饰键、或按键长时间没有任何后续输入、或录音超长兜底时才强制释放,并按 LED 红闪指示。
+                            语音不受普通按键超时限制。正常松手即结束；连续 5 秒未收到蓝牙音频数据，或达到所设录音上限时自动结束并释放按键。安静和说话停顿不会触发数据超时；上限设为 0 仍保留失联保护。
                         </div>
                     </div>
 
@@ -839,18 +850,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                         <div style="font-size: 12px; color: var(--text-muted); margin-top: 10px; line-height: 1.6;">
                             ⚠️ 升级期间请勿断电、勿关闭本页面，保持与设备处于同一网络。写入完成后设备自动重启并恢复服务（约 20~40 秒）。升级失败不影响当前运行的固件。
                         </div>
-                    </div>
-
-                    <div class="card">
-                        <div class="card-header">
-                            <span>🔍 MiOT 广播嗅探 (测试)</span>
-                            <span id="sniff-state" style="font-size: 12px; padding: 2px 8px; border-radius: 6px; background: rgba(100,116,139,0.15); color: var(--text-muted); border: 1px solid rgba(100,116,139,0.3);">关闭</span>
-                        </div>
-                        <p style="font-size: 13px; color: var(--text-muted); line-height: 1.6;">
-                            开启后设备<strong>暂停自动连接</strong>遥控器，持续扫描抓取含 <code style="color:var(--accent-cyan);">0xFE95</code>(MiBeacon)的广播包并写入「运行日志」。<br>
-                            请先切到「运行日志」标签，再依次<strong>单击 / 双击 / 长按</strong>遥控器按键，观察是否出现 <code style="color:var(--accent-cyan);">SNIFF</code> / <code style="color:var(--accent-cyan);">&lt;-- MiBeacon</code> 行。测完记得关闭恢复连接。
-                        </p>
-                        <button class="btn" style="width: 100%;" id="sniff-btn" onclick="toggleAdvSniff()">开启 MiOT 广播嗅探</button>
                     </div>
 
                     <div class="card">
@@ -1429,6 +1428,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 const d = await res.json();
                 document.getElementById('top-status').innerHTML = `固件: ${d.version} | 运行: ${d.uptime_sec}s | IP: ${d.sta_ip}`;
                 document.getElementById('stat-sta-ip').innerText = d.sta_ip;
+                const ssidEl = document.getElementById('stat-sta-ssid');
+                if (ssidEl) {
+                    const ssid = d.sta_connected ? (d.sta_ssid || '') : '';
+                    ssidEl.innerText = ssid ? `${ssid} · ${d.sta_rssi} dBm` : '未连接';
+                    ssidEl.style.color = ssid ? 'var(--text-muted)' : '#f87171';
+                    ssidEl.title = ssid || '';
+                }
                 document.getElementById('stat-uptime').innerText = `${d.uptime_sec}s`;
                 document.getElementById('stat-audio-frames').innerText = `${d.frames_decoded} 帧`;
                 document.getElementById('stat-mem').innerText = `Heap: ${Math.round(d.free_heap/1024)}KB | PSRAM: ${Math.round(d.free_psram/1024/1024)}MB`;
@@ -3266,39 +3272,51 @@ if (mod & 0x01) chips.push('左Ctrl');
             } catch (e) {}
         }
 
-        async function loadAdvSniffState() {
+        // ---- Wi-Fi 空闲自动关闭 (/api/power) ----
+        // One control, three states. Maps onto the existing switch + minutes so
+        // every change applies immediately (no reboot, unlike the policy field).
+        const WIFI_PWR_MODES = ['off', '1', '2'];
+
+        function renderWifiPowerMode(d) {
+            const sel = document.getElementById('wifi-pwr-mode');
+            if (!sel) return;
+            if (document.activeElement === sel) return;
+            let v = 'off';
+            if (d.timeout_enabled === true && WIFI_PWR_MODES.indexOf(String(d.timeout_min)) >= 0) {
+                v = String(d.timeout_min);
+            }
+            sel.value = v;
+        }
+
+        async function loadWifiPowerMode() {
             try {
-                const r = await fetch('/api/debug/adv-sniff');
-                const d = await r.json();
-                renderAdvSniff(d.enabled === true);
+                renderWifiPowerMode(await (await fetch('/api/power')).json());
             } catch (e) {}
         }
 
-        function renderAdvSniff(on) {
-            const st = document.getElementById('sniff-state');
-            const btn = document.getElementById('sniff-btn');
-            if (st) {
-                st.innerText = on ? '嗅探中' : '关闭';
-                st.style.background = on ? 'rgba(249,115,22,0.15)' : 'rgba(100,116,139,0.15)';
-                st.style.color = on ? '#fb923c' : 'var(--text-muted)';
-                st.style.borderColor = on ? 'rgba(249,115,22,0.4)' : 'rgba(100,116,139,0.3)';
-            }
-            if (btn) {
-                btn.innerText = on ? '关闭 MiOT 广播嗅探' : '开启 MiOT 广播嗅探';
-            }
-        }
-
-        async function toggleAdvSniff() {
+        async function applyWifiPowerMode(v) {
+            const sel = document.getElementById('wifi-pwr-mode');
+            const body = (v === 'off')
+                ? { timeout_enabled: false }
+                : { timeout_enabled: true, timeout_min: parseInt(v, 10) };
             try {
-                const r = await fetch('/api/debug/adv-sniff', { method: 'POST' });
-                const d = await r.json();
-                renderAdvSniff(d.enabled === true);
-                if (d.enabled === true) {
-                    showToast('嗅探已开启：请在「运行日志」观察，并操作遥控器 单击/双击/长按');
-                } else {
-                    showToast('嗅探已关闭，恢复自动连接');
+                const res = await fetch('/api/power', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                if (!res.ok) {
+                    const d = await res.json().catch(() => ({}));
+                    showToast('设置失败: ' + (d.error || res.status), true);
+                    if (sel) loadWifiPowerMode();
+                    return;
                 }
-            } catch (e) { showToast('切换失败: ' + e.message, true); }
+                showToast(v === 'off' ? 'Wi-Fi 将保持连接，不再因空闲自动关闭'
+                                      : `Wi-Fi 空闲 ${v} 分钟后自动关闭`);
+            } catch (e) {
+                showToast('设置失败: ' + e.message, true);
+                if (sel) loadWifiPowerMode();
+            }
         }
 
         async function loadGattDumpState() {
@@ -3356,9 +3374,10 @@ if (mod & 0x01) chips.push('左Ctrl');
         // Periodic background pollers
         setInterval(fetchKeyTelemetry, 100);
         setInterval(fetchStatus, 3000);
+        setInterval(loadWifiPowerMode, 8000);
         setInterval(refreshLogs, 2000);
         loadGuardSettings();
-        loadAdvSniffState();
+        loadWifiPowerMode();
         loadGattDumpState();
         loadKeymap();
         fetchStatus();

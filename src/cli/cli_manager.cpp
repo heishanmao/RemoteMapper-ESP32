@@ -57,6 +57,7 @@ static void handle_wifi_command(const String& arg) {
             doc["policy"] = (int)wifi_manager_get_policy();
             doc["policy_str"] = wifi_manager_policy_str(wifi_manager_get_policy());
             doc["timeout_min"] = wifi_manager_get_timeout_min();
+            doc["timeout_enabled"] = wifi_manager_get_timeout_enabled();
             doc["radio_state"] = (int)wifi_manager_get_radio_state();
             doc["radio_state_str"] = wifi_manager_state_str(wifi_manager_get_radio_state());
             String out;
@@ -95,9 +96,30 @@ static void handle_wifi_command(const String& arg) {
         t.trim();
         if (t.length() == 0) {
             uint32_t tm = wifi_manager_get_timeout_min();
-            cli_write_line(tm == 0
-                ? "{\"timeout_min\":0,\"never\":true}"
-                : "{\"timeout_min\":" + String(tm) + ",\"never\":false}");
+            bool en = wifi_manager_get_timeout_enabled();
+            String out = "{\"timeout_min\":" + String(tm) + ",\"never\":" +
+                         String(tm == 0 ? "true" : "false") +
+                         ",\"enabled\":" + String(en ? "true" : "false") + "}";
+            cli_write_line(out);
+            if (!en) {
+                cli_write_line("Wi-Fi 空闲自动关闭当前为关闭状态（超时已保存但不生效；"
+                               "'wifi timeout on' 开启，'wifi timeout off' 关闭）");
+            }
+            return;
+        }
+        if (t.equalsIgnoreCase("on") || t.equalsIgnoreCase("enable") ||
+            t.equalsIgnoreCase("enabled") || t.equalsIgnoreCase("off") ||
+            t.equalsIgnoreCase("disable") || t.equalsIgnoreCase("disabled")) {
+            bool en = t.equalsIgnoreCase("on") || t.equalsIgnoreCase("enable") ||
+                      t.equalsIgnoreCase("enabled");
+            wifi_manager_set_timeout_enabled(en);
+            cli_write_line("{\"status\":\"ok\",\"enabled\":" +
+                           String(wifi_manager_get_timeout_enabled() ? "true" : "false") +
+                           ",\"timeout_min\":" + String(wifi_manager_get_timeout_min()) + "}");
+            cli_write_line(wifi_manager_get_timeout_enabled()
+                ? "Wi-Fi 空闲自动关闭已开启（" + String(wifi_manager_get_timeout_min()) +
+                  " 分钟无需操作）"
+                : "Wi-Fi 空闲自动关闭已关闭（不再因空闲自动断网）");
             return;
         }
         uint32_t minutes = 0;
@@ -110,7 +132,7 @@ static void handle_wifi_command(const String& arg) {
         } else if (digits_only) {
             minutes = t.toInt();
         } else {
-            cli_write_line("{\"error\":\"invalid_timeout\",\"hint\":\"1|5|10|30|never\"}");
+            cli_write_line("{\"error\":\"invalid_timeout\",\"hint\":\"on|off|1|5|10|30|never\"}");
             return;
         }
         if (wifi_manager_set_timeout_min(minutes)) {
@@ -118,8 +140,11 @@ static void handle_wifi_command(const String& arg) {
             cli_write_line(minutes == 0
                 ? "Wi-Fi 空闲自动关闭超时已设为 永不过期"
                 : "Wi-Fi 空闲自动关闭超时已设为 " + String(minutes) + " 分钟");
+            if (!wifi_manager_get_timeout_enabled()) {
+                cli_write_line("注意：空闲自动关闭开关为关闭状态，该超时暂不生效（'wifi timeout on' 开启）");
+            }
         } else {
-            cli_write_line("{\"error\":\"invalid_timeout\",\"hint\":\"1|5|10|30|never\"}");
+            cli_write_line("{\"error\":\"invalid_timeout\",\"hint\":\"on|off|1|5|10|30|never\"}");
         }
         return;
     }
@@ -155,6 +180,7 @@ static void handle_wifi_command(const String& arg) {
         doc["wifi_policy"] = (int)wifi_manager_get_policy();
         doc["wifi_policy_str"] = wifi_manager_policy_str(wifi_manager_get_policy());
         doc["wifi_timeout_min"] = wifi_manager_get_timeout_min();
+        doc["wifi_timeout_enabled"] = wifi_manager_get_timeout_enabled();
         doc["wifi_radio_state"] = (int)wifi_manager_get_radio_state();
         doc["ap_running"] = wifi_manager_is_ap_running();
         doc["ap_ip"] = wifi_manager_get_ap_ip();
@@ -259,7 +285,8 @@ static void handle_command(const String& line) {
         cli_write_line("  gattdump on|off - Toggle full GATT enumeration per remote connection (GATTX log)");
         cli_write_line("  wifi on|off   - Enable/disable the whole Wi-Fi radio (persisted, reboots)");
         cli_write_line("  wifi policy [always_on|on_demand|disabled] - Get/set Wi-Fi power policy");
-        cli_write_line("  wifi timeout [1|5|10|30|never] - Get/set ON_DEMAND idle timeout (min)");
+        cli_write_line("  wifi timeout [on|off] - Enable/disable ON_DEMAND idle auto-shutdown (default off)");
+    cli_write_line("  wifi timeout [1|5|10|30|never] - Get/set ON_DEMAND idle timeout (min)");
         cli_write_line("  wifi status   - Show Wi-Fi radio & connection status (JSON)");
         cli_write_line("  wifi wake     - Wake the radio from ON_DEMAND sleep (same path as USB/key gesture)");
         cli_write_line("  log on|off    - Mirror full logs to USB CDC (default: off)");

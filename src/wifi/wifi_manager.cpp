@@ -31,6 +31,7 @@ static uint32_t         s_sta_disconnected_since = 0;
 // Wi-Fi Power Management state
 static wifi_policy_t      s_policy           = (wifi_policy_t)WIFI_DEFAULT_POLICY;
 static uint32_t           s_timeout_min      = WIFI_DEFAULT_TIMEOUT_MIN;
+static bool               s_timeout_enabled  = WIFI_DEFAULT_TIMEOUT_ENABLED ? true : false;
 static wifi_radio_state_t s_radio_state      = WIFI_STATE_OFF;
 static uint32_t           s_last_activity_ms = 0;
 
@@ -55,8 +56,8 @@ static void wifi_apply_config(void);    // forward decl (defined below)
 static void wifi_reconnect_light(void); // forward decl (defined below)
 
 static bool wifi_is_valid_timeout(uint32_t minutes) {
-    return minutes == WIFI_TIMEOUT_NEVER || minutes == 1 || minutes == 5 ||
-           minutes == 10 || minutes == 30;
+    return minutes == WIFI_TIMEOUT_NEVER || minutes == 1 || minutes == 2 ||
+           minutes == 5 || minutes == 10 || minutes == 30;
 }
 
 static void wifi_start_ap(const String& ap_pass) {
@@ -173,6 +174,11 @@ void wifi_manager_init(void) {
     }
     s_timeout_min = stored_timeout;
 
+    // Auto-shutdown is opt-in: units that never had the key boot with the
+    // switch OFF, so the radio stays up and is only powered down by the user.
+    s_timeout_enabled = s_prefs.getBool(
+        "timeout_en", WIFI_DEFAULT_TIMEOUT_ENABLED ? true : false);
+
     s_wifi_enabled = (s_policy != WIFI_POLICY_DISABLED);
 
     if (!s_wifi_enabled) {
@@ -191,8 +197,9 @@ void wifi_manager_init(void) {
     s_radio_state = WIFI_STATE_ON;
     s_last_activity_ms = millis();
     led_indicator_set_wifi_sleep(false);
-    app_log("WIFI", "Wi-Fi policy %s (timeout %u min, state %s)",
-            wifi_manager_policy_str(s_policy), (unsigned int)s_timeout_min,
+    app_log("WIFI", "Wi-Fi policy %s (timeout %s%u min, state %s)",
+            wifi_manager_policy_str(s_policy),
+            s_timeout_enabled ? "" : "(off) ", (unsigned int)s_timeout_min,
             wifi_manager_state_str(s_radio_state));
 }
 
@@ -244,7 +251,32 @@ bool wifi_manager_set_timeout_min(uint32_t minutes) {
     }
     s_prefs.putUInt("timeout_min", minutes);
     s_timeout_min = minutes;
-    app_log("WIFI", "Wi-Fi idle timeout set to %u minute(s)", (unsigned int)minutes);
+    app_log("WIFI", "Wi-Fi idle timeout set to %u minute(s)%s", (unsigned int)minutes,
+            s_timeout_enabled ? "" : " (auto-shutdown still OFF)");
+    return true;
+}
+
+bool wifi_manager_get_timeout_enabled(void) {
+    return s_timeout_enabled;
+}
+
+bool wifi_manager_set_timeout_enabled(bool enabled) {
+    if (s_timeout_enabled == enabled) {
+        return true;
+    }
+    s_prefs.putBool("timeout_en", enabled);
+    s_timeout_enabled = enabled;
+    // Purely a gate on the idle check below, so it applies right away: no
+    // reboot and no radio transition (the driver stays initialized either way).
+    if (enabled) {
+        // Re-anchor the idle window so enabling does not immediately trip a
+        // timeout computed from a stale activity timestamp.
+        s_last_activity_ms = millis();
+        app_log("WIFI", "Wi-Fi idle auto-shutdown ENABLED (%u min, policy %s)",
+                (unsigned int)s_timeout_min, wifi_manager_policy_str(s_policy));
+    } else {
+        app_log("WIFI", "Wi-Fi idle auto-shutdown DISABLED (radio stays on; 'wifi off' powers it down)");
+    }
     return true;
 }
 
@@ -405,7 +437,10 @@ void wifi_manager_task(void) {
     // Sleep only disconnects + modem-sleeps: the WiFi driver stays initialized.
     // A later light reconnect (wifi_reconnect_light) then needs no radio
     // re-init, which is the churn that deadlocked esp_wifi against NimBLE.
+    // The timeout_en switch gates the whole block: with it off (default) the
+    // radio only goes down through an explicit 'wifi off' or a policy change.
     if (s_policy == WIFI_POLICY_ON_DEMAND &&
+        s_timeout_enabled &&
         s_timeout_min != WIFI_TIMEOUT_NEVER &&
         s_radio_state == WIFI_STATE_ON &&
         s_sta_configured &&
@@ -552,6 +587,9 @@ bool wifi_manager_restore_backup(const String& ssid, const String& sta_pass,
     s_prefs.putUInt("timeout_min", timeout_min);
     s_policy = policy;
     s_timeout_min = timeout_min;
+    // A backup predating the timeout_en key leaves the switch at its default
+    // (OFF) rather than silently re-arming the idle auto-shutdown.
+    s_timeout_enabled = WIFI_DEFAULT_TIMEOUT_ENABLED ? true : false;
     s_wifi_enabled = (policy != WIFI_POLICY_DISABLED);
     s_sta_configured = (ssid.length() > 0);
     app_log("WIFI", "Wi-Fi config restored from backup (policy=%s, timeout=%u min, ssid=%s)",

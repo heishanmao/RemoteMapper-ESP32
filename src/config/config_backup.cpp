@@ -25,6 +25,7 @@ String config_backup_export(bool full) {
     JsonObject wifi = doc["wifi"].to<JsonObject>();
     wifi["policy"] = (int)wifi_manager_get_policy();
     wifi["timeout_min"] = wifi_manager_get_timeout_min();
+    wifi["timeout_enabled"] = wifi_manager_get_timeout_enabled();
 
     String ssid    = wifi_manager_get_sta_ssid();
     String sta_pass = wifi_manager_get_sta_pass();
@@ -86,6 +87,11 @@ String config_backup_import(const String& json) {
         if (!wifi_manager_restore_backup(ssid, sta_pass, ap_pass,
                                          (wifi_policy_t)policy, timeout)) {
             return "Wi-Fi 配置恢复失败（参数非法）";
+        }
+        // Restore the idle auto-shutdown switch too. A backup without the key
+        // keeps the default (OFF) set by wifi_manager_restore_backup().
+        if (w["timeout_enabled"].is<bool>()) {
+            wifi_manager_set_timeout_enabled(w["timeout_enabled"] | false);
         }
     }
 

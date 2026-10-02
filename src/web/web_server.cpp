@@ -7,6 +7,7 @@
 #include "audio/audio_pipeline.h"
 #include "usb/uac_microphone.h"
 #include "usb/usb_composite.h"
+#include "usb/hid_diagnostics.h"
 #include "keymap/key_state_machine.h"
 #include "keymap/key_config_storage.h"
 #include "nvs/nvs_manager.h"
@@ -35,6 +36,8 @@ static void handle_status() {
     doc["firmware"] = FIRMWARE_NAME;
     doc["version"] = FIRMWARE_VERSION;
     doc["uptime_sec"] = millis() / 1000;
+    doc["boot_reset_reason"] = usb_composite_boot_reset_reason();
+    doc["boot_usb_recovery_restart"] = usb_composite_boot_usb_recovery_restart();
     doc["ble_state"] = (int)ble_remote_get_state();
     doc["battery_pct"] = ble_remote_get_battery_pct();
     doc["frames_decoded"] = g_audio_pipeline.total_frames_decoded;
@@ -44,6 +47,8 @@ static void handle_status() {
     doc["ap_ip"] = wifi_manager_get_ap_ip();
     doc["sta_ip"] = wifi_manager_get_sta_ip();
     doc["sta_connected"] = wifi_manager_is_sta_connected();
+    doc["sta_ssid"] = wifi_manager_is_sta_connected() ? wifi_manager_get_sta_ssid() : String("");
+    doc["sta_rssi"] = (int)wifi_manager_get_sta_rssi();
     doc["ap_ssid"] = AP_SSID;
     doc["ap_running"] = wifi_manager_is_ap_running();
     doc["mdns_url"] = wifi_manager_get_mdns_url();
@@ -51,6 +56,7 @@ static void handle_status() {
     doc["wifi_policy"] = (int)wifi_manager_get_policy();
     doc["wifi_policy_str"] = wifi_manager_policy_str(wifi_manager_get_policy());
     doc["wifi_timeout_min"] = wifi_manager_get_timeout_min();
+    doc["wifi_timeout_enabled"] = wifi_manager_get_timeout_enabled();
     doc["wifi_radio_state"] = (int)wifi_manager_get_radio_state();
     String ap_pass = wifi_manager_get_ap_pass();
     doc["ap_secured"] = (ap_pass.length() >= 8);
@@ -97,6 +103,27 @@ static void handle_audio() {
     uint8_t mute = 0;
     int16_t volume = 0;
     uac_microphone_get_control(&mute, &volume);
+    uac_tx_stats_t tx = {};
+    uac_microphone_get_stats(&tx);
+    doc["usb_completed"] = tx.completed;
+    doc["usb_failed"] = tx.failed;
+    doc["usb_claim_skips"] = tx.claim_skips;
+    doc["usb_recoveries"] = tx.recoveries;
+    doc["usb_last_complete_ms"] = tx.last_complete_ms;
+    doc["usb_endpoint"] = tx.endpoint;
+    doc["usb_recovery_pending"] = tx.recovery_pending;
+    uint32_t fifo_rearms = 0, fifo_rearm_completions = 0;
+    uac_microphone_get_fifo_rearm_stats(&fifo_rearms, &fifo_rearm_completions);
+    doc["usb_fifo_rearms"] = fifo_rearms;
+    doc["usb_fifo_rearm_completions"] = fifo_rearm_completions;
+    uint32_t pcm_samples = 0, pcm_nonzero = 0;
+    uint64_t pcm_absolute_sum = 0;
+    uint16_t pcm_peak = 0;
+    uac_microphone_get_pcm_stats(&pcm_samples, &pcm_nonzero, &pcm_absolute_sum, &pcm_peak);
+    doc["usb_pcm_samples"] = pcm_samples;
+    doc["usb_pcm_nonzero"] = pcm_nonzero;
+    doc["usb_pcm_absolute_sum"] = pcm_absolute_sum;
+    doc["usb_pcm_peak"] = pcm_peak;
     doc["streaming"] = uac_microphone_is_streaming();
     doc["alt"] = (int)uac_microphone_get_alt();
     doc["muted"] = (bool)(mute != 0);
@@ -105,7 +132,7 @@ static void handle_audio() {
     doc["session_id"] = (int)g_audio_pipeline.session_id;
     doc["buffering"] = g_audio_pipeline.buffering;
     doc["ring_avail"] = (int)audio_ring_buffer_peek_available(&g_audio_pipeline.ring_buf);
-    doc["ring_capacity"] = AUDIO_RING_BUFFER_SIZE;
+    doc["ring_capacity"] = g_audio_pipeline.ring_buf.capacity;
     doc["underruns"] = (int)g_audio_pipeline.underrun_count;
     doc["starve_count"] = (int)g_audio_pipeline.starve_count;
     doc["partial_count"] = (int)g_audio_pipeline.partial_count;
@@ -153,11 +180,21 @@ static void handle_guard() {
     doc["mod_ms"]     = cfg.mod_ms;
     doc["key_ms"]     = cfg.key_ms;
     doc["voice_ms"]   = cfg.voice_ms;
+    doc["voice_rx_gap_ms"] = HID_GUARD_VOICE_RX_GAP_MS;
     doc["forced"]     = stats.forced_releases;
     doc["last_reason"]= stats.last_reason;
     doc["last_force_ms"] = stats.last_force_ms;
     doc["any_held"]   = stats.any_held;
     doc["held_count"] = stats.held_count;
+    doc["keyboard_pending"] = stats.keyboard_pending;
+    doc["consumer_pending"] = stats.consumer_pending;
+    doc["desired_modifier"] = stats.desired_modifier;
+    doc["tx_complete"] = stats.tx_complete;
+    doc["tx_failed"] = stats.tx_failed;
+    doc["pending_ms"] = stats.pending_ms;
+    doc["usb_recoveries"] = stats.usb_recoveries;
+    doc["recovery_exhausted"] = stats.recovery_exhausted;
+    hid_diagnostics_json(doc["hid_diagnostics"].to<JsonObject>());
     String out;
     serializeJson(doc, out);
     s_server.send(200, "application/json", out);
@@ -386,32 +423,6 @@ static void handle_ble_reconnect() {
     s_server.send(200, "application/json", "{\"status\":\"reconnecting\"}");
 }
 
-static void handle_adv_sniff_get() {
-    JsonDocument doc;
-    doc["enabled"] = ble_remote_sniff_enabled();
-    String out;
-    serializeJson(doc, out);
-    s_server.send(200, "application/json", out);
-}
-
-static void handle_adv_sniff_set() {
-    bool on = ble_remote_sniff_enabled();
-    if (s_server.hasArg("enabled")) {
-        String v = s_server.arg("enabled");
-        if (v == "1" || v.equalsIgnoreCase("true") || v.equalsIgnoreCase("on")) on = true;
-        else if (v == "0" || v.equalsIgnoreCase("false") || v.equalsIgnoreCase("off")) on = false;
-    } else {
-        on = !on;
-    }
-    ble_remote_sniff_set(on);
-    app_log("BLE", "MiOT advertisement sniffer %s", on ? "ON (auto-connect suspended; press remote keys to capture 0xFE95)" : "OFF");
-    JsonDocument doc;
-    doc["enabled"] = on;
-    String out;
-    serializeJson(doc, out);
-    s_server.send(200, "application/json", out);
-}
-
 static void handle_gatt_dump_get() {
     JsonDocument doc;
     doc["enabled"] = ble_remote_gatt_dump_enabled();
@@ -450,6 +461,7 @@ static void handle_power_get() {
     doc["policy"] = (int)wifi_manager_get_policy();
     doc["policy_str"] = wifi_manager_policy_str(wifi_manager_get_policy());
     doc["timeout_min"] = wifi_manager_get_timeout_min();
+    doc["timeout_enabled"] = wifi_manager_get_timeout_enabled();
     doc["radio_state"] = (int)wifi_manager_get_radio_state();
     doc["radio_state_str"] = wifi_manager_state_str(wifi_manager_get_radio_state());
     doc["wifi_enabled"] = wifi_manager_get_enabled();
@@ -457,6 +469,7 @@ static void handle_power_get() {
     doc["idle_sec"] = millis() / 1000 - wifi_manager_get_last_activity_ms() / 1000;
     doc["sta_status"] = (int)WiFi.status();
     doc["sta_connected"] = (WiFi.status() == WL_CONNECTED);
+    doc["sta_ip"] = wifi_manager_get_sta_ip();
     doc["ap_running"] = wifi_manager_is_ap_running();
     doc["uptime_sec"] = millis() / 1000;
     String out;
@@ -495,12 +508,17 @@ static void handle_power_set() {
             return;
         }
     }
+    // Idle auto-shutdown switch: applies immediately, no reboot needed.
+    if (!doc["timeout_enabled"].isNull()) {
+        wifi_manager_set_timeout_enabled(doc["timeout_enabled"] | false);
+    }
 
     JsonDocument res;
     res["status"] = "ok";
     res["policy"] = (int)wifi_manager_get_policy();
     res["policy_str"] = wifi_manager_policy_str(wifi_manager_get_policy());
     res["timeout_min"] = wifi_manager_get_timeout_min();
+    res["timeout_enabled"] = wifi_manager_get_timeout_enabled();
     res["reboot_required"] = policy_changed;
     String out;
     serializeJson(res, out);
@@ -738,8 +756,6 @@ void web_server_init(void) {
     s_server.on("/api/audio/resample", HTTP_POST, handle_audio_resample);
     s_server.on("/api/guard", HTTP_GET, handle_guard);
     s_server.on("/api/guard", HTTP_POST, handle_guard_set);
-    s_server.on("/api/debug/adv-sniff", HTTP_GET, handle_adv_sniff_get);
-    s_server.on("/api/debug/adv-sniff", HTTP_POST, handle_adv_sniff_set);
     s_server.on("/api/debug/gatt-dump", HTTP_GET, handle_gatt_dump_get);
     s_server.on("/api/debug/gatt-dump", HTTP_POST, handle_gatt_dump_set);
 

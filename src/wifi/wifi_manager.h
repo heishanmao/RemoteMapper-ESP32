@@ -59,6 +59,10 @@ wifi_policy_t      wifi_manager_get_policy(void);
 bool               wifi_manager_set_policy(wifi_policy_t policy);
 uint32_t           wifi_manager_get_timeout_min(void);
 bool               wifi_manager_set_timeout_min(uint32_t minutes);
+// Master switch for the ON_DEMAND idle auto-shutdown. Takes effect immediately
+// (no reboot): it only gates the idle check in wifi_manager_task().
+bool               wifi_manager_get_timeout_enabled(void);
+bool               wifi_manager_set_timeout_enabled(bool enabled);
 wifi_radio_state_t wifi_manager_get_radio_state(void);
 // Request the radio to be available (wake from idle power-down or broadcast needs).
 bool               wifi_manager_request_wifi(wifi_wake_reason_t reason);
