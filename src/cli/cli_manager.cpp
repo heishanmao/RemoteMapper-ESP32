@@ -5,6 +5,7 @@
 #include "ble/ble_remote_client.h"
 #include "audio/audio_pipeline.h"
 #include "keymap/key_state_machine.h"
+#include "usb/usb_composite.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <ctype.h>
@@ -219,6 +220,55 @@ static void handle_log_command(const String& arg) {
     }
 }
 
+#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+static void add_usb_stress_json(JsonObject out) {
+    usb_hid_stress_stats_t stats = {};
+    usb_hid_stress_get(&stats);
+    out["active"] = stats.active;
+    out["user_aborted"] = stats.user_aborted;
+    out["test_id"] = stats.test_id;
+    out["duration_ms"] = stats.duration_ms;
+    out["started_ms"] = stats.started_ms;
+    out["ended_ms"] = stats.ended_ms;
+    out["attempted"] = stats.attempted;
+    out["completed"] = stats.completed;
+    out["failed"] = stats.failed;
+    out["stop_reason"] = stats.stop_reason;
+}
+
+static void handle_usb_stress_command(const String& arg) {
+    String command = arg;
+    command.trim();
+    if (command != "stress" && !command.startsWith("stress ")) {
+        cli_write_line("{\"error\":\"unknown_usb_command\",\"hint\":\"usb stress <1..300>|stop|status\"}");
+        return;
+    }
+    String value = command.substring(6);
+    value.trim();
+    if (value.equalsIgnoreCase("stop")) {
+        usb_hid_stress_stop();
+    } else if (value.length() && !value.equalsIgnoreCase("status")) {
+        bool valid = value.length() <= 3;
+        for (size_t i = 0; i < value.length(); i++)
+            if (!isdigit((unsigned char)value[i])) valid = false;
+        const uint32_t seconds = valid ? value.toInt() : 0;
+        if (seconds < 1 || seconds > 300) {
+            cli_write_line("{\"error\":\"invalid_duration\",\"hint\":\"usb stress <1..300>|stop|status\"}");
+            return;
+        }
+        if (!usb_hid_stress_start(seconds)) {
+            cli_write_line("{\"error\":\"stress_unavailable\",\"hint\":\"USB must be mounted and idle; only one test may run\"}");
+            return;
+        }
+    }
+    JsonDocument doc;
+    add_usb_stress_json(doc["usb_stress"].to<JsonObject>());
+    String out;
+    serializeJson(doc, out);
+    cli_write_line(out);
+}
+#endif
+
 static void handle_command(const String& line) {
     String cmd = line;
     cmd.trim();
@@ -240,6 +290,13 @@ static void handle_command(const String& line) {
         return;
     }
 
+#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+    if (head.equalsIgnoreCase("usb")) {
+        handle_usb_stress_command(tail);
+        return;
+    }
+#endif
+
     if (cmd.equalsIgnoreCase("status") || cmd.equalsIgnoreCase("info")) {
         JsonDocument doc;
         doc["firmware"] = FIRMWARE_NAME;
@@ -252,6 +309,9 @@ static void handle_command(const String& line) {
         doc["free_heap"] = ESP.getFreeHeap();
         doc["free_psram"] = ESP.getFreePsram();
         doc["wifi_enabled"] = wifi_manager_get_enabled();
+#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+        add_usb_stress_json(doc["usb_stress"].to<JsonObject>());
+#endif
 
         String out;
         serializeJson(doc, out);
@@ -292,6 +352,9 @@ static void handle_command(const String& line) {
         cli_write_line("  log on|off    - Mirror full logs to USB CDC (default: off)");
         cli_write_line("  log console on|off - Mute/enable routine UART console logs (default: muted after boot)");
         cli_write_line("  log status    - Show log mirror/console state (JSON)");
+#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+        cli_write_line("  usb stress <1..300>|stop|status - Bounded idle-only zero-report HID test");
+#endif
         cli_write_line("  help          - Show available commands");
     }
     else {
@@ -311,11 +374,12 @@ void cli_manager_task(void) {
         cli_feed_char(c);
     }
 #if !ARDUINO_USB_CDC_ON_BOOT
-    if (USBSerial) {
-        while (USBSerial.available() > 0) {
-            char c = (char)USBSerial.read();
-            cli_feed_char(c);
-        }
+    // Received bytes are valid even when the host hasn't asserted both
+    // control lines required by USBCDC::operator bool(). Always drain RX;
+    // otherwise commands accumulate until a later terminal handshake.
+    while (USBSerial.available() > 0) {
+        char c = (char)USBSerial.read();
+        cli_feed_char(c);
     }
 #endif
 }

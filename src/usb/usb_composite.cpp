@@ -112,6 +112,108 @@ static uint32_t s_voice_usb_claim_skips0 = 0;
 static bool s_voice_drain_pending = false;
 static uint32_t s_voice_release_ms = 0;
 static bool s_voice_hid_active = false;
+
+#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+static usb_hid_stress_stats_t s_hid_stress = {};
+static bool s_hid_stress_stop = false;
+
+// Caller holds hid_lock(), including the check and report submission. Never
+// replace desired reports or clear release debt to make the test progress.
+static bool hid_stress_user_idle_locked(void) {
+    if (s_keyboard_pending || s_consumer_pending || s_voice_hid_active ||
+            s_voice_drain_pending || g_audio_pipeline.active || s_consumer_report)
+        return false;
+    const hid_keyboard_report_t idle = {};
+    if (memcmp(&s_keyboard_report, &idle, sizeof(idle)) != 0) return false;
+    for (const auto &entry : s_held) if (entry.pressed) return false;
+    return true;
+}
+
+static void hid_stress_task(void *) {
+    const hid_keyboard_report_t keyboard_idle = {};
+    const uint16_t consumer_idle = 0;
+    uint32_t iteration = 0;
+    for (;;) {
+        hid_lock();
+        const uint32_t elapsed = millis() - s_hid_stress.started_ms;
+        const char *reason = nullptr;
+        if (s_hid_stress_stop) reason = "stop";
+        else if (!hid_stress_user_idle_locked()) reason = "user-input";
+        else if (elapsed >= s_hid_stress.duration_ms) reason = "duration";
+        else if (!s_usb_ready || !tud_ready() || tud_suspended()) reason = "usb-unavailable";
+        if (reason) {
+            s_hid_stress.user_aborted = strcmp(reason, "user-input") == 0;
+            snprintf(s_hid_stress.stop_reason, sizeof(s_hid_stress.stop_reason), "%s", reason);
+            hid_unlock();
+            break;
+        }
+        const bool keyboard = (iteration & 1) == 0;
+        s_hid_stress.attempted++;
+        const bool ok = s_hid_transport.SendReport(
+                keyboard ? HID_REPORT_ID_KEYBOARD : HID_REPORT_ID_CONSUMER_CONTROL,
+                keyboard ? (const void *)&keyboard_idle : (const void *)&consumer_idle,
+                keyboard ? sizeof(keyboard_idle) : sizeof(consumer_idle), 20);
+        if (ok) s_hid_stress.completed++;
+        else {
+            s_hid_stress.failed++;
+            snprintf(s_hid_stress.stop_reason, sizeof(s_hid_stress.stop_reason), "tx-failed");
+        }
+        hid_unlock();
+        if (!ok) break; // Save the first failure; do not flood retries or recover.
+        vTaskDelay(pdMS_TO_TICKS(3 + iteration % 5));
+        iteration++;
+    }
+    hid_lock();
+    s_hid_stress.ended_ms = millis();
+    s_hid_stress.active = false;
+    const usb_hid_stress_stats_t done = s_hid_stress;
+    hid_unlock();
+    app_log("USB_STRESS", "id=%u complete=%u attempted=%u failed=%u stop=%s",
+            (unsigned)done.test_id, (unsigned)done.completed, (unsigned)done.attempted,
+            (unsigned)done.failed, done.stop_reason);
+    vTaskDelete(nullptr);
+}
+
+bool usb_hid_stress_start(uint32_t seconds) {
+    if (seconds < 1 || seconds > 300) return false;
+    hid_lock();
+    if (s_hid_stress.active || !s_usb_ready || !tud_ready() || tud_suspended() ||
+            !hid_stress_user_idle_locked()) {
+        hid_unlock();
+        return false;
+    }
+    const uint32_t id = s_hid_stress.test_id + 1;
+    s_hid_stress = {};
+    s_hid_stress.active = true;
+    s_hid_stress.test_id = id;
+    s_hid_stress.duration_ms = seconds * 1000;
+    s_hid_stress.started_ms = millis();
+    s_hid_stress_stop = false;
+    const bool created = xTaskCreatePinnedToCore(hid_stress_task, "hid_stress", 3072,
+            nullptr, 1, nullptr, 0) == pdPASS;
+    if (!created) {
+        s_hid_stress.active = false;
+        s_hid_stress.ended_ms = millis();
+        snprintf(s_hid_stress.stop_reason, sizeof(s_hid_stress.stop_reason), "create-failed");
+    }
+    hid_unlock();
+    return created;
+}
+
+void usb_hid_stress_stop(void) {
+    hid_lock();
+    s_hid_stress_stop = true;
+    hid_unlock();
+}
+
+void usb_hid_stress_get(usb_hid_stress_stats_t *stats) {
+    if (!stats) return;
+    hid_lock();
+    *stats = s_hid_stress;
+    hid_unlock();
+}
+#endif
+
 // One isolated 2 ms completion after re-enumeration is not recovery. The
 // incident showed roughly one completion per failed 10 s cycle.
 static constexpr uint32_t USB_RECOVERY_HEALTHY_PACKETS = 100;

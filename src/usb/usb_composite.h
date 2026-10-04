@@ -26,6 +26,25 @@ uint32_t usb_composite_recovery_count(void);
 uint32_t usb_composite_boot_reset_reason(void);
 bool usb_composite_boot_usb_recovery_restart(void);
 
+#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+// Bounded laboratory test: sends only idle reports and yields to real input.
+typedef struct {
+    bool active;
+    bool user_aborted;
+    uint32_t test_id;
+    uint32_t duration_ms;
+    uint32_t started_ms;
+    uint32_t ended_ms;
+    uint32_t attempted;
+    uint32_t completed;
+    uint32_t failed;
+    char stop_reason[20];
+} usb_hid_stress_stats_t;
+bool usb_hid_stress_start(uint32_t seconds);
+void usb_hid_stress_stop(void);
+void usb_hid_stress_get(usb_hid_stress_stats_t *stats);
+#endif
+
 /**
  * @brief Send USB HID Keyboard Key Down (with modifier)
  */

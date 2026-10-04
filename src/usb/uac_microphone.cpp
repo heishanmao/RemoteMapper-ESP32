@@ -9,15 +9,14 @@
 #include "device/usbd_pvt.h"
 #include "soc/usb_struct.h"
 #include "soc/usb_reg.h"
-
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
-extern "C" bool remotemapper_dwc2_close_failed(void);
-#endif
+#include "usb/dwc2_diagnostics.h"
 
 #define UAC_DESC_TOTAL_LEN  108
 #define UAC_TX_BLOCK_SAMPLES 32
 #define UAC_TX_BLOCK_BYTES   (UAC_TX_BLOCK_SAMPLES * 2)
 #define UAC_TX_BLOCKS        2
+#define UAC_TX_PERIOD_MS     2
+#define UAC_STALL_TIMEOUT_MS 500
 
 static uint8_t s_uac_ep_in   = 0;
 static uint8_t s_uac_itf_ac  = 0;
@@ -69,6 +68,13 @@ static void uac_service(void*) {
     // the ring's one consumer. Otherwise a full old ring blocks new sessions.
     audio_ring_buffer_consume_pending_clear(&g_audio_pipeline.ring_buf);
     const uint32_t now = millis();
+#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+    if (remotemapper_dwc2_controller_faulted() && !s_recovery_requested) {
+        s_recovery_requested = true;
+        usb_composite_request_recovery(USB_RECOVERY_AUDIO);
+        app_log("UAC", "DWC2 endpoint disable failed; requesting USB recovery");
+    }
+#endif
     if (!s_uac_streaming || !tud_ready() || s_recovery_requested || !s_uac_ep_in) {
         s_last_progress_ms = now;
         __atomic_store_n(&s_service_queued, false, __ATOMIC_RELEASE);
@@ -103,13 +109,12 @@ static void uac_service(void*) {
         }
     }
 #endif
-    // 500ms is far beyond the 2ms packet cadence. This driver cannot close an
-    // individual endpoint; request a full stack-managed disconnect/reconnect
-    // from the loop task rather than corrupting endpoint/FIFO bookkeeping.
-    if (now - s_last_progress_ms >= 500) {
+    // A missing completion for this long requires stack-managed USB recovery.
+    if (now - s_last_progress_ms >= UAC_STALL_TIMEOUT_MS) {
         s_recovery_requested = true;
         usb_composite_request_recovery(USB_RECOVERY_AUDIO);
-        app_log("UAC", "No USB audio completions for 500ms: ep=0x%02X busy=%d skips=%u; requesting USB reconnect",
+        app_log("UAC", "No USB audio completions for %ums: ep=0x%02X busy=%d skips=%u; requesting USB reconnect",
+                UAC_STALL_TIMEOUT_MS,
                 s_uac_ep_in | 0x80, usbd_edpt_busy(0, s_uac_ep_in | 0x80),
                 (unsigned)s_claim_skip_count);
         __atomic_store_n(&s_service_queued, false, __ATOMIC_RELEASE);
@@ -143,7 +148,7 @@ static void uac_service(void*) {
 
 static void uac_push_task(void*) {
     TickType_t last_wake = xTaskGetTickCount();
-    const TickType_t interval = pdMS_TO_TICKS(2);
+    const TickType_t interval = pdMS_TO_TICKS(UAC_TX_PERIOD_MS);
     while (1) {
         vTaskDelayUntil(&last_wake, interval);
         if (!tud_inited()) continue;
@@ -232,6 +237,36 @@ static uint16_t uac_driver_open(uint8_t rhport, tusb_desc_interface_t const *des
     return len;
 }
 
+#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+static bool uac_activate_endpoint(uint8_t rhport) {
+    if (s_uac_ep_open) return true;
+    if (s_recovery_requested) return false;
+    app_log("UAC", "Opening ISO EP 0x%02X size=%u interval=%u",
+            s_uac_ep_desc.bEndpointAddress,
+            (unsigned)tu_edpt_packet_size(&s_uac_ep_desc),
+            (unsigned)s_uac_ep_desc.bInterval);
+    if (!usbd_edpt_open(rhport, &s_uac_ep_desc)) {
+        app_log("UAC", "ISO EP open failed at alt=1");
+        return false;
+    }
+    s_uac_ep_open = true;
+    return true;
+}
+
+static void uac_deactivate_endpoint(uint8_t rhport) {
+    if (!s_uac_ep_open) return;
+    s_uac_streaming = false;
+    usbd_edpt_close(rhport, s_uac_ep_in | 0x80);
+    s_uac_ep_open = false;
+    s_fifo_rearm_waiting = false;
+    if (remotemapper_dwc2_close_failed()) {
+        s_recovery_requested = true;
+        usb_composite_request_recovery(USB_RECOVERY_AUDIO);
+        app_log("UAC", "ISO endpoint did not disable in 2ms; requesting USB recovery");
+    }
+}
+#endif
+
 static bool uac_driver_control_xfer_cb(uint8_t rhport, uint8_t stage,
                                          tusb_control_request_t const *req) {
     if (stage != CONTROL_STAGE_SETUP) return true;
@@ -249,28 +284,8 @@ static bool uac_driver_control_xfer_cb(uint8_t rhport, uint8_t stage,
             }
             if (req->wValue > 1) return false;
 #if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
-            if (alt == 0 && s_uac_ep_open) {
-                s_uac_streaming = false;
-                usbd_edpt_close(rhport, s_uac_ep_in | 0x80);
-                s_uac_ep_open = false;
-                s_fifo_rearm_waiting = false;
-                if (remotemapper_dwc2_close_failed()) {
-                    s_recovery_requested = true;
-                    usb_composite_request_recovery(USB_RECOVERY_AUDIO);
-                    app_log("UAC", "ISO endpoint did not disable in 2ms; requesting USB recovery");
-                }
-            } else if (alt == 1 && !s_uac_ep_open) {
-                if (s_recovery_requested) return false;
-                app_log("UAC", "Opening ISO EP 0x%02X size=%u interval=%u",
-                        s_uac_ep_desc.bEndpointAddress,
-                        (unsigned)tu_edpt_packet_size(&s_uac_ep_desc),
-                        (unsigned)s_uac_ep_desc.bInterval);
-                if (!usbd_edpt_open(rhport, &s_uac_ep_desc)) {
-                    app_log("UAC", "ISO EP open failed at alt=1");
-                    return false;
-                }
-                s_uac_ep_open = true;
-            }
+            if (alt == 0) uac_deactivate_endpoint(rhport);
+            else if (!uac_activate_endpoint(rhport)) return false;
 #endif
             if (alt == 1 && s_uac_alt == 0) {
                 s_stream_start_ms = millis();
@@ -284,9 +299,8 @@ static bool uac_driver_control_xfer_cb(uint8_t rhport, uint8_t stage,
             s_uac_alt       = alt;
             s_uac_streaming = (alt == 1);
 
-            // EP was opened once at enumeration (uac_driver_open). The 500Hz
-            // push task submits transfers only while s_uac_streaming is set.
-            // No close/re-open churn here: that is what wedged the link.
+            // The legacy driver opens once at enumeration; DWC2 opens only for
+            // alt 1 and closes at alt 0. Both use the same paced TX service.
             return tud_control_status(rhport, req);
         } else if (req->bRequest == TUSB_REQ_GET_INTERFACE) {
             uint8_t itf = (uint8_t)req->wIndex;
