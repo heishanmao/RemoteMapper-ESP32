@@ -39,6 +39,9 @@
 #include "device/dcd.h"
 #include "dwc2_type.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
+#include "dwc2_diagnostics.h"
 
 // Following symbols must be defined by port header
 // - _dwc2_controller[]: array of controllers
@@ -94,6 +97,9 @@ typedef struct {
   uint16_t total_len;
   uint16_t max_size;
   uint8_t interval;
+  uint8_t iso_retry;
+  bool disabling;
+  bool irq_was_enabled;
 } xfer_ctl_t;
 
 static xfer_ctl_t xfer_status[DWC2_EP_MAX][2];
@@ -109,26 +115,99 @@ static bool _out_ep_closed;                   // Flag to check if RX FIFO size n
 // SOF enabling flag - required for SOF to not get disabled in ISR when SOF was enabled by
 static bool _sof_en;
 static volatile bool _rm_close_failed;
+static volatile bool _rm_controller_fault;
+static remotemapper_dwc2_stats_t _rm_stats;
+
+// HID can submit on core 0 while the USB ISR drains another endpoint on
+// core 1. A task-only interrupt mask cannot serialize DIEPEMPMSK read/modify/
+// write on both cores. Pair the same ESP32 spinlock in task and ISR paths,
+// including the transfer descriptor that the FIFO handler advances.
+static portMUX_TYPE _rm_dcd_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool _rm_resetting;
+
+static inline void rm_dcd_lock(bool in_isr) {
+  if (in_isr) portENTER_CRITICAL_ISR(&_rm_dcd_mux);
+  else portENTER_CRITICAL(&_rm_dcd_mux);
+}
+
+static inline void rm_dcd_unlock(bool in_isr) {
+  if (in_isr) portEXIT_CRITICAL_ISR(&_rm_dcd_mux);
+  else portEXIT_CRITICAL(&_rm_dcd_mux);
+}
+
+#define RM_ENDPOINT_DISABLE_TIMEOUT_US 2000
+#define RM_ENDPOINT_LIFECYCLE_TIMEOUT_US (3 * RM_ENDPOINT_DISABLE_TIMEOUT_US)
 
 // dcd_edpt_close() has no error return in TinyUSB 0.16. The class driver
 // checks this immediately after closing and requests a full USB recovery if
 // hardware fails to disable the endpoint. Never spin forever in USB task.
 bool remotemapper_dwc2_close_failed(void) { return _rm_close_failed; }
+bool remotemapper_dwc2_controller_faulted(void) { return _rm_controller_fault; }
 
-static bool rm_wait_register_bit(volatile uint32_t* reg, uint32_t bit) {
-  const int64_t deadline = esp_timer_get_time() + 2000;
-  while ((*reg & bit) == 0) {
+void remotemapper_dwc2_get_stats(remotemapper_dwc2_stats_t* stats) {
+  if (!stats) return;
+  tu_memclr(stats, sizeof(*stats));
+  stats->bus_resets = __atomic_load_n(&_rm_stats.bus_resets, __ATOMIC_RELAXED);
+  stats->fifo_reset_failures = __atomic_load_n(&_rm_stats.fifo_reset_failures, __ATOMIC_RELAXED);
+  stats->iso_incomplete_events = __atomic_load_n(&_rm_stats.iso_incomplete_events, __ATOMIC_RELAXED);
+  stats->iso_retries = __atomic_load_n(&_rm_stats.iso_retries, __ATOMIC_RELAXED);
+  stats->iso_aborts = __atomic_load_n(&_rm_stats.iso_aborts, __ATOMIC_RELAXED);
+  // The first snapshot is immutable after the ISR publishes first_iso_ms.
+  stats->first_iso_ms = __atomic_load_n(&_rm_stats.first_iso_ms, __ATOMIC_ACQUIRE);
+  if (stats->first_iso_ms) {
+    stats->first_iso_ep = _rm_stats.first_iso_ep;
+    stats->first_iso_epctl = _rm_stats.first_iso_epctl;
+    stats->first_iso_tsiz = _rm_stats.first_iso_tsiz;
+    stats->first_iso_dsts = _rm_stats.first_iso_dsts;
+  }
+}
+
+static void rm_mark_controller_fault(void) {
+  _rm_close_failed = true;
+  _rm_controller_fault = true;
+}
+
+static bool rm_wait_register(volatile uint32_t* reg, uint32_t bit, bool set) {
+  const int64_t deadline = esp_timer_get_time() + RM_ENDPOINT_DISABLE_TIMEOUT_US;
+  while (((*reg & bit) != 0) != set) {
     if (esp_timer_get_time() >= deadline) return false;
   }
   return true;
 }
 
-static bool rm_wait_register_clear(volatile uint32_t* reg, uint32_t bit) {
-  const int64_t deadline = esp_timer_get_time() + 2000;
-  while ((*reg & bit) != 0) {
-    if (esp_timer_get_time() >= deadline) return false;
+// Claim a lifecycle operation without holding the spinlock during hardware
+// waits. While owned, neither a task submission nor the FIFO ISR can use this
+// endpoint. The owner releases disabling after disable/flush has finished.
+static bool rm_edpt_begin_disable(uint8_t rhport, uint8_t ep_addr, bool close) {
+  uint8_t const epnum = tu_edpt_number(ep_addr);
+  uint8_t const dir = tu_edpt_dir(ep_addr);
+  xfer_ctl_t* xfer = XFER_CTL_BASE(epnum, dir);
+  const int64_t deadline = esp_timer_get_time() + RM_ENDPOINT_LIFECYCLE_TIMEOUT_US;
+  for (;;) {
+    rm_dcd_lock(false);
+    if (_rm_resetting) {
+      // The bus reset owns cancellation. This is not a controller failure.
+      rm_dcd_unlock(false);
+      return false;
+    }
+    if (!xfer->disabling) {
+      xfer->disabling = true;
+      uint32_t const irq_bit = TU_BIT(epnum + (dir == TUSB_DIR_IN ? DAINT_IEPINT_Pos : DAINT_OEPINT_Pos));
+      xfer->irq_was_enabled = (DWC2_REG(rhport)->daintmsk & irq_bit) != 0;
+      DWC2_REG(rhport)->daintmsk &= ~irq_bit;
+      if (close) xfer->max_size = 0;
+      if (dir == TUSB_DIR_IN) DWC2_REG(rhport)->diepempmsk &= ~(1u << epnum);
+      rm_dcd_unlock(false);
+      return true;
+    }
+    rm_dcd_unlock(false);
+    // A host close can legitimately meet an ISO abort on the other core.
+    // Let its three bounded hardware waits finish before claiming this EP.
+    if (esp_timer_get_time() >= deadline) {
+      rm_mark_controller_fault();
+      return false;
+    }
   }
-  return true;
 }
 
 // Calculate the RX FIFO size according to recommendations from reference manual
@@ -155,23 +234,50 @@ static void bus_reset(uint8_t rhport) {
   dwc2_regs_t* dwc2 = DWC2_REG(rhport);
   uint8_t const ep_count = _dwc2_controller[rhport].ep_count;
 
+  rm_dcd_lock(true);
+  _rm_resetting = true;
   tu_memclr(xfer_status, sizeof(xfer_status));
+  _rm_close_failed = false;
+  _rm_controller_fault = false;
   _out_ep_closed = false;
 
   _sof_en = false;
+  __atomic_add_fetch(&_rm_stats.bus_resets, 1, __ATOMIC_RELAXED);
+  tu_memclr(ep0_pending, sizeof(ep0_pending));
 
-  // clear device address
-  dwc2->dcfg &= ~DCFG_DAD_Msk;
-
-  // 1. NAK for all OUT endpoints
   for (uint8_t n = 0; n < ep_count; n++) {
     dwc2->epout[n].doepctl |= DOEPCTL_SNAK;
   }
-
-  // 2. Set up interrupt mask
   dwc2->daintmsk = TU_BIT(DAINTMSK_OEPM_Pos) | TU_BIT(DAINTMSK_IEPM_Pos);
   dwc2->doepmsk = DOEPMSK_STUPM | DOEPMSK_XFRCM;
   dwc2->diepmsk = DIEPMSK_TOM | DIEPMSK_XFRCM;
+
+  // Re-enumeration must remove the previous session's TXFE mask and FIFO
+  // contents, not merely reset software transfer descriptors. This follows
+  // TinyUSB 0.20 handle_bus_reset() while keeping bounded hardware waits.
+  dwc2->diepempmsk = 0;
+  for (uint8_t n = 0; n < ep_count; n++) {
+    if (dwc2->epin[n].diepctl & DIEPCTL_EPENA) {
+      dwc2->epin[n].diepctl |= DIEPCTL_SNAK | DIEPCTL_EPDIS;
+    }
+  }
+  rm_dcd_unlock(true);
+  // Submissions remain blocked by _rm_resetting while hardware is polled.
+  dwc2->grstctl = GRSTCTL_TXFFLSH | (0x10u << GRSTCTL_TXFNUM_Pos);
+  if (!rm_wait_register(&dwc2->grstctl, GRSTCTL_TXFFLSH_Msk, false)) {
+    rm_mark_controller_fault();
+    __atomic_add_fetch(&_rm_stats.fifo_reset_failures, 1, __ATOMIC_RELAXED);
+  } else {
+    dwc2->grstctl = GRSTCTL_RXFFLSH;
+    if (!rm_wait_register(&dwc2->grstctl, GRSTCTL_RXFFLSH_Msk, false)) {
+      rm_mark_controller_fault();
+      __atomic_add_fetch(&_rm_stats.fifo_reset_failures, 1, __ATOMIC_RELAXED);
+    }
+  }
+
+  rm_dcd_lock(true);
+  // clear device address
+  dwc2->dcfg &= ~DCFG_DAD_Msk;
 
   // "USB Data FIFOs" section in reference manual
   // Peripheral FIFO architecture
@@ -239,9 +345,13 @@ static void bus_reset(uint8_t rhport) {
 
   dwc2->epout[0].doeptsiz |= (3 << DOEPTSIZ_STUPCNT_Pos);
 
-  dwc2->gintmsk |= GINTMSK_OEPINT | GINTMSK_IEPINT;
+  dwc2->gintsts = GINTSTS_IISOIXFR;
+  dwc2->gintmsk |= GINTMSK_OEPINT | GINTMSK_IEPINT | GINTMSK_IISOIXFRM;
+  _rm_resetting = false;
+  rm_dcd_unlock(true);
 }
 
+// Called with _rm_dcd_mux held by either the submitting task or the ISR.
 static void edpt_schedule_packets(uint8_t rhport, uint8_t const epnum, uint8_t const dir, uint16_t const num_packets,
                                   uint16_t total_bytes) {
   (void) rhport;
@@ -496,8 +606,10 @@ void dcd_init(uint8_t rhport) {
   dwc2->gintmsk = GINTMSK_OTGINT | GINTMSK_MMISM | GINTMSK_RXFLVLM |
                   GINTMSK_USBSUSPM | GINTMSK_USBRST | GINTMSK_ENUMDNEM | GINTMSK_WUIM;
 
-  // Enable global interrupt
-  dwc2->gahbcfg |= GAHBCFG_GINT;
+  // Each TX FIFO holds one packet. A half-empty interrupt can fire before a
+  // full packet fits, repeatedly occupying the ISR. Match the threshold to
+  // this allocation (TinyUSB upstream issue #2049 / fix #2050).
+  dwc2->gahbcfg |= GAHBCFG_GINT | GAHBCFG_TXFELVL;
 
   // make sure we are in device mode
 //  TU_ASSERT(!(dwc2->gintsts & GINTSTS_CMOD), );
@@ -520,7 +632,9 @@ void dcd_int_disable(uint8_t rhport) {
 
 void dcd_set_address(uint8_t rhport, uint8_t dev_addr) {
   dwc2_regs_t* dwc2 = DWC2_REG(rhport);
+  rm_dcd_lock(false);
   dwc2->dcfg = (dwc2->dcfg & ~DCFG_DAD_Msk) | (dev_addr << DCFG_DAD_Pos);
+  rm_dcd_unlock(false);
 
   // Response with status after changing device address
   dcd_edpt_xfer(rhport, tu_edpt_addr(0, TUSB_DIR_IN), NULL, 0);
@@ -532,28 +646,36 @@ void dcd_remote_wakeup(uint8_t rhport) {
   dwc2_regs_t* dwc2 = DWC2_REG(rhport);
 
   // set remote wakeup
+  rm_dcd_lock(false);
   dwc2->dctl |= DCTL_RWUSIG;
 
   // enable SOF to detect bus resume
   dwc2->gintsts = GINTSTS_SOF;
   dwc2->gintmsk |= GINTMSK_SOFM;
+  rm_dcd_unlock(false);
 
   // Per specs: remote wakeup signal bit must be clear within 1-15ms
   dwc2_remote_wakeup_delay();
 
+  rm_dcd_lock(false);
   dwc2->dctl &= ~DCTL_RWUSIG;
+  rm_dcd_unlock(false);
 }
 
 void dcd_connect(uint8_t rhport) {
   (void) rhport;
   dwc2_regs_t* dwc2 = DWC2_REG(rhport);
+  rm_dcd_lock(false);
   dwc2->dctl &= ~DCTL_SDIS;
+  rm_dcd_unlock(false);
 }
 
 void dcd_disconnect(uint8_t rhport) {
   (void) rhport;
   dwc2_regs_t* dwc2 = DWC2_REG(rhport);
+  rm_dcd_lock(false);
   dwc2->dctl |= DCTL_SDIS;
+  rm_dcd_unlock(false);
 }
 
 // Be advised: audio, video and possibly other iso-ep classes use dcd_sof_enable() to enable/disable its corresponding ISR on purpose!
@@ -561,6 +683,7 @@ void dcd_sof_enable(uint8_t rhport, bool en) {
   (void) rhport;
   dwc2_regs_t* dwc2 = DWC2_REG(rhport);
 
+  rm_dcd_lock(false);
   _sof_en = en;
 
   if (en) {
@@ -569,6 +692,7 @@ void dcd_sof_enable(uint8_t rhport, bool en) {
   } else {
     dwc2->gintmsk &= ~GINTMSK_SOFM;
   }
+  rm_dcd_unlock(false);
 }
 
 /*------------------------------------------------------------------*/
@@ -586,7 +710,12 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const* desc_edpt) {
 
   TU_ASSERT(epnum < ep_count);
 
+  rm_dcd_lock(false);
   xfer_ctl_t* xfer = XFER_CTL_BASE(epnum, dir);
+  if (_rm_resetting || xfer->disabling) {
+    rm_dcd_unlock(false);
+    return false;
+  }
   xfer->max_size = tu_edpt_packet_size(desc_edpt);
   xfer->interval = desc_edpt->bInterval;
 
@@ -598,7 +727,11 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const* desc_edpt) {
 
     // If size_rx needs to be extended check if possible and if so enlarge it
     if (dwc2->grxfsiz < sz) {
-      TU_ASSERT(sz + _allocated_fifo_words_tx <= _dwc2_controller[rhport].ep_fifo_size / 4);
+      if (sz + _allocated_fifo_words_tx > _dwc2_controller[rhport].ep_fifo_size / 4) {
+        xfer->max_size = 0;
+        rm_dcd_unlock(false);
+        return false;
+      }
 
       // Enlarge RX FIFO
       dwc2->grxfsiz = sz;
@@ -633,12 +766,13 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const* desc_edpt) {
     // - IN EP 1 gets FIFO 1, IN EP "n" gets FIFO "n".
 
     // Check if free space is available
-    TU_ASSERT(_allocated_fifo_words_tx + fifo_size + dwc2->grxfsiz <= _dwc2_controller[rhport].ep_fifo_size / 4);
+    if (_allocated_fifo_words_tx + fifo_size + dwc2->grxfsiz > _dwc2_controller[rhport].ep_fifo_size / 4) {
+      xfer->max_size = 0;
+      rm_dcd_unlock(false);
+      return false;
+    }
 
     _allocated_fifo_words_tx += fifo_size;
-
-    TU_LOG(DWC2_DEBUG, "    Allocated %u bytes at offset %lu", fifo_size * 4,
-           _dwc2_controller[rhport].ep_fifo_size - _allocated_fifo_words_tx * 4);
 
     // DIEPTXF starts at FIFO #1.
     // Both TXFD and TXSA are in unit of 32-bit words.
@@ -654,6 +788,7 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const* desc_edpt) {
     dwc2->daintmsk |= (1 << (DAINTMSK_IEPM_Pos + epnum));
   }
 
+  rm_dcd_unlock(false);
   return true;
 }
 
@@ -662,8 +797,10 @@ void dcd_edpt_close_all(uint8_t rhport) {
   dwc2_regs_t* dwc2 = DWC2_REG(rhport);
   uint8_t const ep_count = _dwc2_controller[rhport].ep_count;
 
+  rm_dcd_lock(false);
   // Disable non-control interrupt
   dwc2->daintmsk = (1 << DAINTMSK_OEPM_Pos) | (1 << DAINTMSK_IEPM_Pos);
+  dwc2->diepempmsk &= 1u;
 
   for (uint8_t n = 1; n < ep_count; n++) {
     // disable OUT endpoint
@@ -677,16 +814,23 @@ void dcd_edpt_close_all(uint8_t rhport) {
 
   // reset allocated fifo IN
   _allocated_fifo_words_tx = 16;
+  rm_dcd_unlock(false);
 }
 
 bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t* buffer, uint16_t total_bytes) {
   uint8_t const epnum = tu_edpt_number(ep_addr);
   uint8_t const dir = tu_edpt_dir(ep_addr);
 
+  rm_dcd_lock(false);
   xfer_ctl_t* xfer = XFER_CTL_BASE(epnum, dir);
+  if (_rm_resetting || xfer->disabling || !xfer->max_size) {
+    rm_dcd_unlock(false);
+    return false;
+  }
   xfer->buffer = buffer;
   xfer->ff = NULL;
   xfer->total_len = total_bytes;
+  xfer->iso_retry = xfer->interval;
 
   // EP0 can only handle one packet
   if (epnum == 0) {
@@ -705,6 +849,7 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t* buffer, uint16_t to
     edpt_schedule_packets(rhport, epnum, dir, num_packets, total_bytes);
   }
 
+  rm_dcd_unlock(false);
   return true;
 }
 
@@ -713,16 +858,25 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t* buffer, uint16_t to
 // success message. If total_bytes is too big, the FIFO will copy only what is available
 // into the USB buffer!
 bool dcd_edpt_xfer_fifo(uint8_t rhport, uint8_t ep_addr, tu_fifo_t* ff, uint16_t total_bytes) {
+  // The DCD side of a FIFO is used from ISR: its IN-read / OUT-write mutex
+  // must be NULL (the standard TinyUSB audio driver configures it this way).
+  // Only the opposite, class-driver side may use a blocking FIFO mutex.
   // USB buffers always work in bytes so to avoid unnecessary divisions we demand item_size = 1
   TU_ASSERT(ff->item_size == 1);
 
   uint8_t const epnum = tu_edpt_number(ep_addr);
   uint8_t const dir = tu_edpt_dir(ep_addr);
 
+  rm_dcd_lock(false);
   xfer_ctl_t* xfer = XFER_CTL_BASE(epnum, dir);
+  if (_rm_resetting || xfer->disabling || !xfer->max_size) {
+    rm_dcd_unlock(false);
+    return false;
+  }
   xfer->buffer = NULL;
   xfer->ff = ff;
   xfer->total_len = total_bytes;
+  xfer->iso_retry = xfer->interval;
 
   uint16_t num_packets = (total_bytes / xfer->max_size);
   uint16_t const short_packet_size = total_bytes % xfer->max_size;
@@ -733,10 +887,13 @@ bool dcd_edpt_xfer_fifo(uint8_t rhport, uint8_t ep_addr, tu_fifo_t* ff, uint16_t
   // Schedule packets to be sent within interrupt
   edpt_schedule_packets(rhport, epnum, dir, num_packets, total_bytes);
 
+  rm_dcd_unlock(false);
   return true;
 }
 
-static void dcd_edpt_disable(uint8_t rhport, uint8_t ep_addr, bool stall) {
+// Caller owns xfer->disabling. Register commands are serialized, but the
+// bounded hardware polls never hold _rm_dcd_mux and cannot starve other EPs.
+static void dcd_edpt_disable(uint8_t rhport, uint8_t ep_addr, bool stall, bool in_isr) {
   (void) rhport;
 
   dwc2_regs_t* dwc2 = DWC2_REG(rhport);
@@ -748,55 +905,92 @@ static void dcd_edpt_disable(uint8_t rhport, uint8_t ep_addr, bool stall) {
     dwc2_epin_t* epin = dwc2->epin;
 
     // Only disable currently enabled non-control endpoint
+    rm_dcd_lock(in_isr);
     if ((epnum == 0) || !(epin[epnum].diepctl & DIEPCTL_EPENA)) {
       epin[epnum].diepctl |= DIEPCTL_SNAK | (stall ? DIEPCTL_STALL : 0);
+      rm_dcd_unlock(in_isr);
     } else {
       // Stop transmitting packets and NAK IN xfers.
       epin[epnum].diepctl |= DIEPCTL_SNAK;
-      if (!rm_wait_register_bit(&epin[epnum].diepint, DIEPINT_INEPNE)) {
-        _rm_close_failed = true;
-        return;
+      rm_dcd_unlock(in_isr);
+      if (!rm_wait_register(&epin[epnum].diepint, DIEPINT_INEPNE, true)) {
+        rm_mark_controller_fault();
+        goto done;
       }
 
       // Disable the endpoint.
+      rm_dcd_lock(in_isr);
       epin[epnum].diepctl |= DIEPCTL_EPDIS | (stall ? DIEPCTL_STALL : 0);
-      if (!rm_wait_register_bit(&epin[epnum].diepint, DIEPINT_EPDISD_Msk)) {
-        _rm_close_failed = true;
-        return;
+      rm_dcd_unlock(in_isr);
+      if (!rm_wait_register(&epin[epnum].diepint, DIEPINT_EPDISD_Msk, true)) {
+        rm_mark_controller_fault();
+        goto done;
       }
 
+      rm_dcd_lock(in_isr);
       epin[epnum].diepint = DIEPINT_EPDISD;
+      rm_dcd_unlock(in_isr);
     }
 
     // Flush the FIFO, and wait until we have confirmed it cleared.
+    rm_dcd_lock(in_isr);
     dwc2->grstctl = ((epnum << GRSTCTL_TXFNUM_Pos) | GRSTCTL_TXFFLSH);
-    if (!rm_wait_register_clear(&dwc2->grstctl, GRSTCTL_TXFFLSH_Msk)) {
-      _rm_close_failed = true;
+    rm_dcd_unlock(in_isr);
+    if (!rm_wait_register(&dwc2->grstctl, GRSTCTL_TXFFLSH_Msk, false)) {
+      rm_mark_controller_fault();
     }
   } else {
     dwc2_epout_t* epout = dwc2->epout;
 
     // Only disable currently enabled non-control endpoint
+    rm_dcd_lock(in_isr);
     if ((epnum == 0) || !(epout[epnum].doepctl & DOEPCTL_EPENA)) {
       epout[epnum].doepctl |= stall ? DOEPCTL_STALL : 0;
+      rm_dcd_unlock(in_isr);
     } else {
-      // Asserting GONAK is required to STALL an OUT endpoint.
-      // Simpler to use polling here, we don't use the "B"OUTNAKEFF interrupt
-      // anyway, and it can't be cleared by user code. If this while loop never
-      // finishes, we have bigger problems than just the stack.
+      // Asserting GONAK is required to STALL an OUT endpoint. Bound both
+      // hardware waits so a broken controller cannot block the USB task.
       dwc2->dctl |= DCTL_SGONAK;
-      while ((dwc2->gintsts & GINTSTS_BOUTNAKEFF_Msk) == 0) {}
+      rm_dcd_unlock(in_isr);
+      if (!rm_wait_register(&dwc2->gintsts, GINTSTS_BOUTNAKEFF_Msk, true)) {
+        rm_mark_controller_fault();
+        rm_dcd_lock(in_isr);
+        dwc2->dctl |= DCTL_CGONAK;
+        rm_dcd_unlock(in_isr);
+        goto done;
+      }
 
-      // Ditto here- disable the endpoint.
+      rm_dcd_lock(in_isr);
       epout[epnum].doepctl |= DOEPCTL_EPDIS | (stall ? DOEPCTL_STALL : 0);
-      while ((epout[epnum].doepint & DOEPINT_EPDISD_Msk) == 0) {}
+      rm_dcd_unlock(in_isr);
+      if (!rm_wait_register(&epout[epnum].doepint, DOEPINT_EPDISD_Msk, true)) {
+        rm_mark_controller_fault();
+        rm_dcd_lock(in_isr);
+        dwc2->dctl |= DCTL_CGONAK;
+        rm_dcd_unlock(in_isr);
+        goto done;
+      }
 
+      rm_dcd_lock(in_isr);
       epout[epnum].doepint = DOEPINT_EPDISD;
 
       // Allow other OUT endpoints to keep receiving.
       dwc2->dctl |= DCTL_CGONAK;
+      rm_dcd_unlock(in_isr);
     }
   }
+done:
+  rm_dcd_lock(in_isr);
+  xfer_ctl_t* xfer = XFER_CTL_BASE(epnum, dir);
+  // A late completion from the cancelled transfer must not be delivered as
+  // the completion of a newly submitted transfer after restoring its mask.
+  if (dir == TUSB_DIR_IN) dwc2->epin[epnum].diepint = DIEPINT_XFRC;
+  else dwc2->epout[epnum].doepint = DOEPINT_XFRC;
+  if (!_rm_resetting && xfer->max_size && xfer->irq_was_enabled) {
+    dwc2->daintmsk |= TU_BIT(epnum + (dir == TUSB_DIR_IN ? DAINT_IEPINT_Pos : DAINT_OEPINT_Pos));
+  }
+  xfer->disabling = false;
+  rm_dcd_unlock(in_isr);
 }
 
 /**
@@ -809,9 +1003,11 @@ void dcd_edpt_close(uint8_t rhport, uint8_t ep_addr) {
   uint8_t const dir = tu_edpt_dir(ep_addr);
 
   _rm_close_failed = false;
-  dcd_edpt_disable(rhport, ep_addr, false);
+  if (!rm_edpt_begin_disable(rhport, ep_addr, true)) return;
+  dcd_edpt_disable(rhport, ep_addr, false, false);
   if (_rm_close_failed) return;
 
+  rm_dcd_lock(false);
   // Update max_size
   xfer_status[epnum][dir].max_size = 0;  // max_size = 0 marks a disabled EP - required for changing FIFO allocation
 
@@ -819,16 +1015,24 @@ void dcd_edpt_close(uint8_t rhport, uint8_t ep_addr) {
     uint16_t const fifo_size = (dwc2->dieptxf[epnum - 1] & DIEPTXF_INEPTXFD_Msk) >> DIEPTXF_INEPTXFD_Pos;
     uint16_t const fifo_start = (dwc2->dieptxf[epnum - 1] & DIEPTXF_INEPTXSA_Msk) >> DIEPTXF_INEPTXSA_Pos;
 
-    // For now only the last opened endpoint can be closed without fuss.
-    TU_ASSERT(fifo_start == _dwc2_controller[rhport].ep_fifo_size / 4 - _allocated_fifo_words_tx,);
+    // Only the last opened FIFO can be reclaimed. Report an unexpected order
+    // instead of silently corrupting the allocator in a release build.
+    if (fifo_start != _dwc2_controller[rhport].ep_fifo_size / 4 - _allocated_fifo_words_tx) {
+      rm_mark_controller_fault();
+      rm_dcd_unlock(false);
+      return;
+    }
     _allocated_fifo_words_tx -= fifo_size;
   } else {
     _out_ep_closed = true;     // Set flag such that RX FIFO gets reduced in size once RX FIFO is empty
   }
+  rm_dcd_unlock(false);
 }
 
 void dcd_edpt_stall(uint8_t rhport, uint8_t ep_addr) {
-  dcd_edpt_disable(rhport, ep_addr, true);
+  if (rm_edpt_begin_disable(rhport, ep_addr, false)) {
+    dcd_edpt_disable(rhport, ep_addr, true, false);
+  }
 }
 
 void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr) {
@@ -840,6 +1044,7 @@ void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr) {
   uint8_t const dir = tu_edpt_dir(ep_addr);
 
   // Clear stall and reset data toggle
+  rm_dcd_lock(false);
   if (dir == TUSB_DIR_IN) {
     dwc2->epin[epnum].diepctl &= ~DIEPCTL_STALL;
     dwc2->epin[epnum].diepctl |= DIEPCTL_SD0PID_SEVNFRM;
@@ -847,6 +1052,7 @@ void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr) {
     dwc2->epout[epnum].doepctl &= ~DOEPCTL_STALL;
     dwc2->epout[epnum].doepctl |= DOEPCTL_SD0PID_SEVNFRM;
   }
+  rm_dcd_unlock(false);
 }
 
 /*------------------------------------------------------------------*/
@@ -901,6 +1107,7 @@ static void write_fifo_packet(uint8_t rhport, uint8_t fifo_num, uint8_t const* s
 }
 
 static void handle_rxflvl_irq(uint8_t rhport) {
+  rm_dcd_lock(true);
   dwc2_regs_t* dwc2 = DWC2_REG(rhport);
   volatile uint32_t const* rx_fifo = dwc2->fifo[0];
 
@@ -945,6 +1152,13 @@ static void handle_rxflvl_irq(uint8_t rhport) {
     case GRXSTS_PKTSTS_OUTRX: {
       // Out packet received
       xfer_ctl_t* xfer = XFER_CTL_BASE(epnum, TUSB_DIR_OUT);
+
+      if (_rm_resetting || xfer->disabling || !xfer->max_size) {
+        // A close can leave an already received packet in the shared FIFO.
+        // Drain it without touching a closed/reset transfer buffer.
+        for (uint16_t words = tu_div_ceil(bcnt, 4); words; --words) (void)*rx_fifo;
+        break;
+      }
 
       // Read packet off RxFIFO
       if (xfer->ff) {
@@ -997,6 +1211,7 @@ static void handle_rxflvl_irq(uint8_t rhport) {
       TU_BREAKPOINT();
       break;
   }
+  rm_dcd_unlock(true);
 }
 
 static void handle_epout_irq(uint8_t rhport) {
@@ -1006,7 +1221,14 @@ static void handle_epout_irq(uint8_t rhport) {
   // DAINT for a given EP clears when DOEPINTx is cleared.
   // OEPINT will be cleared when DAINT's out bits are cleared.
   for (uint8_t n = 0; n < ep_count; n++) {
-    if (dwc2->daint & TU_BIT(DAINT_OEPINT_Pos + n)) {
+    bool setup = false;
+    bool complete = false;
+    uint16_t completed_len = 0;
+    uint32_t setup_packet[2];
+    rm_dcd_lock(true);
+    xfer_ctl_t* xfer = XFER_CTL_BASE(n, TUSB_DIR_OUT);
+    if (!_rm_resetting && !xfer->disabling && xfer->max_size &&
+        (dwc2->daint & dwc2->daintmsk & TU_BIT(DAINT_OEPINT_Pos + n))) {
       dwc2_epout_t* epout = &dwc2->epout[n];
 
       uint32_t const doepint = epout->doepint;
@@ -1021,24 +1243,29 @@ static void handle_epout_irq(uint8_t rhport) {
         }
 
         epout->doepint = clear_flag;
-        dcd_event_setup_received(rhport, (uint8_t*) _setup_packet, true);
+        setup_packet[0] = _setup_packet[0];
+        setup_packet[1] = _setup_packet[1];
+        setup = true;
       }
 
       // OUT XFER complete
       if (epout->doepint & DOEPINT_XFRC) {
         epout->doepint = DOEPINT_XFRC;
 
-        xfer_ctl_t* xfer = XFER_CTL_BASE(n, TUSB_DIR_OUT);
-
         // EP0 can only handle one packet
         if ((n == 0) && ep0_pending[TUSB_DIR_OUT]) {
           // Schedule another packet to be received.
           edpt_schedule_packets(rhport, n, TUSB_DIR_OUT, 1, ep0_pending[TUSB_DIR_OUT]);
         } else {
-          dcd_event_xfer_complete(rhport, n, xfer->total_len, XFER_RESULT_SUCCESS, true);
+          completed_len = xfer->total_len;
+          complete = true;
         }
       }
     }
+    rm_dcd_unlock(true);
+    // Event delivery can wake the USB task on the other core.
+    if (setup) dcd_event_setup_received(rhport, (uint8_t*) setup_packet, true);
+    if (complete) dcd_event_xfer_complete(rhport, n, completed_len, XFER_RESULT_SUCCESS, true);
   }
 }
 
@@ -1050,9 +1277,13 @@ static void handle_epin_irq(uint8_t rhport) {
   // DAINT for a given EP clears when DIEPINTx is cleared.
   // IEPINT will be cleared when DAINT's out bits are cleared.
   for (uint8_t n = 0; n < ep_count; n++) {
-    if (dwc2->daint & TU_BIT(DAINT_IEPINT_Pos + n)) {
+    bool complete = false;
+    uint16_t completed_len = 0;
+    rm_dcd_lock(true);
+    xfer_ctl_t* xfer = XFER_CTL_BASE(n, TUSB_DIR_IN);
+    if (!_rm_resetting && !xfer->disabling && xfer->max_size &&
+        (dwc2->daint & dwc2->daintmsk & TU_BIT(DAINT_IEPINT_Pos + n))) {
       // IN XFER complete (entire xfer).
-      xfer_ctl_t* xfer = XFER_CTL_BASE(n, TUSB_DIR_IN);
 
       if (epin[n].diepint & DIEPINT_XFRC) {
         epin[n].diepint = DIEPINT_XFRC;
@@ -1062,7 +1293,8 @@ static void handle_epin_irq(uint8_t rhport) {
           // Schedule another packet to be transmitted.
           edpt_schedule_packets(rhport, n, TUSB_DIR_IN, 1, ep0_pending[TUSB_DIR_IN]);
         } else {
-          dcd_event_xfer_complete(rhport, n | TUSB_DIR_IN_MASK, xfer->total_len, XFER_RESULT_SUCCESS, true);
+          completed_len = xfer->total_len;
+          complete = true;
         }
       }
 
@@ -1103,6 +1335,59 @@ static void handle_epin_irq(uint8_t rhport) {
           dwc2->diepempmsk &= ~(1 << n);
         }
       }
+    }
+    rm_dcd_unlock(true);
+    if (complete) dcd_event_xfer_complete(rhport, n | TUSB_DIR_IN_MASK, completed_len, XFER_RESULT_SUCCESS, true);
+  }
+}
+
+// Backport the bounded ISO frame retry policy from TinyUSB 0.20. A missed
+// frame must eventually emit a failed completion so the class can release its
+// busy state. Retrying does not refill/rewind the FIFO or duplicate PCM.
+static void handle_incomplete_iso_in(uint8_t rhport) {
+  dwc2_regs_t* dwc2 = DWC2_REG(rhport);
+  const bool odd_now = (dwc2->dsts & (1u << DSTS_FNSOF_Pos)) != 0;
+  __atomic_add_fetch(&_rm_stats.iso_incomplete_events, 1, __ATOMIC_RELAXED);
+  for (uint8_t n = 1; n < _dwc2_controller[rhport].ep_count; n++) {
+    bool abort = false;
+    rm_dcd_lock(true);
+    uint32_t ctl = dwc2->epin[n].diepctl;
+    xfer_ctl_t* xfer = XFER_CTL_BASE(n, TUSB_DIR_IN);
+    if (_rm_resetting || xfer->disabling || !xfer->max_size || !(ctl & DIEPCTL_EPENA) ||
+        (ctl & DIEPCTL_EPTYP) != DIEPCTL_EPTYP_0 ||
+        ((ctl & DIEPCTL_EONUM_DPID_Msk) != 0) != odd_now) {
+      rm_dcd_unlock(true);
+      continue;
+    }
+    if (!__atomic_load_n(&_rm_stats.first_iso_ms, __ATOMIC_RELAXED)) {
+      _rm_stats.first_iso_ep = n | TUSB_DIR_IN_MASK;
+      _rm_stats.first_iso_epctl = ctl;
+      _rm_stats.first_iso_tsiz = dwc2->epin[n].dieptsiz;
+      _rm_stats.first_iso_dsts = dwc2->dsts;
+      __atomic_store_n(&_rm_stats.first_iso_ms,
+              (uint32_t)(esp_timer_get_time() / 1000) + 1, __ATOMIC_RELEASE);
+    }
+    if (xfer->iso_retry && xfer->max_size) {
+      --xfer->iso_retry;
+      __atomic_add_fetch(&_rm_stats.iso_retries, 1, __ATOMIC_RELAXED);
+      const uint16_t packets = (xfer->total_len + xfer->max_size - 1) / xfer->max_size;
+      dwc2->epin[n].dieptsiz = (packets << DIEPTSIZ_PKTCNT_Pos) |
+              (xfer->total_len & DIEPTSIZ_XFRSIZ_Msk);
+      ctl &= ~(DIEPCTL_SD0PID_SEVNFRM_Msk | DIEPCTL_SODDFRM_Msk);
+      ctl |= odd_now ? DIEPCTL_SD0PID_SEVNFRM_Msk : DIEPCTL_SODDFRM_Msk;
+      dwc2->epin[n].diepctl = ctl;
+    } else {
+      __atomic_add_fetch(&_rm_stats.iso_aborts, 1, __ATOMIC_RELAXED);
+      xfer->disabling = true;
+      xfer->irq_was_enabled = (dwc2->daintmsk & TU_BIT(n)) != 0;
+      dwc2->daintmsk &= ~TU_BIT(n);
+      dwc2->diepempmsk &= ~(1u << n);
+      abort = true;
+    }
+    rm_dcd_unlock(true);
+    if (abort) {
+      dcd_edpt_disable(rhport, n | TUSB_DIR_IN_MASK, false, true);
+      dcd_event_xfer_complete(rhport, n | TUSB_DIR_IN_MASK, 0, XFER_RESULT_FAILED, true);
     }
   }
 }
@@ -1170,14 +1455,18 @@ void dcd_int_handler(uint8_t rhport) {
   }
 
   if (int_status & GINTSTS_SOF) {
-    dwc2->gotgint = GINTSTS_SOF;
+    dwc2->gintsts = GINTSTS_SOF;
 
-    if (_sof_en) {
+    rm_dcd_lock(true);
+    bool const sof_en = _sof_en;
+    if (!sof_en) {
+      // SOF was used for remote wakeup detection.
+      dwc2->gintmsk &= ~GINTMSK_SOFM;
+    }
+    rm_dcd_unlock(true);
+    if (sof_en) {
       uint32_t frame = (dwc2->dsts & (DSTS_FNSOF)) >> 8;
       dcd_event_sof(rhport, frame, true);
-    } else {
-      // Disable SOF interrupt if SOF was not explicitly enabled. SOF was used for remote wakeup detection
-      dwc2->gintmsk &= ~GINTMSK_SOFM;
     }
 
     dcd_event_bus_signal(rhport, DCD_EVENT_SOF, true);
@@ -1188,14 +1477,17 @@ void dcd_int_handler(uint8_t rhport) {
     // RXFLVL bit is read-only
 
     // Mask out RXFLVL while reading data from FIFO
+    rm_dcd_lock(true);
     dwc2->gintmsk &= ~GINTMSK_RXFLVLM;
+    rm_dcd_unlock(true);
 
     // Loop until all available packets were handled
     do {
       handle_rxflvl_irq(rhport);
-    } while (dwc2->gotgint & GINTSTS_RXFLVL);
+    } while (dwc2->gintsts & GINTSTS_RXFLVL);
 
     // Manage RX FIFO size
+    rm_dcd_lock(true);
     if (_out_ep_closed) {
       update_grxfsiz(rhport);
 
@@ -1204,6 +1496,7 @@ void dcd_int_handler(uint8_t rhport) {
     }
 
     dwc2->gintmsk |= GINTMSK_RXFLVLM;
+    rm_dcd_unlock(true);
   }
 
   // OUT endpoint interrupt handling.
@@ -1218,11 +1511,10 @@ void dcd_int_handler(uint8_t rhport) {
     handle_epin_irq(rhport);
   }
 
-  //  // Check for Incomplete isochronous IN transfer
-  //  if(int_status & GINTSTS_IISOIXFR) {
-  //    printf("      IISOIXFR!\r\n");
-  ////    TU_LOG(DWC2_DEBUG, "      IISOIXFR!\r\n");
-  //  }
+  if (int_status & GINTSTS_IISOIXFR) {
+    dwc2->gintsts = GINTSTS_IISOIXFR;
+    handle_incomplete_iso_in(rhport);
+  }
 }
 
 #endif
