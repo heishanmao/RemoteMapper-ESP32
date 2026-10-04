@@ -89,11 +89,15 @@ extern "C" {
 // ==========================================
 #define TASK_CORE_BLE             0         // Core 0: BLE & Audio decoding
 #define TASK_CORE_USB             1         // Core 1: TinyUSB & HID/Audio push
+#define TASK_CORE_LED             TASK_CORE_USB   // LED heartbeat follows the USB core
+#define TASK_CORE_HID_STRESS      TASK_CORE_BLE   // deliberate: submit HID from the BLE core
 
 #define PRIO_TASK_USB             6         // Real-time USB Isochronous & HID
-#define PRIO_TASK_AUDIO_DSP       5         // High-priority audio stream decoding
+#define PRIO_TASK_AUDIO_DSP       5         // Reserved: PCM decode still runs in the NimBLE host task
 #define PRIO_TASK_BLE             4         // NimBLE client processing
 #define PRIO_TASK_KEYMAP_CLI      3         // Key mapping state machine & CLI
+#define PRIO_TASK_LED             1         // LED heartbeat, lowest urgency
+#define PRIO_TASK_HID_STRESS      1         // Idle stress sender, must never outrank real work
 
 // ==========================================
 // 4. Default Keymap & Hotkey Codes

@@ -1,5 +1,6 @@
 #include "usb/uac_microphone.h"
 #include "usb/usb_composite.h"
+#include "app_config.h"
 #include "esp32-hal-tinyusb.h"
 #include "led_indicator.h"
 #include "audio/audio_pipeline.h"
@@ -395,7 +396,8 @@ bool uac_microphone_init(void) {
     }
 
     // Spawn the 500Hz TX pump.
-    if (xTaskCreatePinnedToCore(uac_push_task, "uac_push", 4096, NULL, 6, NULL, 1) != pdPASS) {
+    if (xTaskCreatePinnedToCore(uac_push_task, "uac_push", 4096, NULL, PRIO_TASK_USB, NULL,
+            TASK_CORE_USB) != pdPASS) {
         app_log("UAC", "Failed to spawn TX pump task");
     }
     esp_err_t err = tinyusb_enable_interface(USB_INTERFACE_CUSTOM, UAC_DESC_TOTAL_LEN, uac_load_descriptor);

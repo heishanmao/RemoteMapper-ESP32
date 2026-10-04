@@ -19,6 +19,15 @@
 
 key_mapper_engine_t g_key_engine;
 
+// Core placement contract. The DWC2 driver protects DIEPEMPMSK with a shared
+// spinlock because HID submissions and the USB ISR run on different cores; if
+// both ends ever land on the same core that protection stops being a
+// cross-core guarantee, so fail the build instead of losing it silently.
+static_assert(TASK_CORE_BLE != TASK_CORE_USB, "BLE and USB tasks must stay on separate cores");
+static_assert(TASK_CORE_LED == TASK_CORE_USB, "LED task follows the USB core");
+static_assert(PRIO_TASK_USB > PRIO_TASK_BLE, "USB outranks BLE");
+static_assert(PRIO_TASK_BLE > PRIO_TASK_HID_STRESS, "stress sender must not outrank BLE");
+
 // Task running on Core 0: BLE Central & Audio Decoding
 static void ble_task_core0(void* param) {
     app_log("SYSTEM", "BLE & Audio Task started on Core %d", xPortGetCoreID());

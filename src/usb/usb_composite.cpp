@@ -1,6 +1,7 @@
 #include "usb_composite.h"
 #include "hid_diagnostics.h"
 #include "uac_microphone.h"
+#include "app_config.h"
 #include "audio/audio_pipeline.h"
 #include "ble/ble_remote_client.h"
 #include "log/app_log.h"
@@ -190,7 +191,7 @@ bool usb_hid_stress_start(uint32_t seconds) {
     s_hid_stress.started_ms = millis();
     s_hid_stress_stop = false;
     const bool created = xTaskCreatePinnedToCore(hid_stress_task, "hid_stress", 3072,
-            nullptr, 1, nullptr, 0) == pdPASS;
+            nullptr, PRIO_TASK_HID_STRESS, nullptr, TASK_CORE_HID_STRESS) == pdPASS;
     if (!created) {
         s_hid_stress.active = false;
         s_hid_stress.ended_ms = millis();

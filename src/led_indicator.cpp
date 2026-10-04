@@ -1,4 +1,5 @@
 #include "led_indicator.h"
+#include "app_config.h"
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -118,7 +119,7 @@ static void led_task(void *arg) {
 
 void led_indicator_init(void) {
     update_hardware_led(LED_STATE_WAIT_CONNECTION);
-    xTaskCreatePinnedToCore(led_task, "led_task", 2048, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(led_task, "led_task", 2048, NULL, PRIO_TASK_LED, NULL, TASK_CORE_LED);
 }
 
 void led_indicator_set(led_state_t state) {
