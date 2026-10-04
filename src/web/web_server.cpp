@@ -8,6 +8,7 @@
 #include "usb/uac_microphone.h"
 #include "usb/usb_composite.h"
 #include "usb/hid_diagnostics.h"
+#include "usb/dwc2_diagnostics.h"
 #include "keymap/key_state_machine.h"
 #include "keymap/key_config_storage.h"
 #include "nvs/nvs_manager.h"
@@ -112,6 +113,21 @@ static void handle_audio() {
     doc["usb_last_complete_ms"] = tx.last_complete_ms;
     doc["usb_endpoint"] = tx.endpoint;
     doc["usb_recovery_pending"] = tx.recovery_pending;
+#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+    remotemapper_dwc2_stats_t dcd = {};
+    remotemapper_dwc2_get_stats(&dcd);
+    JsonObject controller = doc["dwc2"].to<JsonObject>();
+    controller["bus_resets"] = dcd.bus_resets;
+    controller["fifo_reset_failures"] = dcd.fifo_reset_failures;
+    controller["iso_incomplete_events"] = dcd.iso_incomplete_events;
+    controller["iso_retries"] = dcd.iso_retries;
+    controller["iso_aborts"] = dcd.iso_aborts;
+    controller["first_iso_ms"] = dcd.first_iso_ms;
+    controller["first_iso_ep"] = dcd.first_iso_ep;
+    controller["first_iso_epctl"] = dcd.first_iso_epctl;
+    controller["first_iso_tsiz"] = dcd.first_iso_tsiz;
+    controller["first_iso_dsts"] = dcd.first_iso_dsts;
+#endif
     uint32_t fifo_rearms = 0, fifo_rearm_completions = 0;
     uac_microphone_get_fifo_rearm_stats(&fifo_rearms, &fifo_rearm_completions);
     doc["usb_fifo_rearms"] = fifo_rearms;
@@ -195,6 +211,21 @@ static void handle_guard() {
     doc["usb_recoveries"] = stats.usb_recoveries;
     doc["recovery_exhausted"] = stats.recovery_exhausted;
     hid_diagnostics_json(doc["hid_diagnostics"].to<JsonObject>());
+#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+    usb_hid_stress_stats_t stress = {};
+    usb_hid_stress_get(&stress);
+    JsonObject test = doc["usb_stress"].to<JsonObject>();
+    test["active"] = stress.active;
+    test["user_aborted"] = stress.user_aborted;
+    test["test_id"] = stress.test_id;
+    test["duration_ms"] = stress.duration_ms;
+    test["started_ms"] = stress.started_ms;
+    test["ended_ms"] = stress.ended_ms;
+    test["attempted"] = stress.attempted;
+    test["completed"] = stress.completed;
+    test["failed"] = stress.failed;
+    test["stop_reason"] = stress.stop_reason;
+#endif
     String out;
     serializeJson(doc, out);
     s_server.send(200, "application/json", out);

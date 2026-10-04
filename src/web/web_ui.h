@@ -48,6 +48,15 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         .stat-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; padding: 14px 18px; }
         .stat-title { font-size: 12px; color: var(--text-muted); margin-bottom: 4px; }
         .stat-val { font-size: 18px; font-weight: 700; color: #fff; }
+        .wifi-status-row { display:flex; align-items:center; gap:8px; margin-bottom:2px; font-size:12px; color:var(--text-muted); }
+        .wifi-status-row > #stat-sta-ssid { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .wifi-power-toggle { display:flex; align-items:center; flex:none; gap:6px; font-size:11px; color:var(--text-muted); white-space:nowrap; cursor:pointer; }
+        .wifi-power-toggle input { appearance:none; position:relative; width:30px; height:16px; flex:none; border:1px solid var(--border-color); border-radius:999px; background:#334155; cursor:pointer; transition:background .15s; }
+        .wifi-power-toggle input::before { content:''; position:absolute; top:1px; left:1px; width:12px; height:12px; border-radius:50%; background:#fff; transition:transform .15s; }
+        .wifi-power-toggle input:checked { background:var(--accent-cyan); border-color:var(--accent-cyan); }
+        .wifi-power-toggle input:checked::before { transform:translateX(14px); }
+        .wifi-power-toggle input:focus-visible { outline:2px solid var(--accent-cyan); outline-offset:3px; }
+        .wifi-power-toggle input:disabled { opacity:.5; cursor:wait; }
 
         /* Real Xiaomi Silver Metallic Remote Visualizer */
         .remote-tester-container { display: flex; gap: 36px; align-items: flex-start; justify-content: center; flex-wrap: wrap; padding: 10px 0; }
@@ -288,6 +297,16 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             box-shadow: 0 0 12px rgba(168, 85, 247, 0.9), inset 0 0 6px rgba(168, 85, 247, 0.7) !important;
             border: 2px solid #c084fc !important;
         }
+
+        .settings-columns { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:20px; align-items:start; }
+        .settings-column { min-width:0; }
+        @media(max-width:768px) { .settings-columns { grid-template-columns:minmax(0,1fr); } }
+        .settings-intro { margin-bottom:18px; }
+        .settings-intro strong { font-size:18px; }
+        .settings-intro p, .settings-note { font-size:12px; color:var(--text-muted); line-height:1.7; margin-top:6px; }
+        .diagnostics-tools { border:1px solid var(--border-color); border-radius:var(--radius-card); padding:18px; }
+        .diagnostics-tools > summary { cursor:pointer; font-size:14px; font-weight:600; color:var(--text-main); }
+        .diagnostics-tools > .card:last-child { margin-bottom:0; }
     </style>
 </head>
 <body>
@@ -310,22 +329,18 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                     <span id="stat-ble-bat" style="font-weight: 600; color: var(--accent-green);">--</span>
                 </div>
             </div>
-            <div class="stat-card">
-                <div class="stat-title">Wi-Fi 局域网 IP / 域名</div>
-                <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" id="stat-sta-ssid" title="">未连接</div>
-                <div class="stat-val" id="stat-sta-ip">--</div>
-                <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px; display: flex; justify-content: space-between; align-items: center;" id="stat-ap-status">
-                    <span id="stat-ap-badge">热点: 192.168.4.1</span>
-                    <a href="http://remotemapper.local" target="_blank" style="color: var(--accent-cyan); text-decoration: none; font-size: 11px;">域名访问 ↗</a>
+            <div class="stat-card" id="wifi-status-card" role="group" aria-label="Wi-Fi 状态">
+                <div class="wifi-status-row">
+                    <span id="stat-sta-ssid" title="">Wi-Fi 未连接</span>
+                    <label class="wifi-power-toggle" title="空闲时自动关闭 Wi-Fi，保留原有休眠时长">
+                        <span>空闲休眠</span>
+                        <input type="checkbox" role="switch" id="wifi-pwr-mode" onchange="applyWifiPowerMode(this.checked)" disabled>
+                    </label>
                 </div>
-                <div style="font-size: 12px; color: var(--text-muted); margin-top: 6px; display: flex; align-items: center; gap: 6px;">
-                    <span style="white-space: nowrap;">空闲自动关</span>
-                    <select id="wifi-pwr-mode" onchange="applyWifiPowerMode(this.value)"
-                            style="flex:1; min-width:0; background:#0b0f17; border:1px solid var(--border-color); color:var(--text-main); border-radius:6px; padding:3px 6px; font-size:11px; outline:none; cursor:pointer;">
-                        <option value="off">永久连接</option>
-                        <option value="1">1 分钟后</option>
-                        <option value="2">2 分钟后</option>
-                    </select>
+                <div class="stat-val" id="stat-sta-ip">--</div>
+                <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px; display: flex; justify-content: space-between; align-items: center; gap: 8px;" id="stat-ap-status">
+                    <span id="stat-ap-badge" style="min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis">热点: 192.168.4.1</span>
+                    <a href="http://remotemapper.local" target="_blank" style="color: var(--accent-cyan); text-decoration: none; font-size: 11px; flex:none">域名访问 ↗</a>
                 </div>
             </div>
             <div class="stat-card">
@@ -341,11 +356,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         </div>
 
         <div class="tabs">
-            <button class="tab-btn active" onclick="switchTab('tab-tester')">遥控器与改键测试</button>
-            <button class="tab-btn" onclick="switchTab('tab-ble')">蓝牙配对管理</button>
-            <button class="tab-btn" onclick="switchTab('tab-logs')">运行日志</button>
-            <button class="tab-btn" onclick="switchTab('tab-config')">配置管理</button>
-            <button class="tab-btn" onclick="switchTab('tab-wifi')">Wi-Fi 与系统配置</button>
+            <button class="tab-btn active" data-tab="tab-tester" onclick="switchTab('tab-tester')">遥控器与改键测试</button>
+            <button class="tab-btn" data-tab="tab-ble" onclick="switchTab('tab-ble')">蓝牙配对管理</button>
+            <button class="tab-btn" data-tab="tab-logs" onclick="switchTab('tab-logs')">诊断与日志</button>
+            <button class="tab-btn" data-tab="tab-config" onclick="switchTab('tab-config')">备份与恢复</button>
+            <button class="tab-btn" data-tab="tab-wifi" onclick="switchTab('tab-wifi')">系统设置</button>
         </div>
 
         <!-- TAB 1: Key Tester & Remapper Visualizer -->
@@ -557,24 +572,67 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             </div>
         </div>
 
-        <!-- TAB 3: Runtime Logs -->
+        <!-- TAB 3: Runtime Logs and Diagnostics -->
         <div id="tab-logs" class="tab-content">
-            <div class="card">
-                <div class="card-header">
+            <div class="settings-intro"><strong>诊断与日志</strong><p>先查看运行事件，再根据需要打开高级诊断工具。这里不负责备份或恢复配置。</p></div>
+<div class="card">
+                <div class="card-header" style="flex-wrap:wrap;gap:10px">
                     <span>实时运行日志</span>
-                    <div style="display: flex; gap: 8px;">
+                    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><label style="font-size:12px;color:var(--text-muted);display:flex;align-items:center;gap:5px"><input id="logs-auto-refresh" type="checkbox" checked>自动刷新</label>
                         <button class="btn btn-outline" style="font-size: 12px;" onclick="refreshLogs()">刷新</button>
-                        <button class="btn btn-outline" style="font-size: 12px;" onclick="clearLogs()">清空</button>
+                        <button class="btn btn-outline" style="font-size: 12px;" onclick="copyRuntimeLogs()">复制</button>
+                        <button class="btn btn-outline" style="font-size:12px" onclick="exportRuntimeLogs()">导出</button>
+                        <button class="btn btn-outline" style="font-size:12px" onclick="clearLogs()">清空</button>
                     </div>
                 </div>
-                <div class="log-terminal" id="log-terminal">正在加载运行日志...</div>
+                <p class="settings-note" style="margin-bottom:12px">仅在本页可见且开启自动刷新时轮询。向上查看旧日志时保留滚动位置。</p>
+                <div class="log-terminal" id="log-terminal" tabindex="0" aria-label="运行日志内容">正在加载运行日志...</div>
             </div>
+            <details class="diagnostics-tools">
+                <summary>高级诊断：只读配置与蓝牙 GATT 探测</summary>
+                <p class="settings-note" style="margin:12px 0">按需查看配置快照或手动探测蓝牙服务；展开此区域不会自动启动 GATT 探测。</p>
+<div class="card">
+                <details id="nvs-debug-details" ontoggle="onNvsDebugToggle(this)">
+                    <summary style="font-size: 15px; font-weight: 600; color: var(--text-main); user-select: none; display: flex; align-items: center; justify-content: space-between; outline: none; cursor: pointer;">
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <span id="nvs-details-arrow" style="font-size: 12px; color: var(--text-muted); display: inline-block; width: 16px;">▶</span>
+                            <span>只读调试查看（仅查看纯文本格式的 NVS 内部数据）</span>
+                            <span class="badge" style="font-size: 11px; padding: 2px 8px;">纯只读</span>
+                        </div>
+                        <span style="font-size: 12px; color: var(--text-muted); font-weight: normal;">点击展开 / 折叠</span>
+                    </summary>
+                    <div style="margin-top: 16px; border-top: 1px solid var(--border-color); padding-top: 14px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 8px;">
+                            <div style="font-size: 12px; color: var(--text-muted);">
+                                当前 ESP32 Flash NVS 中读取到的内部键值快照（含底层驱动与系统数据）。该区域严格只读，不允许直接修改或回写。
+                            </div>
+                            <div style="display: flex; gap: 8px;">
+                                <button class="btn btn-outline" style="font-size: 12px; padding: 6px 12px;" onclick="loadNvsReadOnly(true)">刷新只读数据</button>
+                                <button class="btn btn-outline" style="font-size: 12px; padding: 6px 12px;" onclick="copyNvsReadOnly()">复制到剪贴板</button>
+                            </div>
+                        </div>
+                        <pre id="nvs-readonly-viewer" class="log-terminal" style="height: 380px; white-space: pre-wrap; word-break: break-all; background: #070a10; color: #38bdf8; border: 1px solid var(--border-color); border-radius: 8px; padding: 14px; font-family: 'Fira Code', Consolas, monospace; font-size: 12px; line-height: 1.5;">点击上方展开即可加载 NVS 内部数据快照...</pre>
+                    </div>
+                </details>
+            </div>
+<div class="card">
+                        <div class="card-header">
+                            <span>🧬 GATT 全量探测 (探索)</span>
+                            <span id="gatt-state" style="font-size: 12px; padding: 2px 8px; border-radius: 6px; background: rgba(100,116,139,0.15); color: var(--text-muted); border: 1px solid rgba(100,116,139,0.3);">关闭</span>
+                        </div>
+                        <p style="font-size: 13px; color: var(--text-muted); line-height: 1.6;">
+                            开启后，每次连上遥控器自动跑一次<strong>完整 GATT 枚举</strong>：逐个服务的特征 / 属性 / 可读数值 / 描述符，覆盖 <code style="color:var(--accent-cyan);">0x180A</code> 设备信息（型号/固件版本）、HID Report Map（<code style="color:var(--accent-cyan);">0x2A4A</code>）与三个未解密服务 <code style="color:var(--accent-cyan);">0xfe59 / 0x01bf / 8a7a0001</code>。结果写入「运行日志」<code style="color:var(--accent-cyan);">GATTX</code> 行。<br>
+                            探测需遥控器保持连接（先按任一键唤醒）；排查时手动开启，完成后关闭。结果在本页运行日志中查看。
+                        </p>
+                        <button class="btn" style="width: 100%;" id="gatt-btn" onclick="toggleGattDump()">开启 GATT 全量探测</button>
+                    </div>
+            </details>
         </div>
 
-        <!-- TAB 4: Configuration Management -->
+        <!-- TAB 4: Configuration Backup and Restore -->
         <div id="tab-config" class="tab-content">
-            <!-- Section 1 & 2: Keymap Backup & Import -->
-            <div class="card">
+            <div class="settings-intro"><strong>备份与恢复</strong><p>管理配置文件。日常参数在系统设置中修改，运行记录在诊断与日志中查看。</p></div>
+<div class="card">
                 <div class="card-header">
                     <div>
                         <span style="font-size: 16px;">按键映射与层级配置备份</span>
@@ -610,9 +668,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                     </div>
                 </div>
             </div>
-
-            <!-- Config Backup / Restore (full system, incl. WiFi) -->
-            <div class="card">
+<div class="card">
                 <div class="card-header">
                     <div>
                         <span style="font-size: 16px;">系统配置备份与恢复</span>
@@ -661,32 +717,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                     </div>
                 </div>
             </div>
+            <p class="settings-note">恢复默认按键映射位于“遥控器与改键测试”。下方出厂重置会清空配置，与从备份文件恢复不同。</p>
 
-            <!-- Section 3: Reset Operations -->
-            <div class="card">
-                <div class="card-header">
-                    <div>
-                        <span style="font-size: 16px;">配置重置与清空</span>
-                        <div style="font-size: 12px; color: var(--text-muted); font-weight: normal; margin-top: 4px;">
-                            提供按键层级单独重置与系统出厂完全重置两种方式，请仔细区分后执行。
-                        </div>
-                    </div>
-                </div>
-                <div class="grid-2">
-                    <div style="background: #090d16; border: 1px solid rgba(245, 158, 11, 0.35); border-radius: 12px; padding: 18px; display: flex; flex-direction: column; justify-content: space-between;">
-                        <div>
-                            <b style="color: #fbbf24; font-size: 14px; display: block; margin-bottom: 8px;">清空按键映射与层级数据</b>
-                            <p style="font-size: 13px; color: var(--text-muted); line-height: 1.6;">
-                                将所有 5 个层级的自定义映射规则恢复为出厂默认。<br>
-                                <span style="color: #34d399;">保留所有 Wi-Fi 密码、AP 设置以及已绑定的蓝牙遥控器连接。</span>
-                            </p>
-                        </div>
-                        <div style="margin-top: 16px;">
-                            <button class="btn btn-outline" style="font-size: 13px; width: 100%; color: #fbbf24; border-color: rgba(245, 158, 11, 0.4);" onclick="resetKeymapOnly()">清空按键映射（保留蓝牙与WiFi配置）</button>
-                        </div>
-                    </div>
-
-                    <div style="background: #090d16; border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 12px; padding: 18px; display: flex; flex-direction: column; justify-content: space-between;">
+            <div class="card" style="border-color:rgba(239,68,68,.35)"><div class="card-header"><span>恢复出厂设置</span></div>
+<div style="background: #090d16; border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 12px; padding: 18px; display: flex; flex-direction: column; justify-content: space-between;">
                         <div>
                             <b style="color: #f87171; font-size: 14px; display: block; margin-bottom: 8px;">清空全部 NVS 数据（出厂完全重置）</b>
                             <p style="font-size: 13px; color: var(--text-muted); line-height: 1.6;">
@@ -699,41 +733,15 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                         </div>
                     </div>
                 </div>
-            </div>
-
-            <!-- Section 4: Read-Only Debug Viewer -->
-            <div class="card">
-                <details id="nvs-debug-details" ontoggle="onNvsDebugToggle(this)">
-                    <summary style="font-size: 15px; font-weight: 600; color: var(--text-main); user-select: none; display: flex; align-items: center; justify-content: space-between; outline: none; cursor: pointer;">
-                        <div style="display: flex; align-items: center; gap: 8px;">
-                            <span id="nvs-details-arrow" style="font-size: 12px; color: var(--text-muted); display: inline-block; width: 16px;">▶</span>
-                            <span>只读调试查看（仅查看纯文本格式的 NVS 内部数据）</span>
-                            <span class="badge" style="font-size: 11px; padding: 2px 8px;">纯只读</span>
-                        </div>
-                        <span style="font-size: 12px; color: var(--text-muted); font-weight: normal;">点击展开 / 折叠</span>
-                    </summary>
-                    <div style="margin-top: 16px; border-top: 1px solid var(--border-color); padding-top: 14px;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 8px;">
-                            <div style="font-size: 12px; color: var(--text-muted);">
-                                当前 ESP32 Flash NVS 中读取到的内部键值快照（含底层驱动与系统数据）。该区域严格只读，不允许直接修改或回写。
-                            </div>
-                            <div style="display: flex; gap: 8px;">
-                                <button class="btn btn-outline" style="font-size: 12px; padding: 6px 12px;" onclick="loadNvsReadOnly(true)">刷新只读数据</button>
-                                <button class="btn btn-outline" style="font-size: 12px; padding: 6px 12px;" onclick="copyNvsReadOnly()">复制到剪贴板</button>
-                            </div>
-                        </div>
-                        <pre id="nvs-readonly-viewer" class="log-terminal" style="height: 380px; white-space: pre-wrap; word-break: break-all; background: #070a10; color: #38bdf8; border: 1px solid var(--border-color); border-radius: 8px; padding: 14px; font-family: 'Fira Code', Consolas, monospace; font-size: 12px; line-height: 1.5;">点击上方展开即可加载 NVS 内部数据快照...</pre>
-                    </div>
-                </details>
-            </div>
         </div>
 
-        <!-- TAB 5: Wi-Fi & System -->
+        <!-- TAB 5: Network, Protection and System Maintenance -->
         <div id="tab-wifi" class="tab-content">
-            <div class="grid-2">
-                <div class="card">
+            <div class="settings-intro"><strong>系统设置</strong><p>Wi-Fi 与配网、热点配置在左侧，其余设置在右侧，直接滚动查看。</p></div>
+            <div class="settings-columns">
+                <div class="settings-column"><div class="card">
                     <div class="card-header">
-                        <span>Wi-Fi 网络配置</span>
+                        <span>Wi-Fi 与配网</span>
                         <button class="btn btn-outline" style="font-size: 12px;" onclick="scanWifiNetworks()">搜索 Wi-Fi</button>
                     </div>
 
@@ -762,10 +770,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                     </div>
                     <button class="btn" style="width: 100%; margin-top:16px;" onclick="saveWifi()">保存并连接 Wi-Fi</button>
                 </div>
-
-                <div style="display: flex; flex-direction: column; gap: 20px;">
-                    <div class="card">
-                        <div class="card-header">
+                <div class="card"><div class="card-header">
                             <span>AP 热点配置</span>
                             <div style="display: flex; gap: 6px; align-items: center;">
                                 <span id="ap-state-badge" style="font-size: 12px; padding: 2px 8px; border-radius: 6px; background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.3);">运行中</span>
@@ -785,18 +790,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                             <span style="color: #34d399;">★ 提示：STA 连上路由器后热点将自动关闭以降低功耗；断网 15 秒后自动恢复广播。</span>
                         </div>
                         <button class="btn" style="width: 100%; margin-top:14px;" onclick="saveApConfig()">保存 AP 配置</button>
-                    </div>
-
-
-                    <div class="card">
-                        <div class="card-header"><span>系统控制</span></div>
-                        <p style="font-size: 14px; color: var(--text-muted); margin-bottom: 20px;">
-                            当前固件支持 UAC 1.0 USB 麦克风录音设备与标准 HID 键盘/多媒体复合注入。
-                        </p>
-                        <button class="btn btn-danger" style="width: 100%;" onclick="restartDevice()">重启设备</button>
-                    </div>
-
-                    <div class="card">
+                </div></div>
+                <div class="settings-column"><div class="card">
                         <div class="card-header">
                             <span>🛡️ 防卡键自动释放 (可靠性保护)</span>
                             <span id="guard-last" style="font-size:11px; color:var(--text-muted); background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.3); padding:3px 10px; border-radius:999px;">--</span>
@@ -812,7 +807,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                                 <input type="number" id="guard-key" min="0" max="3600" value="60" style="width:100%; padding:8px 10px; background:#151d2a; border:1px solid #243247; color:#fff; border-radius:8px; font-size:13px; outline:none;">
                             </div>
                             <div>
-                                <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">语音最长录音 (分钟, 0=关闭)</label>
+                                <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">桥接器语音保护上限 (分钟, 0=关闭)</label>
                                 <input type="number" id="guard-voice" min="0" max="120" value="15" style="width:100%; padding:8px 10px; background:#151d2a; border:1px solid #243247; color:#fff; border-radius:8px; font-size:13px; outline:none;">
                             </div>
                             <div style="display:flex; align-items:flex-end;">
@@ -820,11 +815,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                             </div>
                         </div>
                         <div style="font-size:11px; color:var(--text-muted); margin-top:10px; line-height:1.6; border-top:1px dashed #243247; padding-top:8px;">
-                            语音不受普通按键超时限制。正常松手即结束；连续 5 秒未收到蓝牙音频数据，或达到所设录音上限时自动结束并释放按键。安静和说话停顿不会触发数据超时；上限设为 0 仍保留失联保护。
+                            语音不受普通按键超时限制。正常松手即结束；连续 5 秒未收到蓝牙音频数据，或达到所设保护上限时自动结束并释放按键。安静和说话停顿不会触发数据超时；上限设为 0 仍保留失联保护。<br><strong style="color:var(--accent-cyan)">当前遥控器单次录音最多 60 秒，到时自动断流；这里的保护上限不能延长遥控器录音。</strong>
                         </div>
                     </div>
-
-                    <div class="card">
+<div class="card">
                         <div class="card-header">
                             <span>固件升级 (OTA)</span>
                             <span id="ota-mode-badge" style="font-size: 11px; padding: 2px 8px; border-radius: 6px; background: rgba(16,185,129,0.15); color: var(--accent-green); border: 1px solid rgba(16,185,129,0.3);">在线升级</span>
@@ -851,19 +845,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                             ⚠️ 升级期间请勿断电、勿关闭本页面，保持与设备处于同一网络。写入完成后设备自动重启并恢复服务（约 20~40 秒）。升级失败不影响当前运行的固件。
                         </div>
                     </div>
-
-                    <div class="card">
-                        <div class="card-header">
-                            <span>🧬 GATT 全量探测 (探索)</span>
-                            <span id="gatt-state" style="font-size: 12px; padding: 2px 8px; border-radius: 6px; background: rgba(100,116,139,0.15); color: var(--text-muted); border: 1px solid rgba(100,116,139,0.3);">关闭</span>
-                        </div>
-                        <p style="font-size: 13px; color: var(--text-muted); line-height: 1.6;">
-                            开启后，每次连上遥控器自动跑一次<strong>完整 GATT 枚举</strong>：逐个服务的特征 / 属性 / 可读数值 / 描述符，覆盖 <code style="color:var(--accent-cyan);">0x180A</code> 设备信息（型号/固件版本）、HID Report Map（<code style="color:var(--accent-cyan);">0x2A4A</code>）与三个未解密服务 <code style="color:var(--accent-cyan);">0xfe59 / 0x01bf / 8a7a0001</code>。结果写入「运行日志」<code style="color:var(--accent-cyan);">GATTX</code> 行。<br>
-                            探测需遥控器保持连接（先按任一键唤醒）；期间按键 / 语音不受影响。测完关闭。
+<div class="card">
+                        <div class="card-header"><span>系统控制</span></div>
+                        <p style="font-size: 14px; color: var(--text-muted); margin-bottom: 20px;">
+                            当前固件支持 UAC 1.0 USB 麦克风录音设备与标准 HID 键盘/多媒体复合注入。
                         </p>
-                        <button class="btn" style="width: 100%;" id="gatt-btn" onclick="toggleGattDump()">开启 GATT 全量探测</button>
+                        <button class="btn btn-danger" style="width: 100%;" onclick="restartDevice()">重启设备</button>
                     </div>
-                </div>
+</div>
             </div>
         </div>
     </div>
@@ -1410,16 +1399,16 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         }
 
         function switchTab(id) {
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            if (event && event.target) event.target.classList.add('active');
             const targetEl = document.getElementById(id);
-            if (targetEl) targetEl.classList.add('active');
-            if (id === 'tab-ble') {
-                refreshBleInfo();
-            } else if (id === 'tab-logs') {
-                refreshLogs();
-            }
+            if (!targetEl || !targetEl.classList.contains('tab-content')) return;
+            document.querySelectorAll('.tabs > .tab-btn[data-tab]').forEach(b => {
+                const active = b.dataset.tab === id;
+                b.classList.toggle('active', active);
+                b.setAttribute('aria-selected', String(active));
+            });
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c === targetEl));
+            if (id === 'tab-ble') refreshBleInfo();
+            else if (id === 'tab-logs') refreshLogs();
         }
 
         async function fetchStatus() {
@@ -1427,13 +1416,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 const res = await fetch('/api/status');
                 const d = await res.json();
                 document.getElementById('top-status').innerHTML = `固件: ${d.version} | 运行: ${d.uptime_sec}s | IP: ${d.sta_ip}`;
-                document.getElementById('stat-sta-ip').innerText = d.sta_ip;
+                document.getElementById('stat-sta-ip').innerText = d.sta_connected && d.sta_ip ? d.sta_ip : '--';
                 const ssidEl = document.getElementById('stat-sta-ssid');
                 if (ssidEl) {
                     const ssid = d.sta_connected ? (d.sta_ssid || '') : '';
-                    ssidEl.innerText = ssid ? `${ssid} · ${d.sta_rssi} dBm` : '未连接';
+                    ssidEl.innerText = ssid || 'Wi-Fi 未连接';
                     ssidEl.style.color = ssid ? 'var(--text-muted)' : '#f87171';
-                    ssidEl.title = ssid || '';
+                    ssidEl.title = ssid ? `${ssid} · ${d.sta_rssi} dBm` : '未连接路由器';
                 }
                 document.getElementById('stat-uptime').innerText = `${d.uptime_sec}s`;
                 document.getElementById('stat-audio-frames').innerText = `${d.frames_decoded} 帧`;
@@ -1442,12 +1431,15 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 await refreshBleInfo();
 
                 const apBadgeEl = document.getElementById('stat-ap-badge');
-                if (apBadgeEl && d.ap_ip) {
+                if (apBadgeEl) {
                     if (d.ap_running) {
-                        apBadgeEl.innerText = `热点: ${d.ap_ip} (${d.ap_secured ? 'WPA2' : '开放'})`;
+                        apBadgeEl.innerText = d.ap_ip ? `热点: ${d.ap_ip} (${d.ap_secured ? 'WPA2' : '开放'})` : '热点运行中';
                         apBadgeEl.style.color = 'var(--text-muted)';
+                        apBadgeEl.title = apBadgeEl.innerText;
                     } else {
-                        apBadgeEl.innerHTML = `<span style="color: #34d399;">🍃 热点已休眠(省电)</span>`;
+                        apBadgeEl.innerText = '🍃 热点已省电';
+                        apBadgeEl.style.color = '#34d399';
+                        apBadgeEl.title = '热点已关闭以降低功耗';
                     }
                 }
 
@@ -2643,10 +2635,7 @@ if (mod & 0x01) chips.push('左Ctrl');
         }
 
         async function resetAllKeymaps() {
-            if (!confirm('确定要将所有层级的按键映射与属性恢复为默认值吗？')) return;
-            await fetch('/api/keymap/reset', { method: 'POST' });
-            await loadKeymap();
-            showToast('已恢复出厂默认层级映射');
+            return resetKeymapOnly();
         }
 
         async function refreshBleInfo() {
@@ -2889,9 +2878,24 @@ if (mod & 0x01) chips.push('左Ctrl');
                 const res = await fetch('/api/logs');
                 const d = await res.json();
                 const terminal = document.getElementById('log-terminal');
+                const followBottom = terminal.scrollHeight - terminal.scrollTop - terminal.clientHeight < 24;
                 terminal.innerText = d.logs.join('\n');
-                terminal.scrollTop = terminal.scrollHeight;
+                if (followBottom) terminal.scrollTop = terminal.scrollHeight;
             } catch(e){}
+        }
+
+        async function copyRuntimeLogs() {
+            const terminal = document.getElementById('log-terminal');
+            try { await navigator.clipboard.writeText(terminal.innerText); showToast('运行日志已复制'); }
+            catch (e) { showToast('无法访问剪贴板，请选中日志手动复制', true); }
+        }
+
+        function exportRuntimeLogs() {
+            const text = document.getElementById('log-terminal').innerText;
+            const url = URL.createObjectURL(new Blob([text], { type:'text/plain;charset=utf-8' }));
+            const link = document.createElement('a');
+            link.href = url; link.download = 'RemoteMapper-logs.txt'; link.click();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
         }
 
         async function clearLogs() {
@@ -3273,50 +3277,58 @@ if (mod & 0x01) chips.push('左Ctrl');
         }
 
         // ---- Wi-Fi 空闲自动关闭 (/api/power) ----
-        // One control, three states. Maps onto the existing switch + minutes so
-        // every change applies immediately (no reboot, unlike the policy field).
-        const WIFI_PWR_MODES = ['off', '1', '2'];
+        let wifiPowerSaving = false;
+        let wifiPowerRevision = 0;
 
         function renderWifiPowerMode(d) {
-            const sel = document.getElementById('wifi-pwr-mode');
-            if (!sel) return;
-            if (document.activeElement === sel) return;
-            let v = 'off';
-            if (d.timeout_enabled === true && WIFI_PWR_MODES.indexOf(String(d.timeout_min)) >= 0) {
-                v = String(d.timeout_min);
-            }
-            sel.value = v;
+            const toggle = document.getElementById('wifi-pwr-mode');
+            if (!toggle) return;
+            toggle.checked = d.timeout_enabled === true;
+            toggle.closest('label').title = d.timeout_min > 0
+                ? `空闲休眠时长：${d.timeout_min} 分钟`
+                : '当前休眠时长设置为不自动关闭';
+            if (!wifiPowerSaving) toggle.disabled = false;
         }
 
         async function loadWifiPowerMode() {
+            const revision = wifiPowerRevision;
             try {
-                renderWifiPowerMode(await (await fetch('/api/power')).json());
+                const res = await fetch('/api/power');
+                if (!res.ok) return;
+                const d = await res.json();
+                if (!wifiPowerSaving && revision === wifiPowerRevision) renderWifiPowerMode(d);
             } catch (e) {}
         }
 
-        async function applyWifiPowerMode(v) {
-            const sel = document.getElementById('wifi-pwr-mode');
-            const body = (v === 'off')
-                ? { timeout_enabled: false }
-                : { timeout_enabled: true, timeout_min: parseInt(v, 10) };
+        async function applyWifiPowerMode(enabled) {
+            const toggle = document.getElementById('wifi-pwr-mode');
+            if (wifiPowerSaving) return;
+            wifiPowerSaving = true;
+            wifiPowerRevision++;
+            if (toggle) toggle.disabled = true;
+            let failed = false;
             try {
                 const res = await fetch('/api/power', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(body)
+                    // Toggle only; keep the device's existing idle duration.
+                    body: JSON.stringify({ timeout_enabled: enabled })
                 });
+                const d = await res.json().catch(() => ({}));
                 if (!res.ok) {
-                    const d = await res.json().catch(() => ({}));
-                    showToast('设置失败: ' + (d.error || res.status), true);
-                    if (sel) loadWifiPowerMode();
-                    return;
+                    throw new Error(d.error || res.status);
                 }
-                showToast(v === 'off' ? 'Wi-Fi 将保持连接，不再因空闲自动关闭'
-                                      : `Wi-Fi 空闲 ${v} 分钟后自动关闭`);
+                renderWifiPowerMode(d);
+                showToast(d.timeout_enabled ? '已开启空闲休眠' : '已关闭空闲休眠');
             } catch (e) {
+                failed = true;
+                if (toggle) toggle.checked = !enabled;
                 showToast('设置失败: ' + e.message, true);
-                if (sel) loadWifiPowerMode();
+            } finally {
+                wifiPowerSaving = false;
+                if (toggle) toggle.disabled = false;
             }
+            if (failed) await loadWifiPowerMode();
         }
 
         async function loadGattDumpState() {
@@ -3375,7 +3387,11 @@ if (mod & 0x01) chips.push('左Ctrl');
         setInterval(fetchKeyTelemetry, 100);
         setInterval(fetchStatus, 3000);
         setInterval(loadWifiPowerMode, 8000);
-        setInterval(refreshLogs, 2000);
+        setInterval(() => {
+            const tab = document.getElementById('tab-logs');
+            const auto = document.getElementById('logs-auto-refresh');
+            if (!document.hidden && tab.classList.contains('active') && auto.checked) refreshLogs();
+        }, 2000);
         loadGuardSettings();
         loadWifiPowerMode();
         loadGattDumpState();
