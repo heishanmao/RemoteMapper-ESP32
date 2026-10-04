@@ -9,6 +9,7 @@
 #include "usb/usb_composite.h"
 #include "usb/hid_diagnostics.h"
 #include "usb/dwc2_diagnostics.h"
+#include "core_diagnostics.h"
 #include "keymap/key_state_machine.h"
 #include "keymap/key_config_storage.h"
 #include "nvs/nvs_manager.h"
@@ -182,6 +183,15 @@ static void handle_audio() {
     rawStr += "]";
     doc["spec_raw"] = rawStr;
 
+    String out;
+    serializeJson(doc, out);
+    s_server.send(200, "application/json", out);
+}
+
+static void handle_cores() {
+    wifi_manager_mark_activity();
+    JsonDocument doc;
+    core_diagnostics_json(doc.as<JsonObject>());
     String out;
     serializeJson(doc, out);
     s_server.send(200, "application/json", out);
@@ -785,6 +795,7 @@ void web_server_init(void) {
     s_server.on("/api/audio", HTTP_GET, handle_audio);
     s_server.on("/api/audio/resample", HTTP_GET,  handle_audio_resample);
     s_server.on("/api/audio/resample", HTTP_POST, handle_audio_resample);
+    s_server.on("/api/cores", HTTP_GET, handle_cores);
     s_server.on("/api/guard", HTTP_GET, handle_guard);
     s_server.on("/api/guard", HTTP_POST, handle_guard_set);
     s_server.on("/api/debug/gatt-dump", HTTP_GET, handle_gatt_dump_get);

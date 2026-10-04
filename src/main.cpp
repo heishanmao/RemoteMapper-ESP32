@@ -7,6 +7,7 @@
 #include "audio/audio_pipeline.h"
 #include "keymap/key_state_machine.h"
 #include "keymap/key_config_storage.h"
+#include "core_diagnostics.h"
 #include "usb/usb_composite.h"
 #include "ble/ble_remote_client.h"
 #include "cli/cli_manager.h"
@@ -107,15 +108,17 @@ void setup() {
     }
 
     // 8. Launch BLE Central Task pinned to Core 0
+    TaskHandle_t ble_task = nullptr;
     xTaskCreatePinnedToCore(
         ble_task_core0,
         "ble_audio_task",
         8192,
         NULL,
         PRIO_TASK_BLE,
-        NULL,
+        &ble_task,
         TASK_CORE_BLE
     );
+    core_diagnostics_register("ble_audio_task", ble_task, TASK_CORE_BLE);
 
     if (wifi_manager_get_enabled()) {
         app_log("SYSTEM", "System initialization complete. Web available at http://192.168.4.1 or http://remotemapper.local");
