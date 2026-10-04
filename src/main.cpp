@@ -28,6 +28,12 @@ static_assert(TASK_CORE_LED == TASK_CORE_USB, "LED task follows the USB core");
 static_assert(PRIO_TASK_USB > PRIO_TASK_BLE, "USB outranks BLE");
 static_assert(PRIO_TASK_BLE > PRIO_TASK_HID_STRESS, "stress sender must not outrank BLE");
 
+// loopTask carries TinyUSB, Wi-Fi, the web server and the CLI. Its core comes
+// from the framework's generated sdkconfig (CONFIG_ARDUINO_RUNNING_CORE) rather
+// than this project, so check it here: a framework-side default flip would
+// otherwise move all of that traffic onto the BLE core unnoticed.
+static_assert(ARDUINO_RUNNING_CORE == TASK_CORE_USB, "Arduino loopTask must run on the USB core");
+
 // Task running on Core 0: BLE Central & Audio Decoding
 static void ble_task_core0(void* param) {
     app_log("SYSTEM", "BLE & Audio Task started on Core %d", xPortGetCoreID());
