@@ -182,6 +182,12 @@ static void emit_action_as_tap_if_hold(key_mapper_engine_t *engine, const key_ac
     } else if (action->type == ACTION_CONSUMER_HOLD) {
         key_action_t tap = { ACTION_CONSUMER_TAP, 0, 0, action->consumer_code, 0 };
         emit_action(engine, &tap, source_vk, false);
+    } else if (action->type == ACTION_VOICE_HOLD) {
+        // This path runs after the physical key was released (click or
+        // delayed single-click resolution), so a voice hold cannot be paired
+        // with a later physical release. Preserve its hotkey as a bounded tap.
+        key_action_t tap = { ACTION_KEYBOARD_TAP, action->modifier, action->key_code, 0, 0 };
+        emit_action(engine, &tap, source_vk, false);
     } else {
         emit_action(engine, action, source_vk, false);
     }
@@ -568,6 +574,9 @@ void key_engine_feed_key(key_mapper_engine_t *engine, uint8_t raw_key_code, bool
                         emit_action(engine, &rel, raw_key_code, false);
                     } else if (b.long_action.type == ACTION_CONSUMER_HOLD) {
                         key_action_t rel = { ACTION_CONSUMER_RELEASE, 0, 0, 0, 0 };
+                        emit_action(engine, &rel, raw_key_code, false);
+                    } else if (b.long_action.type == ACTION_VOICE_HOLD) {
+                        key_action_t rel = { ACTION_VOICE_RELEASE, 0, 0, 0, 0 };
                         emit_action(engine, &rel, raw_key_code, false);
                     }
                 } else if (b.has_click) {

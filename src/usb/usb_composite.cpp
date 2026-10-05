@@ -7,6 +7,7 @@
 #include "app_config.h"
 #include "audio/audio_pipeline.h"
 #include "ble/ble_remote_client.h"
+#include "ble/voice_action_gate.h"
 #include "log/app_log.h"
 #include "led_indicator.h"
 #include "wifi/wifi_manager.h"
@@ -92,6 +93,7 @@ static char             s_last_force_reason[24]   = "";
 // single sender task owns report submission; hid_lock serializes that task with
 // the optional laboratory stress sender and recovery's quiescence barrier.
 static hid_keyboard_report_t s_keyboard_report = {};
+static_assert(sizeof(hid_keyboard_report_t) == 8, "Keyboard trace requires the standard 8-byte report");
 static uint16_t s_consumer_report = 0;
 static uint32_t s_hid_last_retry_ms = 0;
 static uint32_t s_hid_last_warning_ms = 0;
@@ -128,6 +130,8 @@ static uint32_t s_voice_usb_claim_skips0 = 0;
 static bool s_voice_drain_pending = false;
 static uint32_t s_voice_release_ms = 0;
 static bool s_voice_hid_active = false;
+static remotemapper::ble::VoiceActionGate s_voice_action_gate;
+static portMUX_TYPE s_voice_action_gate_mux = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct {
     uint32_t sequence;
@@ -199,6 +203,8 @@ static bool hid_send_command_report(const remotemapper::HidCommandQueue::Command
         }
         s_keyboard_report = report;
         ok = s_hid_transport.SendReport(HID_REPORT_ID_KEYBOARD, &report, sizeof(report), 20);
+        hid_diagnostics_record_keyboard_report(millis(), command.id, command.epoch,
+                reinterpret_cast<const uint8_t *>(&report), ok, false);
     } else {
         const uint16_t report = release_report ? 0 : command.consumer;
         s_consumer_report = report;
@@ -306,6 +312,10 @@ static void hid_stress_task(void *) {
                 keyboard ? HID_REPORT_ID_KEYBOARD : HID_REPORT_ID_CONSUMER_CONTROL,
                 keyboard ? (const void *)&keyboard_idle : (const void *)&consumer_idle,
                 keyboard ? sizeof(keyboard_idle) : sizeof(consumer_idle), 20);
+        if (keyboard) {
+            hid_diagnostics_record_keyboard_report(millis(), 0, 0,
+                    reinterpret_cast<const uint8_t *>(&keyboard_idle), ok, true);
+        }
         if (ok) s_hid_stress.completed++;
         else {
             s_hid_stress.failed++;
@@ -1093,6 +1103,27 @@ bool usb_hid_consumer_tap(uint16_t usage_code) {
 
 void usb_hid_dispatch_action(const key_action_t *action) {
     if (!action) return;
+    extern key_mapper_engine_t g_key_engine;
+    key_engine_lock_state(&g_key_engine);
+
+    if (action->type == ACTION_VOICE_HOLD) {
+        portENTER_CRITICAL(&s_voice_action_gate_mux);
+        const bool accepted = s_voice_action_gate.press();
+        portEXIT_CRITICAL(&s_voice_action_gate_mux);
+        if (!accepted) {
+            app_log("VOICE", "Voice hold refused: BLE voice link not ready");
+            key_engine_unlock_state(&g_key_engine);
+            return;
+        }
+    } else if (action->type == ACTION_VOICE_RELEASE) {
+        portENTER_CRITICAL(&s_voice_action_gate_mux);
+        const bool release_active = s_voice_action_gate.release();
+        portEXIT_CRITICAL(&s_voice_action_gate_mux);
+        if (!release_active) {
+            key_engine_unlock_state(&g_key_engine);
+            return;
+        }
+    }
 
     // Every emitted action counts as output activity for the stuck-key rules.
     __atomic_store_n(&s_last_output_ms, millis(), __ATOMIC_RELEASE);
@@ -1231,6 +1262,53 @@ void usb_hid_dispatch_action(const key_action_t *action) {
         default:
             break;
     }
+    key_engine_unlock_state(&g_key_engine);
+}
+
+void usb_voice_action_set_ready(bool ready) {
+    extern key_mapper_engine_t g_key_engine;
+    key_engine_lock_state(&g_key_engine);
+    portENTER_CRITICAL(&s_voice_action_gate_mux);
+    s_voice_action_gate.set_ready(ready);
+    portEXIT_CRITICAL(&s_voice_action_gate_mux);
+    if (!ready) usb_voice_action_invalidate();
+    key_engine_unlock_state(&g_key_engine);
+}
+
+void usb_voice_action_invalidate(void) {
+    extern key_mapper_engine_t g_key_engine;
+    key_engine_lock_state(&g_key_engine);
+    portENTER_CRITICAL(&s_voice_action_gate_mux);
+    const bool release_active = s_voice_action_gate.invalidate();
+    portEXIT_CRITICAL(&s_voice_action_gate_mux);
+    if (!release_active) {
+        key_engine_unlock_state(&g_key_engine);
+        return;
+    }
+    // Clear only the voice action's local audio/HID state. This also handles
+    // a MIC_OPEN failure if the keymap changes before the physical UP report.
+    portENTER_CRITICAL(&s_voice_state_mux);
+    const bool hid_was_active = s_voice_hid_active;
+    s_voice_hid_active = false;
+    s_voice_drain_pending = false;
+    audio_pipeline_stop_session(&g_audio_pipeline);
+    portEXIT_CRITICAL(&s_voice_state_mux);
+    guard_clear_voice();
+    if (hid_was_active) usb_hid_keyboard_release();
+    led_indicator_set(ble_remote_get_state() >= BLE_STATE_CONNECTED
+            ? LED_STATE_CONNECTED : LED_STATE_WAIT_CONNECTION);
+    app_log("VOICE", "Voice hold released after BLE readiness loss");
+    key_engine_unlock_state(&g_key_engine);
+}
+
+bool usb_voice_action_is_active(void) {
+    extern key_mapper_engine_t g_key_engine;
+    key_engine_lock_state(&g_key_engine);
+    portENTER_CRITICAL(&s_voice_action_gate_mux);
+    const bool active = s_voice_action_gate.active();
+    portEXIT_CRITICAL(&s_voice_action_gate_mux);
+    key_engine_unlock_state(&g_key_engine);
+    return active;
 }
 
 void usb_audio_task(void) {

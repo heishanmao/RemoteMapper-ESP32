@@ -8,6 +8,10 @@
 
 static int keyboard_releases = 0;
 static int keyboard_taps = 0;
+static int voice_holds = 0;
+static int voice_releases = 0;
+static uint8_t last_tap_modifier = 0;
+static uint8_t last_tap_key_code = 0;
 static int wol_sends = 0;
 key_mapper_engine_t g_key_engine{};
 static String wifi_nvs_ssid = "old-ssid";
@@ -62,12 +66,81 @@ extern "C" const char* wifi_manager_policy_str(wifi_policy_t) { return "test"; }
 
 static void output(const key_action_t* action) {
     if (action->type == ACTION_KEYBOARD_RELEASE) ++keyboard_releases;
-    if (action->type == ACTION_KEYBOARD_TAP) ++keyboard_taps;
+    if (action->type == ACTION_KEYBOARD_TAP) {
+        ++keyboard_taps;
+        last_tap_modifier = action->modifier;
+        last_tap_key_code = action->key_code;
+    }
+    if (action->type == ACTION_VOICE_HOLD) ++voice_holds;
+    if (action->type == ACTION_VOICE_RELEASE) ++voice_releases;
 }
 
 int main() {
     key_mapper_engine_t& engine = g_key_engine;
     key_engine_init(&engine, output);
+
+    // Default voice is a real-time hold when no long/double gesture delays it.
+    key_engine_feed_key(&engine, MI_KEY_VOICE, true, 1);
+    key_engine_feed_key(&engine, MI_KEY_VOICE, false, 2);
+    assert(voice_holds == 1 && voice_releases == 1);
+
+    // A long voice hold must receive exactly one release, including duplicate UPs.
+    key_binding_t voice_long{};
+    voice_long.source_vk = MI_KEY_POWER;
+    voice_long.has_click = true;
+    voice_long.click_action = { ACTION_KEYBOARD_TAP, USB_MOD_LALT, USB_KEY_TAB, 0, 0 };
+    voice_long.has_long = true;
+    voice_long.long_ms = 100;
+    voice_long.long_action = { ACTION_VOICE_HOLD, USB_MOD_LALT, USB_KEY_H, 0, 0 };
+    assert(key_engine_set_binding(&engine, &voice_long));
+    key_engine_feed_key(&engine, MI_KEY_POWER, true, 10);
+    key_engine_tick(&engine, 110);
+    key_engine_feed_key(&engine, MI_KEY_POWER, false, 111);
+    key_engine_feed_key(&engine, MI_KEY_POWER, false, 112);
+    assert(voice_holds == 2 && voice_releases == 2);
+
+    // Delayed clicks cannot start an unpaired voice hold after physical UP.
+    key_binding_t delayed_voice{};
+    delayed_voice.source_vk = MI_KEY_POWER;
+    delayed_voice.has_click = true;
+    delayed_voice.click_action = { ACTION_VOICE_HOLD, USB_MOD_LALT, USB_KEY_H, 0, 0 };
+    delayed_voice.has_long = true;
+    delayed_voice.long_ms = 500;
+    delayed_voice.long_action.type = ACTION_NONE;
+    assert(key_engine_set_binding(&engine, &delayed_voice));
+    int taps_before_voice_click = keyboard_taps;
+    key_engine_feed_key(&engine, MI_KEY_POWER, true, 200);
+    key_engine_feed_key(&engine, MI_KEY_POWER, false, 210);
+    assert(keyboard_taps == taps_before_voice_click + 1);
+    assert(last_tap_modifier == USB_MOD_LALT && last_tap_key_code == USB_KEY_H);
+    assert(voice_holds == 2 && voice_releases == 2);
+
+    delayed_voice.has_double = true;
+    delayed_voice.double_ms = 250;
+    delayed_voice.double_action.type = ACTION_NONE;
+    assert(key_engine_set_binding(&engine, &delayed_voice));
+    taps_before_voice_click = keyboard_taps;
+    key_engine_feed_key(&engine, MI_KEY_POWER, true, 300);
+    key_engine_feed_key(&engine, MI_KEY_POWER, false, 310);
+    key_engine_tick(&engine, 560);
+    assert(keyboard_taps == taps_before_voice_click + 1);
+    assert(last_tap_modifier == USB_MOD_LALT && last_tap_key_code == USB_KEY_H);
+    assert(voice_holds == 2 && voice_releases == 2);
+
+    delayed_voice.double_action = { ACTION_VOICE_HOLD, USB_MOD_LALT, USB_KEY_H, 0, 0 };
+    assert(key_engine_set_binding(&engine, &delayed_voice));
+    taps_before_voice_click = keyboard_taps;
+    key_engine_feed_key(&engine, MI_KEY_POWER, true, 600);
+    key_engine_feed_key(&engine, MI_KEY_POWER, false, 610);
+    key_engine_feed_key(&engine, MI_KEY_POWER, true, 700);
+    key_engine_feed_key(&engine, MI_KEY_POWER, false, 710);
+    assert(keyboard_taps == taps_before_voice_click + 1);
+    assert(last_tap_modifier == USB_MOD_LALT && last_tap_key_code == USB_KEY_H);
+    assert(voice_holds == 2 && voice_releases == 2);
+
+    // Keep the original stability assertions scoped to their own scenarios.
+    keyboard_taps = 0;
+
     key_binding_t before{};
     assert(key_engine_get_binding(&engine, MI_KEY_OK, &before));
 

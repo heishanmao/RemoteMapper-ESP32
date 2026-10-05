@@ -82,6 +82,11 @@ bool usb_hid_consumer_press(uint16_t usage_code);
  */
 bool usb_hid_consumer_release(void);
 
+// Gate only ACTION_VOICE_HOLD until the BLE voice link is ready.
+void usb_voice_action_set_ready(bool ready);
+void usb_voice_action_invalidate(void);
+bool usb_voice_action_is_active(void);
+
 /**
  * @brief Enqueue an atomic USB HID Consumer Tap.
  * @return true when accepted by the bounded sender queue; this does not mean

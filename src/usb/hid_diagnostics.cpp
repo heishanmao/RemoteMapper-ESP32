@@ -1,4 +1,5 @@
 #include "hid_diagnostics.h"
+#include "hid_keyboard_report_ring.h"
 #include "uac_microphone.h"
 #include <Arduino.h>
 #include "tusb.h"
@@ -34,6 +35,7 @@ portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 Trace live = {};
 Fault fault = {};
 Fault first_audio_fault = {};
+remotemapper::hid_diag::KeyboardReportRing keyboard_reports = {};
 
 uint8_t hid_endpoint() {
     const uint8_t* config = tud_descriptor_configuration_cb(0);
@@ -113,6 +115,16 @@ extern "C" void remotemapper_hid_trace(uint8_t stage, uint8_t report) {
     portEXIT_CRITICAL(&mux);
 }
 
+void hid_diagnostics_record_keyboard_report(uint32_t ms, uint32_t command_id,
+        uint32_t epoch, const uint8_t report[8], bool completed, bool stress_source) {
+    portENTER_CRITICAL(&mux);
+    keyboard_reports.record(ms,
+            stress_source ? remotemapper::hid_diag::KeyboardReportRing::Source::Stress
+                          : remotemapper::hid_diag::KeyboardReportRing::Source::Queue,
+            command_id, epoch, report, completed);
+    portEXIT_CRITICAL(&mux);
+}
+
 void hid_diagnostics_capture(uint32_t reason) {
     const Registers r = registers();
     uac_tx_stats_t audio = {};
@@ -143,11 +155,29 @@ void hid_diagnostics_persist_first_audio_fault() {
 void hid_diagnostics_json(JsonObject out) {
     Trace current;
     Fault saved;
+    remotemapper::hid_diag::KeyboardReportRing reports;
     portENTER_CRITICAL(&mux);
-    current = live; saved = fault;
+    current = live; saved = fault; reports = keyboard_reports;
     portEXIT_CRITICAL(&mux);
     out["schema"] = 2;
     emit_trace(out["live"].to<JsonObject>(), current);
+    JsonArray report_array = out["keyboard_reports"].to<JsonArray>();
+    for (size_t i = 0; i < reports.size(); ++i) {
+        const auto& report = reports.at(i);
+        JsonObject item = report_array.add<JsonObject>();
+        item["first_ms"] = report.first_ms;
+        item["last_ms"] = report.last_ms;
+        item["count"] = report.count;
+        item["source"] = report.source == remotemapper::hid_diag::KeyboardReportRing::Source::Stress
+                ? "stress" : "queue";
+        item["command_id"] = report.command_id;
+        item["epoch"] = report.epoch;
+        item["modifier"] = report.report[0];
+        item["reserved"] = report.report[1];
+        JsonArray keys = item["keys"].to<JsonArray>();
+        for (size_t key = 0; key < 6; ++key) keys.add(report.report[key + 2]);
+        item["completed"] = report.completed;
+    }
     JsonObject last = out["last_fault"].to<JsonObject>();
     last["count"] = saved.count; last["ms"] = saved.ms;
     last["reason"] = saved.reason;
