@@ -3,6 +3,7 @@
 #include "core_diagnostics.h"
 #include "uac_microphone.h"
 #include "hid_command_queue.h"
+#include "usb/hid_guard_registry.h"
 #include "app_config.h"
 #include "audio/audio_pipeline.h"
 #include "ble/ble_remote_client.h"
@@ -19,6 +20,7 @@
 #include "esp_system.h"
 #include "esp_attr.h"
 #include <Preferences.h>
+#include <string.h>
 
 #if !ARDUINO_USB_CDC_ON_BOOT
 USBCDC USBSerial;
@@ -74,17 +76,8 @@ static void hid_unlock(void) {
 // release / force-release. Rules run from usb_composite_task() and, when one
 // trips, force a fully consistent release (engine + USB report + audio + LED).
 // ===========================================================================
-#define HID_HELD_MAX 8
-typedef struct {
-    uint8_t  modifier;   // 0 = none
-    uint8_t  key_code;   // 0 = none
-    uint16_t consumer;   // 0 = none
-    bool     voice;      // true = part of a voice hold (exempt from normal rules)
-    bool     pressed;
-    uint32_t since_ms;
-} hid_held_entry_t;
-
-static hid_held_entry_t s_held[HID_HELD_MAX];
+using hid_held_entry_t = remotemapper::hid_guard::HeldEntry;
+static remotemapper::hid_guard::Registry s_guard_registry = {{}, 1};
 static uint32_t         s_last_output_ms          = 0;
 static uint32_t         s_last_guard_check_ms     = 0;
 static bool             s_guard_inited            = false;
@@ -112,6 +105,8 @@ static bool s_hid_recovering = false;
 static uint32_t s_reconnect_mount_seq = 0;
 static uint32_t s_usb_mount_seq = 0;
 static bool guard_has_held(void);
+static void guard_force_release_if_current(
+        const remotemapper::hid_guard::Snapshot &snapshot, const char *reason);
 static void hid_sender_pause_for_detach(void);
 
 // Runs directly in TinyUSB's lifecycle callback, before Arduino posts its
@@ -580,21 +575,9 @@ static void guard_load_config(void) {
 
 static void guard_add(uint8_t modifier, uint8_t key_code, uint16_t consumer, bool voice) {
     uint32_t now = millis();
-    bool added = false;
     portENTER_CRITICAL(&s_hid_registry_mux);
-    for (int i = 0; i < HID_HELD_MAX; i++) {
-        hid_held_entry_t *e = &s_held[i];
-        if (!e->pressed) {
-            e->modifier = modifier;
-            e->key_code = key_code;
-            e->consumer = consumer;
-            e->voice    = voice;
-            e->pressed  = true;
-            e->since_ms = now;
-            added = true;
-            break;
-        }
-    }
+    const bool added = remotemapper::hid_guard::add(
+            s_guard_registry, modifier, key_code, consumer, voice, now);
     portEXIT_CRITICAL(&s_hid_registry_mux);
     if (added) return;
     // Registry full: force everything out rather than risk a stuck key.
@@ -603,80 +586,113 @@ static void guard_add(uint8_t modifier, uint8_t key_code, uint16_t consumer, boo
 
 static void guard_clear_nonvoice(void) {
     portENTER_CRITICAL(&s_hid_registry_mux);
-    for (int i = 0; i < HID_HELD_MAX; i++) {
-        hid_held_entry_t *e = &s_held[i];
-        if (e->pressed && !e->voice) {
-            e->pressed  = false;
-            e->modifier = 0;
-            e->key_code = 0;
-            e->consumer = 0;
-        }
-    }
+    remotemapper::hid_guard::clear(s_guard_registry, 0);
     portEXIT_CRITICAL(&s_hid_registry_mux);
 }
 
 static void guard_clear_voice(void) {
     portENTER_CRITICAL(&s_hid_registry_mux);
-    for (int i = 0; i < HID_HELD_MAX; i++) {
-        hid_held_entry_t *e = &s_held[i];
-        if (e->pressed && e->voice) {
-            e->pressed  = false;
-            e->modifier = 0;
-            e->key_code = 0;
-            e->consumer = 0;
-        }
-    }
+    remotemapper::hid_guard::clear(s_guard_registry, 1);
     portEXIT_CRITICAL(&s_hid_registry_mux);
 }
 
 static void guard_clear_all(void) {
     portENTER_CRITICAL(&s_hid_registry_mux);
-    for (int i = 0; i < HID_HELD_MAX; i++) {
-        s_held[i].pressed  = false;
-        s_held[i].modifier = 0;
-        s_held[i].key_code = 0;
-        s_held[i].consumer = 0;
-        s_held[i].voice    = false;
-    }
+    remotemapper::hid_guard::clear(s_guard_registry, -1);
     portEXIT_CRITICAL(&s_hid_registry_mux);
 }
 
 static bool guard_has_held(void) {
     bool held = false;
     portENTER_CRITICAL(&s_hid_registry_mux);
-    for (int i = 0; i < HID_HELD_MAX; i++) {
-        if (s_held[i].pressed) { held = true; break; }
+    for (int i = 0; i < remotemapper::hid_guard::kHeldMax; i++) {
+        if (s_guard_registry.entries[i].pressed) { held = true; break; }
     }
     portEXIT_CRITICAL(&s_hid_registry_mux);
     return held;
+}
+
+// A timeout decision is based on a short registry snapshot. Revalidate it
+// while holding the key engine's recursive mutex, which serializes every
+// physical press/release and its guard registry callback through the ensuing
+// force-release transaction.
+static void guard_force_release_if_current(
+        const remotemapper::hid_guard::Snapshot &snapshot, const char *reason) {
+    extern key_mapper_engine_t g_key_engine;
+    key_engine_lock_state(&g_key_engine);
+    bool current = false;
+    portENTER_CRITICAL(&s_hid_registry_mux);
+    current = remotemapper::hid_guard::snapshot_is_current(
+            snapshot, s_guard_registry.generation);
+    portEXIT_CRITICAL(&s_hid_registry_mux);
+    if (current) usb_composite_force_release_all(reason);
+    key_engine_unlock_state(&g_key_engine);
+}
+
+bool usb_composite_guard_force_voice_rx_timeout(uint32_t registry_generation,
+        uint32_t voice_since_ms, uint32_t last_frame_ms) {
+    extern key_mapper_engine_t g_key_engine;
+    key_engine_lock_state(&g_key_engine);
+    remotemapper::hid_guard::Snapshot snapshot;
+    portENTER_CRITICAL(&s_hid_registry_mux);
+    snapshot = remotemapper::hid_guard::take_snapshot(s_guard_registry);
+    portEXIT_CRITICAL(&s_hid_registry_mux);
+
+    bool has_matching_voice = false;
+    for (int i = 0; i < remotemapper::hid_guard::kHeldMax; i++) {
+        const hid_held_entry_t &entry = snapshot.entries[i];
+        if (entry.pressed && entry.voice && entry.since_ms == voice_since_ms) {
+            has_matching_voice = true;
+            break;
+        }
+    }
+    const uint32_t now = millis();
+    const bool current = snapshot.generation == registry_generation && has_matching_voice &&
+            ble_remote_last_audio_frame_ms() == last_frame_ms &&
+            remotemapper::hid_guard::elapsed_at_least(
+                    now, voice_since_ms, HID_GUARD_VOICE_RX_GAP_MS) &&
+            remotemapper::hid_guard::elapsed_at_least(
+                    now, last_frame_ms, HID_GUARD_VOICE_RX_GAP_MS);
+    if (current) usb_composite_force_release_all("voice-rx-timeout");
+    key_engine_unlock_state(&g_key_engine);
+    return current;
 }
 
 // Periodic stuck-key rule evaluation (called from usb_composite_task).
 static void guard_tick(uint32_t now) {
     guard_load_config();
 
-    if ((now - s_last_guard_check_ms) < 250) {
+    if (!remotemapper::hid_guard::elapsed_at_least(now, s_last_guard_check_ms, 250)) {
         return;
     }
     s_last_guard_check_ms = now;
 
     bool any_held     = false;
     bool any_voice    = false;
-    uint32_t first_ms      = 0; // earliest press among registered holds
     uint32_t first_voice_ms = 0;
-    hid_held_entry_t snapshot[HID_HELD_MAX];
+    remotemapper::hid_guard::Snapshot snapshot;
     portENTER_CRITICAL(&s_hid_registry_mux);
-    memcpy(snapshot, s_held, sizeof(snapshot));
+    // guard_add timestamps just before taking this mux, so sampling while
+    // holding it guarantees every copied press timestamp is no later than the
+    // reference clock used for elapsed-time decisions.
+    const uint32_t registry_now = millis();
+    snapshot = remotemapper::hid_guard::take_snapshot(s_guard_registry);
     portEXIT_CRITICAL(&s_hid_registry_mux);
-    for (int i = 0; i < HID_HELD_MAX; i++) {
-        const hid_held_entry_t *e = &snapshot[i];
+    uint32_t oldest_voice_age = 0;
+    bool got_voice_age = false;
+    for (int i = 0; i < remotemapper::hid_guard::kHeldMax; i++) {
+        const hid_held_entry_t *e = &snapshot.entries[i];
         if (!e->pressed) continue;
         if (e->voice) {
             any_voice = true;
-            if (first_voice_ms == 0 || e->since_ms < first_voice_ms) first_voice_ms = e->since_ms;
+            const uint32_t age = remotemapper::hid_guard::held_age(registry_now, *e);
+            if (!got_voice_age || age > oldest_voice_age) {
+                first_voice_ms = e->since_ms;
+                oldest_voice_age = age;
+                got_voice_age = true;
+            }
         } else {
             any_held = true;
-            if (first_ms == 0 || e->since_ms < first_ms) first_ms = e->since_ms;
         }
     }
 
@@ -686,33 +702,39 @@ static void guard_tick(uint32_t now) {
     // must not appear "in the future" relative to the earlier loop timestamp.
     const uint32_t last_frame_ms = ble_remote_last_audio_frame_ms();
     const uint32_t voice_now = millis();
-    if (any_voice && voice_now - first_voice_ms >= HID_GUARD_VOICE_RX_GAP_MS &&
-            voice_now - last_frame_ms >= HID_GUARD_VOICE_RX_GAP_MS) {
-        usb_composite_force_release_all("voice-rx-timeout");
+    if (any_voice && remotemapper::hid_guard::elapsed_at_least(
+                voice_now, first_voice_ms, HID_GUARD_VOICE_RX_GAP_MS) &&
+            remotemapper::hid_guard::elapsed_at_least(
+                voice_now, last_frame_ms, HID_GUARD_VOICE_RX_GAP_MS)) {
+        ble_remote_request_voice_rx_timeout(snapshot.generation, first_voice_ms,
+                last_frame_ms);
         return;
     }
 
     // Rule V: absolute ceiling for a voice recording (exempt from normal rules).
-    if (any_voice && s_guard_voice_ms && (now - first_voice_ms >= s_guard_voice_ms)) {
-        usb_composite_force_release_all("voice-extreme");
+    if (any_voice && s_guard_voice_ms && remotemapper::hid_guard::elapsed_at_least(
+                registry_now, first_voice_ms, s_guard_voice_ms)) {
+        guard_force_release_if_current(snapshot, "voice-extreme");
         return;
     }
 
     // Rule M: any modifier held continuously past the ceiling, regardless of
     // whatever else is going on (this is the classic "PC thinks Alt is down").
-    for (int i = 0; i < HID_HELD_MAX; i++) {
-        const hid_held_entry_t *e = &s_held[i];
+    for (int i = 0; i < remotemapper::hid_guard::kHeldMax; i++) {
+        const hid_held_entry_t *e = &snapshot.entries[i];
         if (!e->pressed || e->voice || e->modifier == 0) continue;
-        if (s_guard_mod_ms && (now - e->since_ms >= s_guard_mod_ms)) {
-            usb_composite_force_release_all("modifier-hold");
+        if (s_guard_mod_ms && remotemapper::hid_guard::elapsed_at_least(
+                    registry_now, e->since_ms, s_guard_mod_ms)) {
+            guard_force_release_if_current(snapshot, "modifier-hold");
             return;
         }
     }
 
     // Rule K: a non-voice key held down with zero further output -> release.
     const uint32_t last_output_ms = __atomic_load_n(&s_last_output_ms, __ATOMIC_ACQUIRE);
-    if (any_held && s_guard_key_ms && (now - last_output_ms >= s_guard_key_ms)) {
-        usb_composite_force_release_all("key-idle");
+    if (any_held && s_guard_key_ms && remotemapper::hid_guard::elapsed_at_least(
+                registry_now, last_output_ms, s_guard_key_ms)) {
+        guard_force_release_if_current(snapshot, "key-idle");
     }
 }
 
@@ -741,8 +763,8 @@ bool usb_composite_guard_get(usb_guard_config_t *cfg, usb_guard_stats_t *stats) 
         stats->any_held  = false;
         stats->held_count = 0;
         portENTER_CRITICAL(&s_hid_registry_mux);
-        for (int i = 0; i < HID_HELD_MAX; i++) {
-            if (s_held[i].pressed) {
+        for (int i = 0; i < remotemapper::hid_guard::kHeldMax; i++) {
+            if (s_guard_registry.entries[i].pressed) {
                 stats->any_held = true;
                 stats->held_count++;
             }
@@ -773,39 +795,38 @@ bool usb_composite_guard_set(const usb_guard_config_t *cfg) {
 }
 
 void usb_composite_force_release_all(const char* reason) {
+    extern key_mapper_engine_t g_key_engine;
+    key_engine_lock_state(&g_key_engine);
+
     // Nothing held and nothing recording -> this is a no-op (e.g. the USB bus
     // stops during the very first enumeration at boot). Don't count/flash.
     const bool pending = hid_command_pending();
-    if (!guard_has_held() && !audio_pipeline_is_active(&g_audio_pipeline) && !pending) return;
+    if (!guard_has_held() && !audio_pipeline_is_active(&g_audio_pipeline) && !pending) {
+        key_engine_unlock_state(&g_key_engine);
+        return;
+    }
 
     s_force_release_count++;
     s_last_force_ms = millis();
     snprintf(s_last_force_reason, sizeof(s_last_force_reason), "%s", reason);
     app_log("GUARD", "Forced HID release (reason=%s, count=%u)",
             reason, (unsigned)s_force_release_count);
-    const voice_state_snapshot_t voice_before = voice_state_snapshot();
-
     // Cancel queued or in-flight-era commands before key_engine_release_all()
     // emits its ordinary releases. Producers never take hid_lock().
     hid_force_cancel_commands();
 
     // Let the key engine release every slot: it emits the proper RELEASE
     //    actions and clears internal press state consistently.
-    extern key_mapper_engine_t g_key_engine;
     key_engine_release_all(&g_key_engine, millis());
 
-    // If a new voice hold won after key_engine_release_all completed, preserve
-    // it. Otherwise stop the old session after the engine has emitted releases.
+    // The engine transaction lock excludes a new physical press until the old
+    // voice session and its registry entries are fully cleared.
     portENTER_CRITICAL(&s_voice_state_mux);
-    const bool preserve_new_voice = s_voice_diag_seq != voice_before.sequence && s_voice_hid_active;
-    bool stopped_audio = false;
-    if (!preserve_new_voice) {
-        s_voice_drain_pending = false;
-        s_voice_hid_active = false;
-        stopped_audio = audio_pipeline_is_active(&g_audio_pipeline);
-        if (stopped_audio) audio_pipeline_stop_session(&g_audio_pipeline);
-    }
+    s_voice_drain_pending = false;
+    s_voice_hid_active = false;
     portEXIT_CRITICAL(&s_voice_state_mux);
+    const bool stopped_audio = audio_pipeline_is_active(&g_audio_pipeline);
+    if (stopped_audio) audio_pipeline_stop_session(&g_audio_pipeline);
     if (stopped_audio) ble_remote_request_mic_stop();
 
     guard_clear_all();
@@ -813,6 +834,7 @@ void usb_composite_force_release_all(const char* reason) {
     // 6. Visual: red flash so the user sees the guard fired, then normal status.
     led_indicator_trigger_stuck();
     led_indicator_set(LED_STATE_CONNECTED);
+    key_engine_unlock_state(&g_key_engine);
 }
 
 void usb_composite_cancel_hid_epoch(void) {
@@ -1074,6 +1096,11 @@ void usb_hid_dispatch_action(const key_action_t *action) {
 
     // Every emitted action counts as output activity for the stuck-key rules.
     __atomic_store_n(&s_last_output_ms, millis(), __ATOMIC_RELEASE);
+    // Invalidate a timeout snapshot if activity arrives before it can commit.
+    portENTER_CRITICAL(&s_hid_registry_mux);
+    s_guard_registry.generation = remotemapper::hid_guard::next_generation(
+            s_guard_registry.generation);
+    portEXIT_CRITICAL(&s_hid_registry_mux);
 
     // User input feeds ON_DEMAND power management: keeps the radio alive, or
     // triggers the 5-press-of-same-key wake gesture after an idle power-down.

@@ -10,7 +10,8 @@
 #define STATIC_LOG_LINES 250
 #define LOG_LINE_MAX_LEN 160
 #define LOG_RING_BYTES   (STATIC_LOG_LINES * LOG_LINE_MAX_LEN)
-#define MIRROR_QUEUE_DEPTH 16
+#define MIRROR_QUEUE_DEPTH 8
+#define MIRROR_ROUTE_COUNT 2
 #define MIRROR_CHUNK_BYTES 32
 #define MIRROR_TEXT_MAX_BYTES 16384
 
@@ -27,18 +28,15 @@ struct MirrorRecord {
     char line[LOG_LINE_MAX_LEN];
     char* owned_payload;
     uint16_t length;
-    uint16_t console_offset;
-    uint16_t cdc_offset;
-    bool send_console;
-    bool send_cdc;
+    uint16_t offset;
 };
 
-// Static bounded queue: callback-side logging never allocates, waits for a
-// consumer, or writes to a serial transport. New mirror messages are dropped
-// when full; the in-memory log ring continues recording them.
-static MirrorRecord s_mirror_queue[MIRROR_QUEUE_DEPTH] = {};
-static size_t s_mirror_head = 0;
-static size_t s_mirror_count = 0;
+// Per-route static bounded queues: callback-side logging never allocates,
+// waits for a consumer, or writes to a serial transport. New mirror messages
+// are dropped on the full route; the in-memory log ring still records them.
+static MirrorRecord s_mirror_queue[MIRROR_ROUTE_COUNT][MIRROR_QUEUE_DEPTH] = {};
+static size_t s_mirror_head[MIRROR_ROUTE_COUNT] = {};
+static size_t s_mirror_count[MIRROR_ROUTE_COUNT] = {};
 static uint32_t s_mirror_dropped = 0;
 static bool s_cdc_log_enabled = false;
 static bool s_console_log_enabled = true;
@@ -59,18 +57,21 @@ void app_log_init(void) {
         }
     }
 
-    char* abandoned[MIRROR_QUEUE_DEPTH] = {};
+    char* abandoned[MIRROR_ROUTE_COUNT * MIRROR_QUEUE_DEPTH] = {};
     memset(s_log_slot_sequence, 0, sizeof(s_log_slot_sequence));
     taskENTER_CRITICAL(&s_log_mux);
-    for (size_t i = 0; i < s_mirror_count; ++i) {
-        const size_t slot = (s_mirror_head + i) % MIRROR_QUEUE_DEPTH;
-        abandoned[i] = s_mirror_queue[slot].owned_payload;
+    size_t abandoned_count = 0;
+    for (size_t route = 0; route < MIRROR_ROUTE_COUNT; ++route) {
+        for (size_t i = 0; i < s_mirror_count[route]; ++i) {
+            const size_t slot = (s_mirror_head[route] + i) % MIRROR_QUEUE_DEPTH;
+            abandoned[abandoned_count++] = s_mirror_queue[route][slot].owned_payload;
+        }
     }
     s_log_head = 0;
     s_log_count = 0;
     s_log_next_sequence = 0;
-    s_mirror_head = 0;
-    s_mirror_count = 0;
+    memset(s_mirror_head, 0, sizeof(s_mirror_head));
+    memset(s_mirror_count, 0, sizeof(s_mirror_count));
     s_mirror_dropped = 0;
     s_uart_cli_dropped = 0;
     s_cdc_cli_dropped = 0;
@@ -79,7 +80,7 @@ void app_log_init(void) {
     s_uart_overflow_notice_offset = 0;
     s_cdc_overflow_notice_offset = 0;
     taskEXIT_CRITICAL(&s_log_mux);
-    for (size_t i = 0; i < MIRROR_QUEUE_DEPTH; ++i) free(abandoned[i]);
+    for (size_t i = 0; i < abandoned_count; ++i) free(abandoned[i]);
 }
 
 void app_log(const char* tag, const char* format, ...) {
@@ -114,190 +115,105 @@ void app_log(const char* tag, const char* format, ...) {
         s_log_count++;
     }
 
-    const bool mirror_console = s_console_log_enabled && !s_uart_overflow_notice_pending;
-    const bool mirror_cdc = s_cdc_log_enabled && !s_cdc_overflow_notice_pending;
-    if (mirror_console || mirror_cdc) {
-        if (s_mirror_count < MIRROR_QUEUE_DEPTH) {
-            const size_t tail = (s_mirror_head + s_mirror_count) % MIRROR_QUEUE_DEPTH;
-            MirrorRecord* record = &s_mirror_queue[tail];
-            // Reserve both the newline and terminator even when snprintf
-            // filled the complete ring line. The ring retains its own copy.
-            const size_t mirror_len = line_len < LOG_LINE_MAX_LEN - 2
-                    ? line_len : LOG_LINE_MAX_LEN - 2;
-            memcpy(record->line, full_line, mirror_len);
-            record->line[mirror_len] = '\n';
-            record->line[mirror_len + 1] = '\0';
-            record->owned_payload = NULL;
-            record->length = (uint16_t)(mirror_len + 1);
-            record->console_offset = 0;
-            record->cdc_offset = 0;
-            record->send_console = mirror_console;
-            record->send_cdc = mirror_cdc;
-            s_mirror_count++;
-        } else {
+    const bool mirror_enabled[MIRROR_ROUTE_COUNT] = {
+        s_console_log_enabled && !s_uart_overflow_notice_pending,
+        s_cdc_log_enabled && !s_cdc_overflow_notice_pending
+    };
+    for (size_t route = 0; route < MIRROR_ROUTE_COUNT; ++route) {
+        if (!mirror_enabled[route]) continue;
+        if (s_mirror_count[route] >= MIRROR_QUEUE_DEPTH) {
             s_mirror_dropped++;
+            continue;
         }
+        const size_t tail = (s_mirror_head[route] + s_mirror_count[route]) % MIRROR_QUEUE_DEPTH;
+        MirrorRecord* record = &s_mirror_queue[route][tail];
+        // Reserve both the newline and terminator even when snprintf
+        // filled the complete ring line. The ring retains its own copy.
+        const size_t mirror_len = line_len < LOG_LINE_MAX_LEN - 2
+                ? line_len : LOG_LINE_MAX_LEN - 2;
+        memcpy(record->line, full_line, mirror_len);
+        record->line[mirror_len] = '\n';
+        record->line[mirror_len + 1] = '\0';
+        record->owned_payload = NULL;
+        record->length = (uint16_t)(mirror_len + 1);
+        record->offset = 0;
+        s_mirror_count[route]++;
     }
     taskEXIT_CRITICAL(&s_log_mux);
 }
 
 void app_log_task(void) {
-    MirrorRecord record;
-    bool queued_record = false;
-    bool uart_error_record = false;
-    bool cdc_error_record = false;
-    uint16_t uart_error_offset = 0;
-    uint16_t cdc_error_offset = 0;
     static const char error_text[] = "\r\n{\"error\":\"output_queue_full\"}\r\n";
-    taskENTER_CRITICAL(&s_log_mux);
-    bool cdc_queued = false;
-    bool uart_queued = false;
-    for (size_t i = 0; i < s_mirror_count; ++i) {
-        const MirrorRecord& pending = s_mirror_queue[(s_mirror_head + i) % MIRROR_QUEUE_DEPTH];
-        cdc_queued = cdc_queued || pending.send_cdc;
-        uart_queued = uart_queued || pending.send_console;
-    }
-    cdc_error_record = s_cdc_overflow_notice_pending && !cdc_queued;
-    uart_error_record = s_uart_overflow_notice_pending && !uart_queued;
-    cdc_error_offset = s_cdc_overflow_notice_offset;
-    uart_error_offset = s_uart_overflow_notice_offset;
-    if (s_mirror_count) {
-        record = s_mirror_queue[s_mirror_head];
-        queued_record = true;
-    } else if (cdc_error_record) {
-        memset(&record, 0, sizeof(record));
-        memcpy(record.line, error_text, sizeof(error_text));
-        record.length = sizeof(error_text) - 1;
-        record.cdc_offset = cdc_error_offset;
-        record.send_cdc = true;
-        uart_error_record = false;
-    } else if (uart_error_record) {
-        memset(&record, 0, sizeof(record));
-        memcpy(record.line, error_text, sizeof(error_text));
-        record.length = sizeof(error_text) - 1;
-        record.console_offset = uart_error_offset;
-        record.send_console = true;
-    } else {
+    for (size_t route = 0; route < MIRROR_ROUTE_COUNT; ++route) {
+        MirrorRecord record = {};
+        bool queued_record = false;
+        bool notice_record = false;
+
+        taskENTER_CRITICAL(&s_log_mux);
+        if (s_mirror_count[route]) {
+            record = s_mirror_queue[route][s_mirror_head[route]];
+            queued_record = true;
+        } else if (route == APP_LOG_OUTPUT_CDC ? s_cdc_overflow_notice_pending
+                                               : s_uart_overflow_notice_pending) {
+            notice_record = true;
+            record.offset = route == APP_LOG_OUTPUT_CDC
+                    ? s_cdc_overflow_notice_offset : s_uart_overflow_notice_offset;
+            record.length = sizeof(error_text) - 1;
+        }
         taskEXIT_CRITICAL(&s_log_mux);
-        return;
-    }
-    taskEXIT_CRITICAL(&s_log_mux);
+        if (!queued_record && !notice_record) continue;
 
-    // Limit each transport to a small chunk per main-loop call. HardwareSerial
-    // has a bounded TX ring; availability is checked before writing, and all
-    // application Serial writes are made by this same loop task.
-    if (record.send_console && record.console_offset < record.length && Serial) {
-        int available = Serial.availableForWrite();
-        if (available > 0) {
-            size_t remaining = record.length - record.console_offset;
-            size_t amount = (size_t)available;
+        const bool cdc = route == APP_LOG_OUTPUT_CDC;
+        const bool disconnected = cdc && !tud_cdc_n_connected(0);
+        const char* payload = notice_record ? error_text
+                : (record.owned_payload ? record.owned_payload : record.line);
+        if (disconnected) {
+            record.offset = record.length;
+        } else if (record.offset < record.length) {
+            size_t amount = record.length - record.offset;
             if (amount > MIRROR_CHUNK_BYTES) amount = MIRROR_CHUNK_BYTES;
-            if (amount > remaining) amount = remaining;
-            if (amount) {
-                const char* payload = record.owned_payload ? record.owned_payload : record.line;
-                Serial.write((const uint8_t*)payload + record.console_offset, amount);
-                record.console_offset = (uint16_t)(record.console_offset + amount);
+            size_t sent = 0;
+            if (cdc) {
+                uint32_t accepted = tud_cdc_n_write(0, payload + record.offset, (uint32_t)amount);
+                sent = accepted > amount ? amount : accepted;
+                if (sent) tud_cdc_n_write_flush(0);
+            } else if (Serial) {
+                const int available = Serial.availableForWrite();
+                if (available > 0) {
+                    if (amount > (size_t)available) amount = (size_t)available;
+                    if (amount) {
+                        sent = Serial.write((const uint8_t*)payload + record.offset, amount);
+                        if (sent > amount) sent = amount;
+                    }
+                }
+            }
+            record.offset = (uint16_t)(record.offset + sent);
+        }
+
+        char* released_payload = NULL;
+        taskENTER_CRITICAL(&s_log_mux);
+        if (queued_record && s_mirror_count[route]) {
+            MirrorRecord* queued = &s_mirror_queue[route][s_mirror_head[route]];
+            queued->offset = record.offset;
+            if (queued->offset >= queued->length) {
+                released_payload = queued->owned_payload;
+                queued->owned_payload = NULL;
+                s_mirror_head[route] = (s_mirror_head[route] + 1) % MIRROR_QUEUE_DEPTH;
+                s_mirror_count[route]--;
+            }
+        } else if (notice_record) {
+            uint16_t* offset = cdc ? &s_cdc_overflow_notice_offset : &s_uart_overflow_notice_offset;
+            bool* pending = cdc ? &s_cdc_overflow_notice_pending : &s_uart_overflow_notice_pending;
+            *offset = record.offset;
+            if (*offset >= record.length) {
+                *pending = false;
+                *offset = 0;
             }
         }
+        taskEXIT_CRITICAL(&s_log_mux);
+        free(released_payload);
     }
-
-    // TinyUSB's tud_cdc_n_write() is a single bounded FIFO write (unlike
-    // USBCDC::write(), which loops until all bytes are accepted). The main
-    // loop is the only application-side CDC writer: cli_manager_task() also
-    // runs there. This single write reports the bytes accepted; the USB stack
-    // consumes the FIFO asynchronously and this function never retries a full
-    // FIFO in a loop.
-    if (record.send_cdc && record.cdc_offset < record.length && !tud_cdc_n_connected(0)) {
-        // Disconnected CDC has no consumer; discard this mirror copy so it
-        // cannot pin the bounded queue indefinitely.
-        record.cdc_offset = record.length;
-    } else if (record.send_cdc && record.cdc_offset < record.length) {
-        const size_t remaining = record.length - record.cdc_offset;
-        const uint32_t amount = remaining > MIRROR_CHUNK_BYTES
-                                    ? MIRROR_CHUNK_BYTES
-                                    : (uint32_t)remaining;
-        const char* payload = record.owned_payload ? record.owned_payload : record.line;
-        uint32_t sent = tud_cdc_n_write(0, payload + record.cdc_offset, amount);
-        if (sent > amount) sent = amount;
-        record.cdc_offset = (uint16_t)(record.cdc_offset + sent);
-        if (sent) {
-            tud_cdc_n_write_flush(0);
-        }
-    }
-
-    // Overflow notices live outside the full queue. Send one only after every
-    // earlier record for that same route has drained; other-route traffic may
-    // continue independently while a host is backpressured.
-    if (queued_record && cdc_error_record) {
-        const uint32_t amount = (sizeof(error_text) - 1 - cdc_error_offset) > MIRROR_CHUNK_BYTES
-                ? MIRROR_CHUNK_BYTES
-                : (uint32_t)(sizeof(error_text) - 1 - cdc_error_offset);
-        if (!tud_cdc_n_connected(0)) {
-            cdc_error_offset = sizeof(error_text) - 1;
-        } else if (amount) {
-            uint32_t sent = tud_cdc_n_write(0, error_text + cdc_error_offset, amount);
-            if (sent > amount) sent = amount;
-            cdc_error_offset = (uint16_t)(cdc_error_offset + sent);
-            if (sent) tud_cdc_n_write_flush(0);
-        }
-    }
-    if (queued_record && uart_error_record) {
-        int available = Serial.availableForWrite();
-        if (available > 0) {
-            const uint32_t remaining = sizeof(error_text) - 1 - uart_error_offset;
-            size_t amount = (size_t)available;
-            if (amount > MIRROR_CHUNK_BYTES) amount = MIRROR_CHUNK_BYTES;
-            if (amount > remaining) amount = remaining;
-            if (amount) {
-                Serial.write((const uint8_t*)error_text + uart_error_offset, amount);
-                uart_error_offset = (uint16_t)(uart_error_offset + amount);
-            }
-        }
-    }
-
-    // When the queue is empty, the fixed error notice is sent through the
-    // temporary `record` above. Persist that record's advanced offset; leaving
-    // the local error offset unchanged would resend the first chunk forever
-    // and keep the route blocked after an oversize/allocation rejection.
-    if (!queued_record && cdc_error_record) {
-        cdc_error_offset = record.cdc_offset;
-    }
-    if (!queued_record && uart_error_record) {
-        uart_error_offset = record.console_offset;
-    }
-
-    char* released_payload = NULL;
-    taskENTER_CRITICAL(&s_log_mux);
-    if (queued_record && s_mirror_count) {
-        MirrorRecord* queued = &s_mirror_queue[s_mirror_head];
-        queued->console_offset = record.console_offset;
-        queued->cdc_offset = record.cdc_offset;
-        const bool console_done = !queued->send_console || queued->console_offset >= queued->length;
-        const bool cdc_done = !queued->send_cdc || queued->cdc_offset >= queued->length;
-        if (console_done && cdc_done) {
-            released_payload = queued->owned_payload;
-            s_mirror_head = (s_mirror_head + 1) % MIRROR_QUEUE_DEPTH;
-            s_mirror_count--;
-        }
-    }
-    if (cdc_error_record && s_cdc_overflow_notice_pending) {
-        s_cdc_overflow_notice_offset = cdc_error_offset;
-        if (cdc_error_offset >= sizeof(error_text) - 1) {
-            s_cdc_overflow_notice_pending = false;
-            s_cdc_overflow_notice_offset = 0;
-        }
-    }
-    if (uart_error_record && s_uart_overflow_notice_pending) {
-        s_uart_overflow_notice_offset = uart_error_offset;
-        if (uart_error_offset >= sizeof(error_text) - 1) {
-            s_uart_overflow_notice_pending = false;
-            s_uart_overflow_notice_offset = 0;
-        }
-    }
-    taskEXIT_CRITICAL(&s_log_mux);
-    free(released_payload);
 }
-
 static bool app_log_queue_cli_text_route(app_log_output_t output, const char* text, size_t length) {
     const bool cdc = output == APP_LOG_OUTPUT_CDC;
     if (!text || !length || length > MIRROR_TEXT_MAX_BYTES) {
@@ -335,7 +251,8 @@ static bool app_log_queue_cli_text_route(app_log_output_t output, const char* te
 
     taskENTER_CRITICAL(&s_log_mux);
     const bool route_blocked = cdc ? s_cdc_overflow_notice_pending : s_uart_overflow_notice_pending;
-    if (s_mirror_count >= MIRROR_QUEUE_DEPTH || route_blocked) {
+    const size_t route = cdc ? APP_LOG_OUTPUT_CDC : APP_LOG_OUTPUT_UART;
+    if (s_mirror_count[route] >= MIRROR_QUEUE_DEPTH || route_blocked) {
         if (cdc) {
             s_cdc_cli_dropped++;
             if (!s_cdc_overflow_notice_pending) s_cdc_overflow_notice_offset = 0;
@@ -349,15 +266,12 @@ static bool app_log_queue_cli_text_route(app_log_output_t output, const char* te
         free(payload);
         return false;
     }
-    const size_t tail = (s_mirror_head + s_mirror_count) % MIRROR_QUEUE_DEPTH;
-    MirrorRecord* record = &s_mirror_queue[tail];
+    const size_t tail = (s_mirror_head[route] + s_mirror_count[route]) % MIRROR_QUEUE_DEPTH;
+    MirrorRecord* record = &s_mirror_queue[route][tail];
     record->owned_payload = payload;
     record->length = (uint16_t)length;
-    record->console_offset = 0;
-    record->cdc_offset = 0;
-    record->send_console = !cdc;
-    record->send_cdc = cdc;
-    s_mirror_count++;
+    record->offset = 0;
+    s_mirror_count[route]++;
     taskEXIT_CRITICAL(&s_log_mux);
     return true;
 }

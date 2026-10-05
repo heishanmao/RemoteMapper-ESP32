@@ -7,19 +7,30 @@
 
 static SemaphoreHandle_t s_key_engine_mutex = NULL;
 
-static void key_engine_lock(void) {
+static bool key_engine_lock(void) {
     if (!s_key_engine_mutex) {
         s_key_engine_mutex = xSemaphoreCreateRecursiveMutex();
     }
-    if (s_key_engine_mutex) {
-        xSemaphoreTakeRecursive(s_key_engine_mutex, portMAX_DELAY);
-    }
+    if (!s_key_engine_mutex) return false;
+    return xSemaphoreTakeRecursive(s_key_engine_mutex, portMAX_DELAY) == pdTRUE;
 }
 
 static void key_engine_unlock(void) {
     if (s_key_engine_mutex) {
         xSemaphoreGiveRecursive(s_key_engine_mutex);
     }
+}
+
+void key_engine_lock_state(key_mapper_engine_t *engine) {
+    if (engine) (void)key_engine_lock();
+}
+
+void key_engine_unlock_state(key_mapper_engine_t *engine) {
+    if (engine) key_engine_unlock();
+}
+
+bool key_engine_is_ready(void) {
+    return s_key_engine_mutex != NULL;
 }
 
 extern void app_log(const char* tag, const char* format, ...);
@@ -178,8 +189,9 @@ static void emit_action_as_tap_if_hold(key_mapper_engine_t *engine, const key_ac
 
 void key_engine_switch_layer(key_mapper_engine_t *engine, uint8_t target_layer, uint32_t now_ms) {
     if (!engine) return;
+    if (!key_engine_lock()) return;
     if (target_layer >= MAX_LAYERS) target_layer = 0;
-    if (engine->active_layer == target_layer) return;
+    if (engine->active_layer == target_layer) { key_engine_unlock(); return; }
 
     // Force release all active pressed keys to prevent sticky keys
     key_engine_release_all(engine, now_ms);
@@ -192,15 +204,23 @@ void key_engine_switch_layer(key_mapper_engine_t *engine, uint8_t target_layer, 
     led_indicator_set_layer_color(color);
 
     app_log("KEYMAP", "Layer Switched -> [%u: %s]", target_layer, engine->layers[target_layer].name);
+    key_engine_unlock();
 }
 
 uint8_t key_engine_get_active_layer(const key_mapper_engine_t *engine) {
     if (!engine) return 0;
-    return engine->active_layer;
+    if (!key_engine_lock()) return 0;
+    uint8_t active_layer = engine->active_layer;
+    key_engine_unlock();
+    return active_layer;
 }
 
-void key_engine_load_defaults(key_mapper_engine_t *engine) {
+static void key_engine_load_defaults_impl(key_mapper_engine_t *engine, bool update_output, bool synchronize) {
     if (!engine) return;
+    if (synchronize && !key_engine_lock()) return;
+
+    /* Release old held actions while their original bindings are still live. */
+    if (synchronize) key_engine_release_all(engine, 0);
 
     memset(engine->layers, 0, sizeof(engine->layers));
     engine->layer_count = MAX_LAYERS;
@@ -384,11 +404,45 @@ void key_engine_load_defaults(key_mapper_engine_t *engine) {
     engine->layers[4].timeout_sec = 0;
     engine->layers[4].led_color = 0xFFFFFF; // White
     engine->layers[4].binding_count = 0;
+
+    memset(engine->states, 0, sizeof(engine->states));
+    if (update_output) led_indicator_set_layer_color(engine->layers[0].led_color);
+    if (synchronize) key_engine_unlock();
+}
+
+void key_engine_load_defaults(key_mapper_engine_t *engine) {
+    key_engine_load_defaults_impl(engine, true, true);
+}
+
+void key_engine_init_candidate_defaults(key_mapper_engine_t *engine) {
+    if (!engine) return;
+    memset(engine, 0, sizeof(*engine));
+    key_engine_load_defaults_impl(engine, false, false);
+}
+
+bool key_engine_replace_layout(key_mapper_engine_t *engine,
+                               const key_layer_t layers[MAX_LAYERS],
+                               uint8_t active_layer) {
+    if (!engine || !layers || active_layer >= MAX_LAYERS) return false;
+    for (size_t i = 0; i < MAX_LAYERS; ++i) {
+        if (layers[i].binding_count > MAX_KEY_BINDINGS) return false;
+    }
+    if (!key_engine_lock()) return false;
+    key_engine_release_all(engine, 0);
+    memcpy(engine->layers, layers, sizeof(engine->layers));
+    engine->layer_count = MAX_LAYERS;
+    engine->active_layer = active_layer;
+    engine->last_activity_time = 0;
+    memset(engine->states, 0, sizeof(engine->states));
+    uint32_t color = engine->layers[active_layer].led_color;
+    led_indicator_set_layer_color(color);
+    key_engine_unlock();
+    return true;
 }
 
 bool key_engine_set_layer_binding(key_mapper_engine_t *engine, uint8_t layer_idx, const key_binding_t *binding) {
     if (!engine || !binding || layer_idx >= MAX_LAYERS) return false;
-    key_engine_lock();
+    if (!key_engine_lock()) return false;
 
     key_layer_t *layer = &engine->layers[layer_idx];
     int idx = find_binding_index_in_layer(layer, binding->source_vk);
@@ -408,7 +462,7 @@ bool key_engine_set_layer_binding(key_mapper_engine_t *engine, uint8_t layer_idx
 
 bool key_engine_get_layer_binding(const key_mapper_engine_t *engine, uint8_t layer_idx, uint8_t source_vk, key_binding_t *out_binding) {
     if (!engine || !out_binding || layer_idx >= MAX_LAYERS) return false;
-    key_engine_lock();
+    if (!key_engine_lock()) return false;
 
     const key_layer_t *layer = &engine->layers[layer_idx];
     int idx = find_binding_index_in_layer(layer, source_vk);
@@ -431,7 +485,7 @@ bool key_engine_get_binding(const key_mapper_engine_t *engine, uint8_t source_vk
 
 void key_engine_init(key_mapper_engine_t *engine, key_output_callback_t cb) {
     if (!engine) return;
-    key_engine_lock();
+    if (!key_engine_lock()) return;
     memset(engine, 0, sizeof(key_mapper_engine_t));
     engine->output_cb = cb;
     key_engine_load_defaults(engine);
@@ -440,7 +494,7 @@ void key_engine_init(key_mapper_engine_t *engine, key_output_callback_t cb) {
 
 void key_engine_feed_key(key_mapper_engine_t *engine, uint8_t raw_key_code, bool is_pressed, uint32_t now_ms) {
     if (!engine) return;
-    key_engine_lock();
+    if (!key_engine_lock()) return;
 
     engine->last_activity_time = now_ms;
 
@@ -538,7 +592,7 @@ void key_engine_feed_key(key_mapper_engine_t *engine, uint8_t raw_key_code, bool
 
 void key_engine_tick(key_mapper_engine_t *engine, uint32_t now_ms) {
     if (!engine) return;
-    key_engine_lock();
+    if (!key_engine_lock()) return;
 
     // Check timeout for LAYER_TYPE_TIMEOUT
     if (engine->active_layer != 0 && engine->layers[engine->active_layer].type == LAYER_TYPE_TIMEOUT) {
@@ -588,7 +642,7 @@ void key_engine_tick(key_mapper_engine_t *engine, uint32_t now_ms) {
 
 void key_engine_release_all(key_mapper_engine_t *engine, uint32_t now_ms) {
     if (!engine) return;
-    key_engine_lock();
+    if (!key_engine_lock()) return;
 
     uint8_t raw_keys[] = {
         MI_KEY_POWER, MI_KEY_VOICE, MI_KEY_UP, MI_KEY_DOWN,
@@ -596,13 +650,59 @@ void key_engine_release_all(key_mapper_engine_t *engine, uint32_t now_ms) {
         MI_KEY_HOME, MI_KEY_MENU, MI_KEY_VOL_UP, MI_KEY_VOL_DOWN, MI_KEY_TV
     };
 
+    typedef struct {
+        key_action_t action;
+        uint8_t source_vk;
+    } pending_release_t;
+    pending_release_t pending[MAX_KEY_BINDINGS];
+    size_t pending_count = 0;
+
     for (int slot = 0; slot < 13; slot++) {
         key_slot_state_t *s = &engine->states[slot];
         if (s->is_pressed) {
-            key_engine_feed_key(engine, raw_keys[slot], false, now_ms);
+            key_binding_t binding;
+            get_effective_binding(engine, raw_keys[slot], &binding);
+            const key_action_t *active = NULL;
+            if (s->long_fired) {
+                active = &binding.long_action;
+            } else if (!binding.has_long && !binding.has_double) {
+                active = &binding.click_action;
+            }
+
+            // Forced cleanup may release only an action that was actually
+            // emitted as a hold. It must never turn an interrupted tap/WOL or
+            // deferred click into a fresh press while cancelling state.
+            if (active) {
+                key_action_t release;
+                bool should_release = true;
+                switch (active->type) {
+                    case ACTION_KEYBOARD_HOLD:
+                        release = (key_action_t){ ACTION_KEYBOARD_RELEASE, 0, 0, 0, 0 };
+                        break;
+                    case ACTION_CONSUMER_HOLD:
+                        release = (key_action_t){ ACTION_CONSUMER_RELEASE, 0, 0, 0, 0 };
+                        break;
+                    case ACTION_VOICE_HOLD:
+                        release = (key_action_t){ ACTION_VOICE_RELEASE, 0, 0, 0, 0 };
+                        break;
+                    default:
+                        should_release = false;
+                        break;
+                }
+                if (should_release) {
+                    pending[pending_count].action = release;
+                    pending[pending_count].source_vk = binding.source_vk;
+                    pending_count++;
+                }
+            }
         }
-        s->waiting_double = false;
-        s->press_count = 0;
+    }
+    // Clear every physical/deferred state before callbacks: a release may
+    // switch a one-shot layer, which recursively asks to release all keys.
+    memset(engine->states, 0, sizeof(engine->states));
+    for (size_t i = 0; i < pending_count; ++i) {
+        emit_action(engine, &pending[i].action, pending[i].source_vk, false);
+        engine->last_telemetry.timestamp = now_ms;
     }
     key_engine_unlock();
 }

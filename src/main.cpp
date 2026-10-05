@@ -71,6 +71,10 @@ void setup() {
         app_log("INIT", "LED indicator task unavailable");
     }
 
+    // Create the engine lock and empty live state before USB can dispatch a
+    // lifecycle callback. BLE starts only after NVS mappings are restored.
+    key_engine_init(&g_key_engine, usb_hid_dispatch_action);
+
     // 2. Initialize USB Composite Stack (UAC Mic + HID Keyboard + Consumer + CDC)
     usb_composite_init();
     Serial.begin(115200);
@@ -85,8 +89,7 @@ void setup() {
     // UAC initialization owns the shared audio pipeline and initializes it
     // once before creating the USB TX worker.
 
-    // 4. Initialize Key Engine with USB HID dispatcher callback and restore NVS mappings
-    key_engine_init(&g_key_engine, usb_hid_dispatch_action);
+    // 4. Restore key mappings after USB/audio initialization.
     key_config_storage_init(&g_key_engine);
     app_log("INIT", "Key Engine active with %u layers (Layer 0 has %u mappings)", 
             (unsigned int)g_key_engine.layer_count, (unsigned int)g_key_engine.layers[0].binding_count);
@@ -129,7 +132,7 @@ void setup() {
         app_log("INIT", "Failed to spawn BLE task");
     }
 
-    s_critical_startup_ok = ble_task_created == pdPASS && usb_composite_is_initialized() &&
+    s_critical_startup_ok = key_engine_is_ready() && ble_task_created == pdPASS && usb_composite_is_initialized() &&
             uac_microphone_is_ready();
     runtime_diagnostics_set_startup_health(s_critical_startup_ok);
     if (!s_critical_startup_ok) {
@@ -152,21 +155,26 @@ void setup() {
 
 void loop() {
     const uint32_t loop_started_us = runtime_diagnostics_loop_begin();
+    uint32_t stage_started_us = loop_started_us;
 
     // 1. Service application-level USB recovery and audio state. TinyUSB
     //    transfer callbacks run from the framework's usbd task.
     usb_composite_task();
+    stage_started_us = runtime_diagnostics_stage_end(RuntimeStage::Usb, stage_started_us);
 
     // 2. Service Wi-Fi & DNS tasks
     wifi_manager_task();
+    stage_started_us = runtime_diagnostics_stage_end(RuntimeStage::Wifi, stage_started_us);
 
     // 3. Service HTTP Web Server (only when Wi-Fi is enabled)
     if (wifi_manager_get_enabled()) {
         web_server_task();
     }
+    stage_started_us = runtime_diagnostics_stage_end(RuntimeStage::Web, stage_started_us);
 
     // 4. Service Serial / WebSerial CLI commands
     cli_manager_task();
+    stage_started_us = runtime_diagnostics_stage_end(RuntimeStage::Cli, stage_started_us);
 
     // 5. Confirm safe-boot watchdog once the new firmware has run stably
     if (s_critical_startup_ok && usb_composite_is_initialized() && uac_microphone_is_ready()) {
@@ -178,7 +186,9 @@ void loop() {
     // notification (key reports included) and has a shallow stack.
     ble_audio_rx_diagnostics_tick();
     core_diagnostics_discover_framework_tasks();
+    stage_started_us = runtime_diagnostics_stage_end(RuntimeStage::Maintenance, stage_started_us);
     app_log_task();
+    runtime_diagnostics_stage_end(RuntimeStage::Log, stage_started_us);
     runtime_diagnostics_loop_end(loop_started_us);
 
     // USB audio task handles its own timing via vTaskDelayUntil. Keep this a

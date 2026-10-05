@@ -114,6 +114,8 @@ void key_engine_init(key_mapper_engine_t *engine, key_output_callback_t cb);
  * @brief Load default factory key mapping table for all layers
  */
 void key_engine_load_defaults(key_mapper_engine_t *engine);
+/* Build factory state in a temporary engine without touching live outputs. */
+void key_engine_init_candidate_defaults(key_mapper_engine_t *engine);
 
 /**
  * @brief Switch active layer with automatic toggle (if target == current -> revert to 0)
@@ -159,6 +161,15 @@ void key_engine_tick(key_mapper_engine_t *engine, uint32_t now_ms);
  * @brief Forcefully release all active pressed keys and reset state
  */
 void key_engine_release_all(key_mapper_engine_t *engine, uint32_t now_ms);
+
+/* Shared recursive state lock for short engine snapshots/transactions. */
+void key_engine_lock_state(key_mapper_engine_t *engine);
+void key_engine_unlock_state(key_mapper_engine_t *engine);
+bool key_engine_is_ready(void);
+/* Replace the live layout after releasing held actions from the old layout. */
+bool key_engine_replace_layout(key_mapper_engine_t *engine,
+                               const key_layer_t layers[MAX_LAYERS],
+                               uint8_t active_layer);
 
 
 #ifdef __cplusplus

@@ -22,19 +22,8 @@ import sys
 
 FRAMEWORK = "framework-arduinoespressif32"
 
-USB_ORIG = "ESPUSB(size_t event_task_stack_size=2048, uint8_t event_task_priority=5);"
-USB_PATCHED = "ESPUSB(size_t event_task_stack_size=16384, uint8_t event_task_priority=5);"
-
-WS_ANCHOR = "HTTPRaw& raw() { return *_currentRaw; }"
-WS_ADDITION = (
-    "HTTPRaw& raw() { return *_currentRaw; }\n"
-    "  bool hasUpload() const { return _currentUpload != nullptr; }\n"
-    "  bool hasRaw() const { return _currentRaw != nullptr; }"
-)
-
-
 def _read(path):
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
 
@@ -67,34 +56,7 @@ def _framework_dir():
 def main():
     fw = _framework_dir()
     if not fw:
-        sys.stderr.write("[patches] framework-arduinoespressif32 not found; skipping\n")
-        return
-
-    # --- Patch 1: USB event task stack ---
-    usb_h = os.path.join(fw, "cores", "esp32", "USB.h")
-    if os.path.isfile(usb_h):
-        src = _read(usb_h)
-        if USB_PATCHED in src:
-            print("[patches] USB.h stack 16384: already patched")
-        elif USB_ORIG in src:
-            _write(usb_h, src.replace(USB_ORIG, USB_PATCHED))
-            print("[patches] USB.h stack 2048 -> 16384: APPLIED")
-        else:
-            sys.stderr.write(
-                "[patches] WARNING: USB.h matches neither original nor patched text\n")
-
-    # --- Patch 2: WebServer hasUpload()/hasRaw() ---
-    ws_h = os.path.join(fw, "libraries", "WebServer", "src", "WebServer.h")
-    if os.path.isfile(ws_h):
-        src = _read(ws_h)
-        if "bool hasUpload() const" in src:
-            print("[patches] WebServer.h hasUpload()/hasRaw(): already patched")
-        elif WS_ANCHOR in src:
-            _write(ws_h, src.replace(WS_ANCHOR, WS_ADDITION))
-            print("[patches] WebServer.h hasUpload()/hasRaw(): APPLIED")
-        else:
-            sys.stderr.write(
-                "[patches] WARNING: WebServer.h anchor line not found\n")
+        raise RuntimeError("Required Arduino framework unavailable; cannot validate USB/OTA patches")
 
     # Patch 3: bounded, generation-checked HID completion. Upgrade stock and
     # TRACE_V1 reproducibly, and refresh the embedded V2 state machine on each
@@ -102,23 +64,25 @@ def main():
     patch_dir = os.path.join(env.subst("$PROJECT_DIR"), "tools", "patches")
     sys.path.insert(0, patch_dir)
     from hid_tx_patch import patch_hid_source, patch_usb_source
+    from framework_header_patches import patch_usb_header, patch_webserver_header
 
-    hid_cpp = os.path.join(fw, "libraries", "USB", "src", "USBHID.cpp")
-    usb_cpp = os.path.join(fw, "cores", "esp32", "USB.cpp")
-    hid_src = _read(hid_cpp)
-    usb_src = _read(usb_cpp)
-    hid_patched = patch_hid_source(hid_src)
-    usb_patched = patch_usb_source(usb_src)
-    if hid_patched != hid_src:
-        _write(hid_cpp, hid_patched)
-        print("[patches] USBHID completion guard V2: APPLIED/REFRESHED")
-    else:
-        print("[patches] USBHID completion guard V2: current")
-    if usb_patched != usb_src:
-        _write(usb_cpp, usb_patched)
-        print("[patches] synchronous USB mount/unmount hooks: APPLIED")
-    else:
-        print("[patches] synchronous USB mount/unmount hooks: current")
+    edits = []
+    patches = [
+        ("cores/esp32/USB.h", patch_usb_header, "USB event stack"),
+        ("libraries/WebServer/src/WebServer.h", patch_webserver_header, "WebServer null guards"),
+        ("libraries/USB/src/USBHID.cpp", patch_hid_source, "HID completion guard V2"),
+        ("cores/esp32/USB.cpp", patch_usb_source, "synchronous USB lifecycle"),
+    ]
+    # Validate every required adaptation before touching this shared SDK package.
+    # Framework drift must fail the build, never silently omit a safety fix.
+    for relative, patch, label in patches:
+        path = os.path.join(fw, *relative.split("/"))
+        source = _read(path)
+        edits.append((path, source, patch(source), label))
+    for path, source, patched, label in edits:
+        if patched != source:
+            _write(path, patched)
+        print("[patches] %s: %s" % (label, "APPLIED/REFRESHED" if patched != source else "verified"))
 
 
 main()

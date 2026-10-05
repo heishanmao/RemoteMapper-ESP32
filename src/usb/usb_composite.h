@@ -143,6 +143,10 @@ bool usb_composite_guard_set(const usb_guard_config_t *cfg);
  *        in a consistent way (engine + USB report + audio + LED) and log the reason.
  */
 void usb_composite_force_release_all(const char* reason);
+// Revalidate a queued voice RX-gap timeout against the live held-key registry
+// and latest frame timestamp before committing it on the BLE host owner.
+bool usb_composite_guard_force_voice_rx_timeout(uint32_t registry_generation,
+        uint32_t voice_since_ms, uint32_t last_frame_ms);
 // Cancels queued HID work on a remote disconnect and leaves durable zero reports.
 void usb_composite_cancel_hid_epoch(void);
 

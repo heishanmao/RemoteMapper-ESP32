@@ -5,6 +5,7 @@
 #include "ble/ble_remote_client.h"
 #include "audio/audio_pipeline.h"
 #include "keymap/key_state_machine.h"
+#include "keymap/key_config_storage.h"
 #include "usb/usb_composite.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -327,8 +328,11 @@ static void handle_command(const String& line) {
         ble_remote_trigger_reconnect();
     }
     else if (cmd.equalsIgnoreCase("reset_keys")) {
-        key_engine_load_defaults(&g_key_engine);
-        cli_write_line("{\"status\":\"keymap_reset_to_defaults\"}");
+        if (key_config_storage_reset_defaults(&g_key_engine)) {
+            cli_write_line("{\"status\":\"keymap_reset_to_defaults\"}");
+        } else {
+            cli_write_line("{\"status\":\"error\",\"error\":\"keymap_save_failed\"}");
+        }
     }
     else if (head.equalsIgnoreCase("gattdump")) {
         tail.toLowerCase();
@@ -343,24 +347,28 @@ static void handle_command(const String& line) {
         }
     }
     else if (cmd.equalsIgnoreCase("help")) {
-        cli_write_line("Commands:");
-        cli_write_line("  status        - Display system info & runtime statistics (JSON)");
-        cli_write_line("  reconnect     - Trigger BLE remote re-scan");
-        cli_write_line("  reset_keys    - Reset key bindings to factory defaults");
-        cli_write_line("  gattdump on|off - Toggle full GATT enumeration per remote connection (GATTX log)");
-        cli_write_line("  wifi on|off   - Enable/disable the whole Wi-Fi radio (persisted, reboots)");
-        cli_write_line("  wifi policy [always_on|on_demand|disabled] - Get/set Wi-Fi power policy");
-        cli_write_line("  wifi timeout [on|off] - Enable/disable ON_DEMAND idle auto-shutdown (default off)");
-    cli_write_line("  wifi timeout [1|5|10|30|never] - Get/set ON_DEMAND idle timeout (min)");
-        cli_write_line("  wifi status   - Show Wi-Fi radio & connection status (JSON)");
-        cli_write_line("  wifi wake     - Wake the radio from ON_DEMAND sleep (same path as USB/key gesture)");
-        cli_write_line("  log on|off    - Mirror full logs to USB CDC (default: off)");
-        cli_write_line("  log console on|off - Mute/enable routine UART console logs (default: muted after boot)");
-        cli_write_line("  log status    - Show log mirror/console state (JSON)");
+        // One record per response: queue pressure rejects a complete help
+        // response, never just its trailing lines.
+        static const char help_text[] =
+            "Commands:\r\n"
+            "  status        - Display system info & runtime statistics (JSON)\r\n"
+            "  reconnect     - Trigger BLE remote re-scan\r\n"
+            "  reset_keys    - Reset key bindings to factory defaults\r\n"
+            "  gattdump on|off - Toggle full GATT enumeration per remote connection (GATTX log)\r\n"
+            "  wifi on|off   - Enable/disable the whole Wi-Fi radio (persisted, reboots)\r\n"
+            "  wifi policy [always_on|on_demand|disabled] - Get/set Wi-Fi power policy\r\n"
+            "  wifi timeout [on|off] - Enable/disable ON_DEMAND idle auto-shutdown (default off)\r\n"
+            "  wifi timeout [1|5|10|30|never] - Get/set ON_DEMAND idle timeout (min)\r\n"
+            "  wifi status   - Show Wi-Fi radio & connection status (JSON)\r\n"
+            "  wifi wake     - Wake the radio from ON_DEMAND sleep (same path as USB/key gesture)\r\n"
+            "  log on|off    - Mirror full logs to USB CDC (default: off)\r\n"
+            "  log console on|off - Mute/enable routine UART console logs (default: muted after boot)\r\n"
+            "  log status    - Show log mirror/console state (JSON)\r\n"
 #if defined(REMOTEMAPPER_DWC2_DRIVER)
-        cli_write_line("  usb stress <1..300>|stop|status - Bounded idle-only zero-report HID test");
+            "  usb stress <1..300>|stop|status - Bounded idle-only zero-report HID test\r\n"
 #endif
-        cli_write_line("  help          - Show available commands");
+            "  help          - Show available commands\r\n";
+        app_log_queue_cli_text(s_response_output, help_text, sizeof(help_text) - 1);
     }
     else {
         cli_write_line("{\"error\":\"unknown_command\",\"hint\":\"type help\"}");

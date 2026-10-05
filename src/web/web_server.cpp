@@ -419,12 +419,15 @@ static void handle_keymap_save() {
         s_server.send(400, "application/json", "{\"error\":\"missing_body\"}");
         return;
     }
-    bool ok = key_config_from_json(&g_key_engine, s_server.arg("plain"));
+    String body = s_server.arg("plain");
+    key_mapper_engine_t candidate = {};
+    bool format_ok = key_config_parse_json(body, &candidate);
+    if (format_ok && !key_config_storage_save_candidate(&candidate)) {
+        s_server.send(500, "application/json", "{\"error\":\"save_failed\"}");
+        return;
+    }
+    bool ok = format_ok && key_config_apply_candidate(&g_key_engine, &candidate);
     if (ok) {
-        key_config_storage_save(&g_key_engine);
-        // The keymap just changed under possibly-held remote buttons: drop every
-        // held state so old bindings can never ghost into the new layout.
-        usb_composite_force_release_all("keymap-reload");
         s_server.send(200, "application/json", "{\"status\":\"saved\"}");
     } else {
         s_server.send(400, "application/json", "{\"error\":\"invalid_keymap_format\"}");
@@ -432,8 +435,10 @@ static void handle_keymap_save() {
 }
 
 static void handle_keymap_reset() {
-    key_config_storage_reset_defaults(&g_key_engine);
-    usb_composite_force_release_all("keymap-reset");
+    if (!key_config_storage_reset_defaults(&g_key_engine)) {
+        s_server.send(500, "application/json", "{\"error\":\"save_failed\"}");
+        return;
+    }
     app_log("KEYMAP", "Reset keymap to factory defaults via Web API");
     s_server.send(200, "application/json", "{\"status\":\"reset_ok\"}");
 }
@@ -690,10 +695,12 @@ static void handle_ota_status() {
             }
         }
     }
-    // Run the same image verification the bootloader performs against the
-    // target OTA slot. If the slot holds a valid image this must be ESP_OK,
-    // otherwise it reveals the exact reason the bootloader refuses to boot it.
-    {
+    doc["target_verify"] = "not_checked";
+    doc["target_segments"] = -1;
+    doc["target_entry"] = 0;
+    // Full target-slot verification reads the image and is opt-in because this
+    // status endpoint is polled frequently by the UI.
+    if (s_server.hasArg("verify") && s_server.arg("verify") == "1") {
         const esp_partition_t* tgt = esp_ota_get_next_update_partition(NULL);
         if (tgt != NULL) {
             esp_partition_pos_t pos = {};

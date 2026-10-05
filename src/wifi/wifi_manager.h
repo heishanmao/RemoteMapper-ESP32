@@ -54,7 +54,13 @@ String wifi_manager_get_sta_pass(void);
 // the radio; the caller is expected to reboot afterwards for policy to apply.
 bool wifi_manager_restore_backup(const String& ssid, const String& sta_pass,
                                  const String& ap_pass, wifi_policy_t policy,
-                                 uint32_t timeout_min);
+                                 uint32_t timeout_min, bool timeout_enabled,
+                                 bool publish_runtime = true);
+void wifi_manager_apply_backup_state(const String& ssid, wifi_policy_t policy,
+                                     uint32_t timeout_min, bool timeout_enabled);
+bool wifi_manager_validate_backup(const String& ssid, const String& sta_pass,
+                                 const String& ap_pass,
+                                 wifi_policy_t policy, uint32_t timeout_min);
 
 // ---- Wi-Fi Power Management (Policy / State Machine) ----
 wifi_policy_t      wifi_manager_get_policy(void);

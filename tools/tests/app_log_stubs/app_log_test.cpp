@@ -13,6 +13,7 @@ static std::vector<void*> tracked_allocations;
 static std::string serial_output;
 static std::string cdc_output;
 static bool cdc_connected = false;
+static uint32_t cdc_write_limit = UINT32_MAX;
 static uint32_t clock_ms = 1234;
 
 extern "C" void app_log_test_free(void* p) {
@@ -30,16 +31,18 @@ void* heap_caps_malloc(size_t size, unsigned int) {
 uint32_t millis(void) { return clock_ms++; }
 
 size_t TestSerial::write(const uint8_t* data, size_t size) {
-    serial_output.append(reinterpret_cast<const char*>(data), size);
-    return size;
+    const size_t accepted = size < write_limit ? size : write_limit;
+    serial_output.append(reinterpret_cast<const char*>(data), accepted);
+    return accepted;
 }
 
 bool tud_cdc_n_connected(uint8_t instance) { return instance == 0 && cdc_connected; }
 
 uint32_t tud_cdc_n_write(uint8_t instance, const void* buffer, uint32_t size) {
     if (instance != 0 || !cdc_connected) return 0;
-    cdc_output.append(static_cast<const char*>(buffer), size);
-    return size;
+    const uint32_t accepted = size < cdc_write_limit ? size : cdc_write_limit;
+    cdc_output.append(static_cast<const char*>(buffer), accepted);
+    return accepted;
 }
 
 uint32_t tud_cdc_n_write_flush(uint8_t) { return 0; }
@@ -99,16 +102,16 @@ int main() {
     assert(serial_output == large); // UART uses the owned 16 KB payload too
     assert(tracked_allocations.size() == 1);
 
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 8; ++i) {
         const std::string item = "payload-" + std::to_string(i);
         assert(app_log_queue_cli_text(APP_LOG_OUTPUT_UART, item.data(), item.size()));
     }
     const uint32_t dropped_before = app_log_get_cli_dropped(APP_LOG_OUTPUT_UART);
     assert(!app_log_queue_cli_text(APP_LOG_OUTPUT_UART, "whole-message-rejected", 22));
     assert(app_log_get_cli_dropped(APP_LOG_OUTPUT_UART) == dropped_before + 1);
-    assert(tracked_allocations.size() == 17); // failed enqueue freed its copy
+    assert(tracked_allocations.size() == 9); // failed enqueue freed its copy
 
-    drain(18); // all queued lines, then the reserved fixed-size error notice
+    drain(20); // all queued lines, then the reserved fixed-size error notice
     assert(serial_output.find("output_queue_full") != std::string::npos);
     assert(tracked_allocations.size() == 1);
     const std::string oversize(16385, 'X');
@@ -119,12 +122,51 @@ int main() {
     cdc_connected = true;
     drain(2); // clear the oversize error notice before exercising queue-full
     assert(cdc_output == "\r\n{\"error\":\"output_queue_full\"}\r\n");
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 8; ++i) {
         assert(app_log_queue_cli_text(APP_LOG_OUTPUT_CDC, "cdc", 3));
     }
     assert(!app_log_queue_cli_text(APP_LOG_OUTPUT_CDC, "rejected", 8));
+    serial_output.clear();
+    assert(app_log_queue_cli_text(APP_LOG_OUTPUT_UART, "uart-independent", 16));
+    drain(1); // a full, stalled CDC FIFO cannot block the independent UART FIFO
+    assert(serial_output == "uart-independent");
     cdc_connected = false;
-    drain(18); // disconnected CDC releases payloads and its pending error
+    drain(20); // disconnected CDC releases payloads and its pending error
+    assert(tracked_allocations.size() == 1);
+
+    // A connected CDC host that accepts zero bytes must not prevent later UART
+    // replies. CDC resumes at its saved offset and preserves its own FIFO order.
+    cdc_connected = true;
+    cdc_output.clear();
+    serial_output.clear();
+    const std::string stalled_cdc = "cdc-resume-preserves-the-complete-record";
+    const std::string stalled_cdc_next = "second-cdc-record";
+    assert(app_log_queue_cli_text(APP_LOG_OUTPUT_CDC, stalled_cdc.data(), stalled_cdc.size()));
+    cdc_write_limit = 0;
+    assert(app_log_queue_cli_text(APP_LOG_OUTPUT_CDC, stalled_cdc_next.data(), stalled_cdc_next.size()));
+    assert(app_log_queue_cli_text(APP_LOG_OUTPUT_UART, "uart-while-cdc-stalled", 22));
+    drain(10);
+    assert(serial_output == "uart-while-cdc-stalled");
+    assert(cdc_output.empty());
+    cdc_write_limit = 7;
+    drain(10);
+    assert(cdc_output == stalled_cdc + stalled_cdc_next);
+
+    // Both transports may accept partial writes. Advancing by the returned
+    // byte count must reproduce the original record exactly without gaps.
+    serial_output.clear();
+    Serial.write_limit = 5;
+    assert(app_log_queue_cli_text(APP_LOG_OUTPUT_UART, "partial-uart-payload", 20));
+    drain(10);
+    assert(serial_output == "partial-uart-payload");
+    Serial.write_limit = (size_t)-1;
+    cdc_output.clear();
+    cdc_write_limit = 3;
+    const std::string partial_cdc = "partial-cdc-payload";
+    assert(app_log_queue_cli_text(APP_LOG_OUTPUT_CDC, partial_cdc.data(), partial_cdc.size()));
+    drain(10);
+    assert(cdc_output == partial_cdc);
+    cdc_write_limit = UINT32_MAX;
     assert(tracked_allocations.size() == 1);
     return 0;
 }

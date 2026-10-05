@@ -14,8 +14,10 @@ private:
 
 class TestSerial {
 public:
+    int available_limit = 4096;
+    size_t write_limit = (size_t)-1;
     explicit operator bool() const { return true; }
-    int availableForWrite() const { return 4096; }
+    int availableForWrite() const { return available_limit; }
     size_t write(const uint8_t* data, size_t size);
     size_t write(uint8_t value) { return write(&value, 1); }
 };

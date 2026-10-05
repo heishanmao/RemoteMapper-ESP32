@@ -1,7 +1,7 @@
 # Upload firmware to the device OTA endpoint.
-# The default N16R8 build includes the shared DWC2 timing fixes (1.2.48).
+# The default N16R8 build includes the shared DWC2 timing fixes.
 # To upload a reviewed archive instead, pass -Bin explicitly, for example:
-#   .\tools\ota.ps1 -Bin .\.cache\firmware-1.2.48\firmware.bin
+#   .\tools\ota.ps1 -Bin .\.cache\firmware-1.2.51\firmware.bin
 # Invoke-WebRequest mangles large bodies on this PowerShell build, so build the
 # multipart payload by hand and post it through System.Net.Http instead.
 param(
@@ -41,11 +41,22 @@ $content.Headers.ContentType =
     [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse("multipart/form-data; boundary=$boundary")
 
 "posting $($body.Length) bytes to http://$Host_/api/ota/upload ..."
+$resp = $null
 try {
     $resp = $client.PostAsync("http://$Host_/api/ota/upload", $content).GetAwaiter().GetResult()
     "HTTP $([int]$resp.StatusCode)"
-    $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    $responseBody = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    $responseBody
+    if (-not $resp.IsSuccessStatusCode) {
+        throw "OTA upload failed: HTTP $([int]$resp.StatusCode)"
+    }
+    $reply = $responseBody | ConvertFrom-Json
+    if ($reply.success -ne $true) {
+        throw 'The device did not confirm successful OTA activation.'
+    }
 }
 finally {
+    if ($null -ne $resp) { $resp.Dispose() }
+    $content.Dispose()
     $client.Dispose()
 }

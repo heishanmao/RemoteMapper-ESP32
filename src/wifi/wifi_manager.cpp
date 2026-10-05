@@ -408,6 +408,21 @@ const char* wifi_manager_state_str(wifi_radio_state_t state) {
     }
 }
 
+static bool prefs_put_string_verified(const char* key, const String& value) {
+    size_t written = s_prefs.putString(key, value);
+    return written == value.length() && s_prefs.getString(key, "") == value;
+}
+
+static bool prefs_put_uint_verified(const char* key, uint32_t value) {
+    size_t written = s_prefs.putUInt(key, value);
+    return written == sizeof(value) && s_prefs.getUInt(key, UINT32_MAX) == value;
+}
+
+static bool prefs_put_bool_verified(const char* key, bool value) {
+    size_t written = s_prefs.putBool(key, value);
+    return written == sizeof(uint8_t) && s_prefs.getBool(key, !value) == value;
+}
+
 static void wifi_scan_begin(void) {
     WiFi.scanDelete();
     s_scan_error = 0;
@@ -715,43 +730,88 @@ String wifi_manager_get_sta_pass(void) {
     return s_prefs.getString("pass", "");
 }
 
-bool wifi_manager_restore_backup(const String& ssid, const String& sta_pass,
-                                 const String& ap_pass, wifi_policy_t policy,
-                                 uint32_t timeout_min) {
+bool wifi_manager_validate_backup(const String& ssid, const String& sta_pass,
+                                  const String& ap_pass,
+                                  wifi_policy_t policy, uint32_t timeout_min) {
     if ((uint32_t)policy > WIFI_POLICY_DISABLED) {
         return false;
     }
     if (!wifi_is_valid_timeout(timeout_min)) {
         return false;
     }
+    if (ssid.length() > 32 || sta_pass.length() > 64) return false;
     String ap = ap_pass;
     ap.trim();
-    if (ap.length() > 0 && ap.length() < 8) {
+    if (ap.length() > 0 && (ap.length() < 8 || ap.length() > 63)) {
         return false;
     }
-    s_prefs.putString("ssid", ssid);
-    s_prefs.putString("pass", sta_pass);
-    s_prefs.putString("ap_pass", ap);
-    s_prefs.putUInt("policy", (uint32_t)policy);
-    s_prefs.putUInt("timeout_min", timeout_min);
-    s_policy = policy;
-    s_timeout_min = timeout_min;
-    // A backup predating the timeout_en key leaves the switch at its default
-    // (OFF) rather than silently re-arming the idle auto-shutdown.
-    s_timeout_enabled = WIFI_DEFAULT_TIMEOUT_ENABLED ? true : false;
-    s_wifi_enabled = (policy != WIFI_POLICY_DISABLED);
-    s_sta_configured = (ssid.length() > 0);
+    return true;
+}
+
+bool wifi_manager_restore_backup(const String& ssid, const String& sta_pass,
+                                 const String& ap_pass, wifi_policy_t policy,
+                                 uint32_t timeout_min, bool timeout_enabled,
+                                 bool publish_runtime) {
+    if (!wifi_manager_validate_backup(ssid, sta_pass, ap_pass, policy, timeout_min)) return false;
+    String ap = ap_pass;
+    ap.trim();
+
+    const String old_ssid = s_prefs.getString("ssid", "");
+    const String old_pass = s_prefs.getString("pass", "");
+    const String old_ap = s_prefs.getString("ap_pass", "");
+    const uint32_t old_policy = s_prefs.getUInt("policy", WIFI_DEFAULT_POLICY);
+    const uint32_t old_timeout = s_prefs.getUInt("timeout_min", WIFI_DEFAULT_TIMEOUT_MIN);
+    const bool old_timeout_enabled = s_prefs.getBool("timeout_en", WIFI_DEFAULT_TIMEOUT_ENABLED ? true : false);
+
+    bool stored = prefs_put_string_verified("ssid", ssid) &&
+                  prefs_put_string_verified("pass", sta_pass) &&
+                  prefs_put_string_verified("ap_pass", ap) &&
+                  prefs_put_uint_verified("policy", (uint32_t)policy) &&
+                  prefs_put_uint_verified("timeout_min", timeout_min) &&
+                  prefs_put_bool_verified("timeout_en", timeout_enabled);
+    if (stored) {
+        stored = s_prefs.getString("ssid", "") == ssid &&
+                 s_prefs.getString("pass", "") == sta_pass &&
+                 s_prefs.getString("ap_pass", "") == ap &&
+                 s_prefs.getUInt("policy", UINT32_MAX) == (uint32_t)policy &&
+                 s_prefs.getUInt("timeout_min", UINT32_MAX) == timeout_min &&
+                 s_prefs.getBool("timeout_en", !timeout_enabled) == timeout_enabled;
+    }
+    if (!stored) {
+        bool rolled_back = true;
+        rolled_back = prefs_put_string_verified("ssid", old_ssid) && rolled_back;
+        rolled_back = prefs_put_string_verified("pass", old_pass) && rolled_back;
+        rolled_back = prefs_put_string_verified("ap_pass", old_ap) && rolled_back;
+        rolled_back = prefs_put_uint_verified("policy", old_policy) && rolled_back;
+        rolled_back = prefs_put_uint_verified("timeout_min", old_timeout) && rolled_back;
+        rolled_back = prefs_put_bool_verified("timeout_en", old_timeout_enabled) && rolled_back;
+        app_log("WIFI", "Wi-Fi backup NVS write failed; rollback %s (power-loss atomicity is not available)",
+                rolled_back ? "completed" : "incomplete");
+        return false;
+    }
+    if (publish_runtime) {
+        wifi_manager_apply_backup_state(ssid, policy, timeout_min, timeout_enabled);
+    }
     app_log("WIFI", "Wi-Fi config restored from backup (policy=%s, timeout=%u min, ssid=%s)",
             wifi_manager_policy_str(policy), (unsigned int)timeout_min,
             ssid.length() > 0 ? ssid.c_str() : "(none)");
     return true;
 }
 
+void wifi_manager_apply_backup_state(const String& ssid, wifi_policy_t policy,
+                                     uint32_t timeout_min, bool timeout_enabled) {
+    s_policy = policy;
+    s_timeout_min = timeout_min;
+    s_timeout_enabled = timeout_enabled;
+    s_wifi_enabled = (policy != WIFI_POLICY_DISABLED);
+    s_sta_configured = (ssid.length() > 0);
+}
+
 bool wifi_manager_save_ap_config(const String& ap_password) {
     if (!s_wifi_enabled) return false;
     String p = ap_password;
     p.trim();
-    if (p.length() > 0 && p.length() < 8) {
+    if (p.length() > 0 && (p.length() < 8 || p.length() > 63)) {
         return false;
     }
     s_prefs.putString("ap_pass", p);

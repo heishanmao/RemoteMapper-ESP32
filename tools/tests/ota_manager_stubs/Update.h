@@ -1,0 +1,21 @@
+#pragma once
+
+#include <stdint.h>
+#include <Arduino.h>
+
+static const uint32_t UPDATE_SIZE_UNKNOWN = 0xFFFFFFFFu;
+enum {
+    UPDATE_ERROR_OK = 0,
+    UPDATE_ERROR_WRITE = 1,
+    UPDATE_ERROR_READ = 2,
+    UPDATE_ERROR_SIZE = 3,
+    UPDATE_ERROR_ACTIVATE = 4,
+    UPDATE_ERROR_NO_PARTITION = 5,
+    UPDATE_ERROR_BAD_ARGUMENT = 6,
+    UPDATE_ERROR_ABORT = 7,
+    UPDATE_ERROR_ERASE = 8,
+    UPDATE_ERROR_SPACE = 9,
+    UPDATE_ERROR_STREAM = 10,
+    UPDATE_ERROR_MD5 = 11,
+    UPDATE_ERROR_MAGIC_BYTE = 12
+};

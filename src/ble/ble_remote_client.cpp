@@ -1,5 +1,6 @@
 #include "ble_remote_client.h"
 #include "ble_audio_diagnostics.h"
+#include "ble/mic_session_owner.h"
 #include "audio/audio_pipeline.h"
 #include "led_indicator.h"
 #include "keymap/key_state_machine.h"
@@ -11,6 +12,7 @@
 #include <ArduinoJson.h>
 #include <vector>
 #include <strings.h>
+#include "nimble/porting/nimble/include/nimble/nimble_port.h"
 
 static ble_remote_state_t              s_ble_state = BLE_STATE_DISCONNECTED;
 static NimBLEClient*                   s_client = nullptr;
@@ -108,17 +110,27 @@ static NimBLEAdvertisedDevice*         s_pending_adv_device = nullptr;
 static String                          s_pending_mac = "";
 static uint8_t                         s_pending_addr_type = BLE_ADDR_RANDOM;
 
-static uint8_t                         s_session_id = 0;
 static uint32_t                        s_last_audio_ms = 0;
 static uint32_t                        s_last_audio_frame_ms = 0;
-static bool                            s_req_mic_stop = false;
 static uint32_t                        s_last_scan_ms = 0;
 static uint32_t                        s_last_keepalive_ms = 0;
 static size_t                          s_frame_size = AUDIO_DEFAULT_FRAME_BYTES;
 static void request_audio_conn_params(void);
 static uint16_t                        s_caps_version = 0;
 static uint8_t                         s_caps_codec_mask = 0;
-static bool                            s_mic_open = false;
+static portMUX_TYPE                    s_mic_control_mux = portMUX_INITIALIZER_UNLOCKED;
+static remotemapper::ble::MicSessionOwner s_mic_owner = {1, 0, 0, false, false, false};
+static bool                            s_req_mic_stop = false;
+static uint32_t                        s_req_mic_stop_epoch = 0;
+static uint32_t                        s_voice_hogp_epoch = 0; // NimBLE host task only
+static bool                            s_voice_timeout_pending = false;
+static uint32_t                        s_voice_timeout_generation = 0;
+static uint32_t                        s_voice_timeout_since_ms = 0;
+static uint32_t                        s_voice_timeout_last_frame_ms = 0;
+static struct ble_npl_event            s_forced_mic_close_event = {};
+static struct ble_npl_eventq*           s_nimble_eventq = nullptr;
+static bool                            s_mic_event_ready = false;
+static volatile bool                   s_mic_event_posted = false;
 
 // The remote encodes 16 kHz when the 0x02 codec bit is offered, 8 kHz otherwise
 // (see HD838A/remote-mic-app ATVVCapabilities.parse). We can only play 16 kHz
@@ -136,6 +148,155 @@ static uint8_t atvv_select_codec(uint8_t mask) {
 
 static uint32_t atvv_codec_sample_rate(uint8_t codec) {
     return (codec == ATVV_CODEC_16K) ? 16000u : 8000u;
+}
+
+static void restore_mic_stop_request(uint32_t expected_epoch);
+static void audio_frame_acc_reset(void);
+
+static void write_hogp_mic_open(uint32_t epoch, uint16_t caps_version,
+                                uint8_t codec) {
+    if (!s_char_cmd) return;
+    bool wrote = false;
+    if (caps_version >= 0x0100) {
+        const uint8_t open[] = {0x0C, 0x00};
+        wrote = s_char_cmd->writeValue(open, sizeof(open), false);
+        app_log("ATVV", "MIC_OPEN {0x0C,0x00} ver=0x%04X codec=0x%02X/16kHz",
+                caps_version, (unsigned)codec);
+    } else {
+        const uint8_t open[] = {0x0C, 0x00, codec};
+        wrote = s_char_cmd->writeValue(open, sizeof(open), false);
+        app_log("ATVV", "MIC_OPEN {0x0C,0x00,0x%02X} legacy ver=0x%04X codec=0x%02X/16kHz",
+                (unsigned)codec, caps_version, (unsigned)codec);
+    }
+    if (!wrote) {
+        portENTER_CRITICAL(&s_mic_control_mux);
+        if (s_mic_owner.epoch == epoch) s_mic_owner.open = false;
+        portEXIT_CRITICAL(&s_mic_control_mux);
+    } else {
+        audio_frame_acc_reset();
+    }
+}
+
+static void write_hogp_mic_close(const remotemapper::ble::MicCloseCommand &command) {
+    if (!s_char_cmd || !s_client || !s_client->isConnected()) {
+        restore_mic_stop_request(command.epoch);
+        return;
+    }
+    const uint8_t close[] = {0x0D, command.session_id};
+    if (!s_char_cmd->writeValue(close, sizeof(close), false)) {
+        restore_mic_stop_request(command.epoch);
+        return;
+    }
+    portENTER_CRITICAL(&s_mic_control_mux);
+    remotemapper::ble::finish_mic_close(s_mic_owner, command);
+    portEXIT_CRITICAL(&s_mic_control_mux);
+    s_ble_state = BLE_STATE_CONNECTED;
+    app_log("ATVV", "MIC_CLOSE {0x0D,0x%02X} on Voice key release",
+            (unsigned)command.session_id);
+}
+
+static void restore_mic_stop_request(uint32_t expected_epoch) {
+    portENTER_CRITICAL(&s_mic_control_mux);
+    if (s_mic_owner.epoch == expected_epoch && s_mic_owner.active && s_mic_owner.open) {
+        s_req_mic_stop_epoch = expected_epoch;
+        s_req_mic_stop = true;
+    }
+    portEXIT_CRITICAL(&s_mic_control_mux);
+}
+
+static bool post_mic_owner_event(void) {
+    if (!s_mic_event_ready || !s_nimble_eventq) return false;
+    if (!__atomic_exchange_n(&s_mic_event_posted, true, __ATOMIC_ACQ_REL)) {
+        // NimBLE 1.4.3 exposes a void eventq_put. Its FreeRTOS implementation
+        // blocks until queue space exists; this producer is never the host task.
+        ble_npl_eventq_put(s_nimble_eventq, &s_forced_mic_close_event);
+    }
+    return true;
+}
+
+static void forced_mic_close_event_cb(struct ble_npl_event *event) {
+    (void)event;
+    // This flag deduplicates producers and protects the NPL event's queued bit
+    // from the dequeue/post race in the 1.4.3 FreeRTOS port.
+    __atomic_store_n(&s_mic_event_posted, false, __ATOMIC_RELEASE);
+
+    bool have_voice_timeout = false;
+    uint32_t timeout_generation = 0;
+    uint32_t timeout_since_ms = 0;
+    uint32_t timeout_last_frame_ms = 0;
+    portENTER_CRITICAL(&s_mic_control_mux);
+    if (s_voice_timeout_pending) {
+        have_voice_timeout = true;
+        timeout_generation = s_voice_timeout_generation;
+        timeout_since_ms = s_voice_timeout_since_ms;
+        timeout_last_frame_ms = s_voice_timeout_last_frame_ms;
+        s_voice_timeout_pending = false;
+    }
+    portEXIT_CRITICAL(&s_mic_control_mux);
+    if (have_voice_timeout) {
+        usb_composite_guard_force_voice_rx_timeout(timeout_generation,
+                timeout_since_ms, timeout_last_frame_ms);
+    }
+
+    const bool pipeline_active = audio_pipeline_is_active(&g_audio_pipeline);
+    remotemapper::ble::MicCloseCommand command = {};
+    bool should_retry = false;
+    uint32_t retry_epoch = 0;
+    portENTER_CRITICAL(&s_mic_control_mux);
+    const bool accepted = remotemapper::ble::take_mic_close(
+            s_mic_owner, pipeline_active, &command);
+    should_retry = !accepted && s_mic_owner.close_pending &&
+            s_mic_owner.pending_close_epoch == s_mic_owner.epoch;
+    if (should_retry) retry_epoch = s_mic_owner.pending_close_epoch;
+    portEXIT_CRITICAL(&s_mic_control_mux);
+
+    if (!accepted) {
+        if (should_retry) restore_mic_stop_request(retry_epoch);
+        return;
+    }
+
+    NimBLERemoteCharacteristic *characteristic = s_char_cmd;
+    if (!characteristic || !s_client || !s_client->isConnected()) {
+        restore_mic_stop_request(command.epoch);
+        return;
+    }
+
+    const uint8_t close[] = {0x0D, command.session_id};
+    if (!characteristic->writeValue(close, sizeof(close), false)) {
+        restore_mic_stop_request(command.epoch);
+        return;
+    }
+
+    portENTER_CRITICAL(&s_mic_control_mux);
+    remotemapper::ble::finish_mic_close(s_mic_owner, command);
+    portEXIT_CRITICAL(&s_mic_control_mux);
+    s_ble_state = BLE_STATE_CONNECTED;
+    app_log("ATVV", "MIC_CLOSE after forced voice stop (epoch=%u session=%u)",
+            (unsigned)command.epoch, (unsigned)command.session_id);
+}
+
+static void process_mic_stop_request(void) {
+    if (audio_pipeline_is_active(&g_audio_pipeline)) return;
+
+    uint32_t expected_epoch = 0;
+    remotemapper::ble::MicCloseCommand ignored = {};
+    bool should_post = false;
+    portENTER_CRITICAL(&s_mic_control_mux);
+    if (s_req_mic_stop) {
+        expected_epoch = s_req_mic_stop_epoch;
+        s_req_mic_stop = false;
+        should_post = remotemapper::ble::prepare_mic_close(
+                s_mic_owner, expected_epoch, &ignored);
+    }
+    portEXIT_CRITICAL(&s_mic_control_mux);
+    if (!should_post) return;
+
+    if (!post_mic_owner_event()) {
+        portENTER_CRITICAL(&s_mic_control_mux);
+        remotemapper::ble::mic_close_enqueue_failed(s_mic_owner, expected_epoch);
+        portEXIT_CRITICAL(&s_mic_control_mux);
+        restore_mic_stop_request(expected_epoch);
+    }
 }
 
 // Power save: while connected, no continuous scan. WebUI requests short
@@ -438,23 +599,56 @@ static void on_ctl_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, siz
         s_rx_prev_ms = 0;
         s_rx_have_prev = false;
         portEXIT_CRITICAL(&s_rx_mux);
-        s_session_id = (length >= 4) ? pData[3] : 0;
-        s_ble_state = BLE_STATE_TALKING;
+        const uint8_t session_id = (length >= 4) ? pData[3] : 0;
         s_last_audio_ms = millis();
         // BLE owns decoder/filter/resampler state. Publish the new epoch and
         // reset producer state here before key-engine delivery starts USB audio.
-        audio_pipeline_prepare_session(&g_audio_pipeline, s_session_id);
-
+        key_engine_lock_state(&g_key_engine);
+        const bool already_pressed = g_key_engine.states[1].is_pressed;
+        audio_pipeline_prepare_session(&g_audio_pipeline, session_id);
         key_engine_feed_key(&g_key_engine, MI_KEY_VOICE, true, millis());
-        app_log("ATVV", ">>> Voice button PRESSED (session %d)", s_session_id);
+        const bool voice_action = g_key_engine.states[1].is_pressed &&
+                g_key_engine.last_telemetry.action_type == ACTION_VOICE_HOLD;
+        portENTER_CRITICAL(&s_mic_control_mux);
+        if (voice_action) {
+            s_voice_hogp_epoch = remotemapper::ble::accept_mic_audio_start(
+                    s_mic_owner, s_voice_hogp_epoch, already_pressed, session_id);
+        } else {
+            const uint32_t epoch = remotemapper::ble::candidate_mic_epoch(s_mic_owner);
+            remotemapper::ble::begin_mic_session(s_mic_owner, epoch, session_id, true);
+            s_voice_hogp_epoch = 0;
+        }
+        portEXIT_CRITICAL(&s_mic_control_mux);
+        key_engine_unlock_state(&g_key_engine);
+        s_ble_state = BLE_STATE_TALKING;
+        app_log("ATVV", ">>> Voice button PRESSED (session %d)", session_id);
     }
     // AUDIO_STOP / MIC_CLOSED / release op (0x00 or 0x08):
     else if (op == 0x00 || op == 0x08) {
-        const bool was_open = s_mic_open;
-        s_mic_open = false;
-        if (s_ble_state == BLE_STATE_TALKING || was_open) {
+        key_engine_lock_state(&g_key_engine);
+        portENTER_CRITICAL(&s_mic_control_mux);
+        // The deployed ATVV stop variants do not have one stable session-id
+        // layout. Keep the baseline stop semantics and scope this transition
+        // to the current owner epoch instead of guessing a byte offset.
+        const bool matches = s_ble_state == BLE_STATE_TALKING ||
+                (s_mic_owner.active && s_mic_owner.open);
+        if (matches) {
+            s_mic_owner.active = false;
+            s_mic_owner.open = false;
+            s_mic_owner.close_pending = false;
+            s_mic_owner.pending_close_epoch = 0;
+            s_mic_owner.session_id = 0;
+            s_mic_owner.epoch = remotemapper::ble::next_mic_epoch(s_mic_owner.epoch);
+            s_req_mic_stop = false;
+            s_voice_hogp_epoch = 0;
+        }
+        portEXIT_CRITICAL(&s_mic_control_mux);
+        if (matches) {
             s_ble_state = BLE_STATE_CONNECTED;
             key_engine_feed_key(&g_key_engine, MI_KEY_VOICE, false, millis());
+        }
+        key_engine_unlock_state(&g_key_engine);
+        if (matches) {
             app_log("ATVV", "<<< Voice button RELEASED (op=0x%02X)", op);
         } else {
             app_log("ATVV", "Microphone inactive / standby (op=0x%02X)", op);
@@ -575,67 +769,98 @@ static void on_hogp_report_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pD
         }
     }
 
-    // Auto-release previous key if a new key is pressed without an explicit all-zero release report
-    if (s_last_hogp_key != 0 && is_pressed && raw_key != s_last_hogp_key) {
-        app_log("HOGP", "Auto-Release key 0x%02X due to new key 0x%02X", s_last_hogp_key, raw_key);
-        key_engine_feed_key(&g_key_engine, s_last_hogp_key, false, millis());
-        s_last_hogp_key = 0;
-    }
-
-    if (is_pressed) {
-        s_last_hogp_key = raw_key;
-    } else {
-        s_last_hogp_key = 0;
-    }
+    const bool voice_key = raw_key == MI_KEY_VOICE || raw_key == MI_KEY_VOICE_ALT;
+    const bool previous_voice_key = s_last_hogp_key == MI_KEY_VOICE ||
+            s_last_hogp_key == MI_KEY_VOICE_ALT;
+    const bool physical_voice_down = voice_key && is_pressed &&
+            (!previous_voice_key || raw_key != s_last_hogp_key);
+    bool write_open = false;
+    uint32_t open_epoch = 0;
+    uint16_t open_caps_version = 0;
+    uint8_t open_codec = 0;
+    bool write_close = false;
+    remotemapper::ble::MicCloseCommand close_command = {};
 
     if (raw_key != 0) {
         app_log("HOGP", "Key event: 0x%02X (%s)", raw_key, is_pressed ? "DOWN" : "UP");
-        if (raw_key == MI_KEY_VOICE || raw_key == MI_KEY_VOICE_ALT) {
-            app_log("VOICE", "Voice button event: 0x%02X (%s)", raw_key, is_pressed ? "DOWN" : "UP");
-            if (is_pressed) {
-                if (s_char_cmd != nullptr) {
-                    // MIC_OPEN. The codec id must match what CAPS advertised,
-                    // otherwise the remote streams at a rate we cannot play.
-                    // 0x0100+ uses the two-byte form and negotiates from the
-                    // capability set; older remotes need an explicit codec byte.
-                    const uint8_t codec = atvv_select_codec(s_caps_codec_mask);
-                    if (atvv_codec_sample_rate(codec) != AUDIO_REMOTE_SAMPLE_RATE) {
-                        app_log("ATVV", "MIC_OPEN refused: remote offers codecs=0x%02X, "
-                                        "need 16kHz (0x%02X)",
-                                (unsigned)s_caps_codec_mask, (unsigned)ATVV_CODEC_16K);
-                    } else if (s_caps_version >= 0x0100) {
-                        uint8_t cmd_open[] = { 0x0C, 0x00 };
-                        s_char_cmd->writeValue(cmd_open, sizeof(cmd_open), false);
-                        s_mic_open = true;
-                        s_session_id = 0;
-                        audio_frame_acc_reset();
-                        app_log("ATVV", "MIC_OPEN {0x0C,0x00} ver=0x%04X codec=0x%02X/16kHz",
-                                s_caps_version, (unsigned)codec);
-                    } else {
-                        uint8_t cmd_open[] = { 0x0C, 0x00, codec };
-                        s_char_cmd->writeValue(cmd_open, sizeof(cmd_open), false);
-                        s_mic_open = true;
-                        s_session_id = 0;
-                        audio_frame_acc_reset();
-                        app_log("ATVV", "MIC_OPEN {0x0C,0x00,0x%02X} legacy ver=0x%04X codec=0x%02X/16kHz",
-                                (unsigned)codec, s_caps_version, (unsigned)codec);
-                    }
-                } else {
-                    app_log("ATVV", "Warning: Voice key pressed but ATVV CMD characteristic unavailable");
-                }
-            } else {
-                if (s_char_cmd != nullptr) {
-                    // MIC_CLOSE is opcode 0x0D (0x00 is a control/status opcode, not
-                    // "close"), so the mic can stay hot until the remote times out.
-                    uint8_t cmd_close[] = { 0x0D, s_session_id };
-                    s_char_cmd->writeValue(cmd_close, sizeof(cmd_close), false);
-                    s_mic_open = false;
-                    app_log("ATVV", "MIC_CLOSE {0x0D,0x%02X} on Voice key release",
-                            (unsigned)s_session_id);
-                }
-            }
+        if (voice_key) {
+            app_log("VOICE", "Voice button event: 0x%02X (%s)", raw_key,
+                    is_pressed ? "DOWN" : "UP");
         }
+    }
+
+    // The physical transition and its owner epoch form one engine transaction.
+    // GATT calls happen only after unlocking, on the NimBLE host callback thread.
+    key_engine_lock_state(&g_key_engine);
+    if (s_last_hogp_key != 0 && is_pressed && raw_key != s_last_hogp_key) {
+        app_log("HOGP", "Auto-Release key 0x%02X due to new key 0x%02X",
+                s_last_hogp_key, raw_key);
+        key_engine_feed_key(&g_key_engine, s_last_hogp_key, false, millis());
+        if (previous_voice_key) {
+            portENTER_CRITICAL(&s_mic_control_mux);
+            write_close = s_voice_hogp_epoch && remotemapper::ble::prepare_mic_close(
+                    s_mic_owner, s_voice_hogp_epoch, &close_command);
+            s_voice_hogp_epoch = 0;
+            portEXIT_CRITICAL(&s_mic_control_mux);
+        }
+    }
+
+    if (is_pressed) s_last_hogp_key = raw_key;
+    else s_last_hogp_key = 0;
+
+    if (raw_key != 0) {
+        const bool was_voice_pressed = g_key_engine.states[1].is_pressed;
         key_engine_feed_key(&g_key_engine, raw_key, is_pressed, millis());
+
+        if (voice_key && is_pressed && physical_voice_down &&
+                g_key_engine.states[1].is_pressed &&
+                g_key_engine.last_telemetry.action_type == ACTION_VOICE_HOLD) {
+            const uint8_t codec = atvv_select_codec(s_caps_codec_mask);
+            const bool codec_ok = atvv_codec_sample_rate(codec) == AUDIO_REMOTE_SAMPLE_RATE;
+            portENTER_CRITICAL(&s_mic_control_mux);
+            // AUDIO_START may already own this press before the HOGP DOWN
+            // report arrives. Adopt that epoch/session instead of replacing it.
+            if (s_mic_owner.active && was_voice_pressed) {
+                open_epoch = s_mic_owner.epoch;
+                // The HOGP command itself explicitly opens session 0 in the
+                // existing protocol. AUDIO_START may subsequently publish the
+                // remote-assigned id; keep the local epoch separate from it.
+                s_mic_owner.session_id = 0;
+                s_mic_owner.open = codec_ok && s_char_cmd != nullptr;
+            } else {
+                open_epoch = remotemapper::ble::candidate_mic_epoch(s_mic_owner);
+                remotemapper::ble::begin_mic_session(s_mic_owner, open_epoch, 0,
+                        codec_ok && s_char_cmd != nullptr);
+            }
+            s_voice_hogp_epoch = open_epoch;
+            portEXIT_CRITICAL(&s_mic_control_mux);
+
+            if (!s_char_cmd) {
+                app_log("ATVV", "Warning: Voice key pressed but ATVV CMD characteristic unavailable");
+            } else if (!codec_ok) {
+                app_log("ATVV", "MIC_OPEN refused: remote offers codecs=0x%02X, need 16kHz (0x%02X)",
+                        (unsigned)s_caps_codec_mask, (unsigned)ATVV_CODEC_16K);
+            } else {
+                write_open = true;
+                open_caps_version = s_caps_version;
+                open_codec = codec;
+            }
+        } else if (voice_key && !is_pressed) {
+            portENTER_CRITICAL(&s_mic_control_mux);
+            write_close = s_voice_hogp_epoch && remotemapper::ble::prepare_mic_close(
+                    s_mic_owner, s_voice_hogp_epoch, &close_command);
+            s_voice_hogp_epoch = 0;
+            portEXIT_CRITICAL(&s_mic_control_mux);
+        }
+    }
+    key_engine_unlock_state(&g_key_engine);
+
+    // Preserve the remote's command order when one report replaces one held
+    // voice key with another; a queued forced close still carries the old epoch.
+    if (write_close) write_hogp_mic_close(close_command);
+    if (write_open) write_hogp_mic_open(open_epoch, open_caps_version, open_codec);
+
+    if (raw_key != 0) {
         if (is_pressed) {
             // Arm the link-liveness probe: if nothing at all arrives within the
             // window (release lost, or the notification stream died), the tick
@@ -797,8 +1022,12 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         s_dev_fw = "";
         s_dev_sw = "";
           s_last_hogp_key = 0;
-          s_mic_open = false;
-          s_session_id = 0;
+          portENTER_CRITICAL(&s_mic_control_mux);
+          remotemapper::ble::disconnect_mic_owner(s_mic_owner);
+          s_req_mic_stop = false;
+          s_req_mic_stop_epoch = 0;
+          s_voice_hogp_epoch = 0;
+          portEXIT_CRITICAL(&s_mic_control_mux);
           s_caps_version = 0;
           s_caps_codec_mask = 0;
           portENTER_CRITICAL(&s_rx_mux);
@@ -1585,6 +1814,11 @@ void ble_remote_init(void) {
     }
 
     NimBLEDevice::init("ESP32-RemoteBridge");
+    s_nimble_eventq = nimble_port_get_dflt_eventq();
+    if (s_nimble_eventq) {
+        ble_npl_event_init(&s_forced_mic_close_event, forced_mic_close_event_cb, nullptr);
+        s_mic_event_ready = true;
+    }
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     // Just Works bonding: bonding=true, mitm=false, sc=true
     // (MITM must be false because BLE_HS_IO_NO_INPUT_OUTPUT cannot support MITM authentication)
@@ -1617,18 +1851,7 @@ void ble_remote_gatt_dump_request(bool on) {
 
 void ble_remote_task(void) {
     uint32_t now = millis();
-
-    if (__atomic_exchange_n(&s_req_mic_stop, false, __ATOMIC_ACQ_REL) &&
-            !audio_pipeline_is_active(&g_audio_pipeline)) {
-        if (s_client && s_client->isConnected() && s_char_cmd &&
-                (s_mic_open || s_ble_state == BLE_STATE_TALKING)) {
-            uint8_t close[] = {0x0D, s_session_id};
-            s_char_cmd->writeValue(close, sizeof(close), false);
-            app_log("ATVV", "MIC_CLOSE after forced voice stop");
-        }
-        s_mic_open = false;
-        if (s_ble_state == BLE_STATE_TALKING) s_ble_state = BLE_STATE_CONNECTED;
-    }
+    process_mic_stop_request();
 
     // 1. Process asynchronous unpair / reconnect requests from Core 1
     if (s_req_unpair || s_req_reconnect) {
@@ -1868,6 +2091,29 @@ uint32_t ble_remote_last_audio_frame_ms(void) {
     return __atomic_load_n(&s_last_audio_frame_ms, __ATOMIC_ACQUIRE);
 }
 
+bool ble_remote_request_voice_rx_timeout(uint32_t registry_generation,
+        uint32_t voice_since_ms, uint32_t last_frame_ms) {
+    portENTER_CRITICAL(&s_mic_control_mux);
+    if (!s_voice_timeout_pending) {
+        s_voice_timeout_generation = registry_generation;
+        s_voice_timeout_since_ms = voice_since_ms;
+        s_voice_timeout_last_frame_ms = last_frame_ms;
+        s_voice_timeout_pending = true;
+    }
+    portEXIT_CRITICAL(&s_mic_control_mux);
+    if (post_mic_owner_event()) return true;
+
+    portENTER_CRITICAL(&s_mic_control_mux);
+    if (s_voice_timeout_pending &&
+            s_voice_timeout_generation == registry_generation &&
+            s_voice_timeout_since_ms == voice_since_ms &&
+            s_voice_timeout_last_frame_ms == last_frame_ms) {
+        s_voice_timeout_pending = false;
+    }
+    portEXIT_CRITICAL(&s_mic_control_mux);
+    return false;
+}
+
 void ble_remote_get_audio_rx_diagnostics(ble_audio_rx_diagnostics_t* out) {
     if (!out) return;
     ble_audio_diag_window_t snapshot;
@@ -1891,7 +2137,16 @@ void ble_remote_get_audio_rx_diagnostics(ble_audio_rx_diagnostics_t* out) {
 }
 
 void ble_remote_request_mic_stop(void) {
-    __atomic_store_n(&s_req_mic_stop, true, __ATOMIC_RELEASE);
+    // Capturing the owner while holding the same engine transaction boundary
+    // as HOGP DOWN prevents an old release from claiming a not-yet-open session.
+    key_engine_lock_state(&g_key_engine);
+    portENTER_CRITICAL(&s_mic_control_mux);
+    if (s_mic_owner.active && s_mic_owner.open) {
+        s_req_mic_stop_epoch = s_mic_owner.epoch;
+        s_req_mic_stop = true;
+    }
+    portEXIT_CRITICAL(&s_mic_control_mux);
+    key_engine_unlock_state(&g_key_engine);
 }
 
 void ble_remote_trigger_reconnect(void) {

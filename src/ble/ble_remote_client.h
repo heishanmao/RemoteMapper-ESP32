@@ -43,6 +43,10 @@ void ble_remote_init(void);
 
 // Last complete ATVV frame received (independent of volume/USB backpressure).
 uint32_t ble_remote_last_audio_frame_ms(void);
+// Queue a stale-frame decision onto the NimBLE host owner. The host callback
+// revalidates registry/session timestamps immediately before release.
+bool ble_remote_request_voice_rx_timeout(uint32_t registry_generation,
+        uint32_t voice_since_ms, uint32_t last_frame_ms);
 // Copy the live primitive-counter window for a status/API consumer.
 void ble_remote_get_audio_rx_diagnostics(ble_audio_rx_diagnostics_t* out);
 // Defer mic close to the BLE task; a new active session supersedes this request.
