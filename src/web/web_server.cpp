@@ -10,6 +10,7 @@
 #include "usb/hid_diagnostics.h"
 #include "usb/dwc2_diagnostics.h"
 #include "core_diagnostics.h"
+#include "runtime_diagnostics.h"
 #include "keymap/key_state_machine.h"
 #include "keymap/key_config_storage.h"
 #include "nvs/nvs_manager.h"
@@ -46,6 +47,9 @@ static void handle_status() {
     doc["samples_pushed"] = g_audio_pipeline.total_samples_pushed;
     doc["free_heap"] = ESP.getFreeHeap();
     doc["free_psram"] = ESP.getFreePsram();
+    doc["usb_initialized"] = usb_composite_is_initialized();
+    runtime_diagnostics_json(doc["runtime"].to<JsonObject>());
+    doc["log_mirror_dropped"] = app_log_get_mirror_dropped();
     doc["ap_ip"] = wifi_manager_get_ap_ip();
     doc["sta_ip"] = wifi_manager_get_sta_ip();
     doc["sta_connected"] = wifi_manager_is_sta_connected();
@@ -114,7 +118,7 @@ static void handle_audio() {
     doc["usb_last_complete_ms"] = tx.last_complete_ms;
     doc["usb_endpoint"] = tx.endpoint;
     doc["usb_recovery_pending"] = tx.recovery_pending;
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
     remotemapper_dwc2_stats_t dcd = {};
     remotemapper_dwc2_get_stats(&dcd);
     JsonObject controller = doc["dwc2"].to<JsonObject>();
@@ -157,6 +161,21 @@ static void handle_audio() {
     doc["padded_samples"] = (int)g_audio_pipeline.padded_samples;
     doc["frames_decoded"] = (int)g_audio_pipeline.total_frames_decoded;
     doc["samples_pushed"] = (int)g_audio_pipeline.total_samples_pushed;
+    ble_audio_rx_diagnostics_t rx = {};
+    ble_remote_get_audio_rx_diagnostics(&rx);
+    JsonObject rx_window = doc["rx_window"].to<JsonObject>();
+    rx_window["frames"] = rx.frames;
+    rx_window["elapsed_ms"] = rx.elapsed_ms;
+    rx_window["fps_x10"] = rx.fps_x10;
+    rx_window["interval_count"] = rx.interval_count;
+    rx_window["interval_avg_ms"] = rx.interval_avg_ms;
+    rx_window["interval_max_ms"] = rx.interval_max_ms;
+    rx_window["long_intervals"] = rx.long_intervals;
+    rx_window["decode_avg_us"] = rx.decode_avg_us;
+    rx_window["decode_max_us"] = rx.decode_max_us;
+    rx_window["len_other"] = rx.len_other;
+    rx_window["partial"] = rx.partial;
+    rx_window["decode_drop"] = rx.decode_drop;
 
     // Spectral probe on the decoded sequence: if there is real energy above
     // 6000 Hz then the remote captured above 12 kHz and ships 1/1 pitch, so the
@@ -191,7 +210,7 @@ static void handle_audio() {
 static void handle_cores() {
     wifi_manager_mark_activity();
     JsonDocument doc;
-    core_diagnostics_json(doc.as<JsonObject>());
+    core_diagnostics_json(doc.to<JsonObject>());
     String out;
     serializeJson(doc, out);
     s_server.send(200, "application/json", out);
@@ -219,9 +238,15 @@ static void handle_guard() {
     doc["tx_failed"] = stats.tx_failed;
     doc["pending_ms"] = stats.pending_ms;
     doc["usb_recoveries"] = stats.usb_recoveries;
+    uint32_t recovery_audio = 0, recovery_hid = 0, recovery_wakeup = 0;
+    usb_composite_recovery_reason_counts(&recovery_audio, &recovery_hid, &recovery_wakeup);
+    doc["usb_recovery_audio"] = recovery_audio;
+    doc["usb_recovery_hid"] = recovery_hid;
+    doc["usb_recovery_wakeup"] = recovery_wakeup;
     doc["recovery_exhausted"] = stats.recovery_exhausted;
+    doc["transport_recovering"] = stats.transport_recovering;
     hid_diagnostics_json(doc["hid_diagnostics"].to<JsonObject>());
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
     usb_hid_stress_stats_t stress = {};
     usb_hid_stress_get(&stress);
     JsonObject test = doc["usb_stress"].to<JsonObject>();

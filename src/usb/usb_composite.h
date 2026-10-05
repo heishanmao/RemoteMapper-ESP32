@@ -14,19 +14,21 @@ extern "C" {
  * @brief Initialize TinyUSB stack with UAC 1.0 Microphone, HID Keyboard & Consumer, and CDC Serial
  */
 void usb_composite_init(void);
+bool usb_composite_is_initialized(void);
 
 /**
  * @brief Process periodic TinyUSB device tasks
  */
 void usb_composite_task(void);
 
-typedef enum { USB_RECOVERY_NONE, USB_RECOVERY_AUDIO, USB_RECOVERY_HID } usb_recovery_reason_t;
+typedef enum { USB_RECOVERY_NONE, USB_RECOVERY_AUDIO, USB_RECOVERY_HID, USB_RECOVERY_WAKE } usb_recovery_reason_t;
 void usb_composite_request_recovery(usb_recovery_reason_t reason);
 uint32_t usb_composite_recovery_count(void);
+void usb_composite_recovery_reason_counts(uint32_t *audio, uint32_t *hid, uint32_t *wakeup);
 uint32_t usb_composite_boot_reset_reason(void);
 bool usb_composite_boot_usb_recovery_restart(void);
 
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
 // Bounded laboratory test: sends only idle reports and yields to real input.
 typedef struct {
     bool active;
@@ -110,6 +112,7 @@ typedef struct {
     uint32_t pending_ms;
     uint32_t usb_recoveries;
     bool recovery_exhausted;
+    bool transport_recovering; // submissions gated until a fresh host mount
     uint32_t held_count;        // Number of currently registered held entries
 } usb_guard_stats_t;
 

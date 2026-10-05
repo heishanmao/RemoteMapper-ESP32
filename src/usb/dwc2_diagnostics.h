@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
 #ifdef __cplusplus
 extern "C" {
 #endif

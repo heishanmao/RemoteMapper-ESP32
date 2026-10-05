@@ -7,12 +7,14 @@
 
 namespace {
 constexpr unsigned EVENT_COUNT = 24;
-constexpr unsigned STAGES = 9;
+constexpr unsigned STAGES = 12;
 // Hook ABI: attempt, uninitialized, mutex_timeout, not_ready, submitted,
-// submit_rejected, completion_timeout, wait_success, callback.
+// submit_rejected, completion_timeout, wait_success, callback,
+// previous_pending, callback_rejected, lifecycle_cancelled.
 const char* const names[STAGES] = {"attempt", "uninitialized", "mutex_timeout",
     "not_ready", "submitted", "submit_rejected", "completion_timeout",
-    "wait_success", "callback"};
+    "wait_success", "callback", "previous_pending", "callback_rejected",
+    "lifecycle_cancelled"};
 struct Registers {
     uint32_t empty_mask, ctl, size, interrupt, fifo_free, all_interrupt,
         all_mask, global_interrupt, global_mask, status;
@@ -144,7 +146,7 @@ void hid_diagnostics_json(JsonObject out) {
     portENTER_CRITICAL(&mux);
     current = live; saved = fault;
     portEXIT_CRITICAL(&mux);
-    out["schema"] = 1;
+    out["schema"] = 2;
     emit_trace(out["live"].to<JsonObject>(), current);
     JsonObject last = out["last_fault"].to<JsonObject>();
     last["count"] = saved.count; last["ms"] = saved.ms;

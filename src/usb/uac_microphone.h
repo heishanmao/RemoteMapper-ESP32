@@ -17,6 +17,7 @@ void uac_microphone_get_fifo_rearm_stats(uint32_t* attempts, uint32_t* completio
 void uac_microphone_get_pcm_stats(uint32_t* samples, uint32_t* nonzero,
                                   uint64_t* absolute_sum, uint16_t* peak);
 bool uac_microphone_init(void);
+bool uac_microphone_is_ready(void);
 void uac_microphone_task(void);
 bool uac_microphone_is_streaming(void);
 void uac_microphone_get_control(uint8_t* mute, int16_t* volume);

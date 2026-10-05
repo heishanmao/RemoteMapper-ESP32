@@ -8,7 +8,9 @@
 #include "keymap/key_state_machine.h"
 #include "keymap/key_config_storage.h"
 #include "core_diagnostics.h"
+#include "runtime_diagnostics.h"
 #include "usb/usb_composite.h"
+#include "usb/uac_microphone.h"
 #include "ble/ble_remote_client.h"
 #include "cli/cli_manager.h"
 #include "led_indicator.h"
@@ -19,6 +21,7 @@
 #include <nvs.h>
 
 key_mapper_engine_t g_key_engine;
+static bool s_critical_startup_ok = false;
 
 // Core placement contract. The DWC2 driver protects DIEPEMPMSK with a shared
 // spinlock because HID submissions and the USB ISR run on different cores; if
@@ -29,7 +32,7 @@ static_assert(TASK_CORE_LED == TASK_CORE_USB, "LED task follows the USB core");
 static_assert(PRIO_TASK_USB > PRIO_TASK_BLE, "USB outranks BLE");
 static_assert(PRIO_TASK_BLE > PRIO_TASK_HID_STRESS, "stress sender must not outrank BLE");
 
-// loopTask carries TinyUSB, Wi-Fi, the web server and the CLI. Its core comes
+// loopTask carries USB recovery, Wi-Fi, the web server and the CLI. Its core comes
 // from the framework's generated sdkconfig (CONFIG_ARDUINO_RUNNING_CORE) rather
 // than this project, so check it here: a framework-side default flip would
 // otherwise move all of that traffic onto the BLE core unnoticed.
@@ -63,7 +66,9 @@ void setup() {
     app_log_init();
     
     // 1.5. Initialize LED Indicator
-    led_indicator_init();
+    if (!led_indicator_init()) {
+        app_log("INIT", "LED indicator task unavailable");
+    }
 
     // 2. Initialize USB Composite Stack (UAC Mic + HID Keyboard + Consumer + CDC)
     usb_composite_init();
@@ -76,9 +81,8 @@ void setup() {
     app_log("SYSTEM", "==================================================");
     app_log("SYSTEM", "CPU frequency: %u MHz", (unsigned)(getCpuFrequencyMhz()));
 
-    // 3. Initialize Audio Pipeline
-    audio_pipeline_init(&g_audio_pipeline);
-    app_log("INIT", "Audio Pipeline initialized (16kHz 16-bit Mono UAC 1.0)");
+    // UAC initialization owns the shared audio pipeline and initializes it
+    // once before creating the USB TX worker.
 
     // 4. Initialize Key Engine with USB HID dispatcher callback and restore NVS mappings
     key_engine_init(&g_key_engine, usb_hid_dispatch_action);
@@ -109,7 +113,7 @@ void setup() {
 
     // 8. Launch BLE Central Task pinned to Core 0
     TaskHandle_t ble_task = nullptr;
-    xTaskCreatePinnedToCore(
+    const BaseType_t ble_task_created = xTaskCreatePinnedToCore(
         ble_task_core0,
         "ble_audio_task",
         8192,
@@ -118,7 +122,18 @@ void setup() {
         &ble_task,
         TASK_CORE_BLE
     );
-    core_diagnostics_register("ble_audio_task", ble_task, TASK_CORE_BLE);
+    if (ble_task_created == pdPASS) {
+        core_diagnostics_register("ble_audio_task", ble_task, TASK_CORE_BLE);
+    } else {
+        app_log("INIT", "Failed to spawn BLE task");
+    }
+
+    s_critical_startup_ok = ble_task_created == pdPASS && usb_composite_is_initialized() &&
+            uac_microphone_is_ready();
+    runtime_diagnostics_set_startup_health(s_critical_startup_ok);
+    if (!s_critical_startup_ok) {
+        app_log("INIT", "Critical startup incomplete; OTA safe-boot confirmation withheld");
+    }
 
     if (wifi_manager_get_enabled()) {
         app_log("SYSTEM", "System initialization complete. Web available at http://192.168.4.1 or http://remotemapper.local");
@@ -135,9 +150,10 @@ void setup() {
 }
 
 void loop() {
-    uint32_t now = millis();
+    const uint32_t loop_started_us = runtime_diagnostics_loop_begin();
 
-    // 1. Service TinyUSB & Audio push
+    // 1. Service application-level USB recovery and audio state. TinyUSB
+    //    transfer callbacks run from the framework's usbd task.
     usb_composite_task();
 
     // 2. Service Wi-Fi & DNS tasks
@@ -152,19 +168,16 @@ void loop() {
     cli_manager_task();
 
     // 5. Confirm safe-boot watchdog once the new firmware has run stably
-    ota_manager_watchdog_confirm();
+    if (s_critical_startup_ok && usb_composite_is_initialized() && uac_microphone_is_ready()) {
+        ota_manager_watchdog_confirm();
+    }
 
     // 6. Flush audio RX accounting from the loop task. This must never run in
     // the NimBLE host task, which is the single dispatcher for every BLE
     // notification (key reports included) and has a shallow stack.
-      ble_audio_rx_diagnostics_tick();
-
-      // 3. Confirm a pending OTA boot so the safe-boot watchdog stops counting.
-      //    Without this the device rolls back to the previous app partition after
-      //    OTA_WATCHDOG_TRIES (3) unconfirmed boots. Self-guarded: it only acts
-      //    once a watchdog boot is armed and OTA_WATCHDOG_CONFIRM_MS has elapsed.
-      ota_manager_watchdog_confirm();
-
+    ble_audio_rx_diagnostics_tick();
+    app_log_task();
+    runtime_diagnostics_loop_end(loop_started_us);
 
     // USB audio task handles its own timing via vTaskDelayUntil. Keep this a
     // few ms so the loop does not spin (Core 1 wakeups) while still servicing

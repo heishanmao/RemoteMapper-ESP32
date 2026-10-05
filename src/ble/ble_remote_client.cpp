@@ -1,4 +1,5 @@
 #include "ble_remote_client.h"
+#include "ble_audio_diagnostics.h"
 #include "audio/audio_pipeline.h"
 #include "led_indicator.h"
 #include "keymap/key_state_machine.h"
@@ -9,6 +10,7 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <vector>
+#include <strings.h>
 
 static ble_remote_state_t              s_ble_state = BLE_STATE_DISCONNECTED;
 static NimBLEClient*                   s_client = nullptr;
@@ -49,15 +51,33 @@ static String                          s_connected_name = "";
 static String                          s_connected_mac = "";
 
 // In-memory discovered BLE device cache (thread-safe, fed by Core 0 continuous scan)
+#define BLE_DISCOVERY_LIMIT 30
+#define BLE_NAME_MAX_LEN 64
 struct DiscoveredBleDevice {
-    String   name;
-    String   mac;
+    char     name[BLE_NAME_MAX_LEN];
+    char     mac[18];
     int      rssi;
     uint8_t  type;
     uint32_t last_seen_ms;
 };
-static std::vector<DiscoveredBleDevice> s_discovered_devices;
+static DiscoveredBleDevice s_discovered_devices[BLE_DISCOVERY_LIMIT] = {};
+static size_t                          s_discovered_count = 0;
 static portMUX_TYPE                    s_disc_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void copy_clean_ble_name(char* out, size_t capacity, const char* in) {
+    if (!capacity) return;
+    size_t used = 0;
+    if (in) {
+        for (const unsigned char* p = (const unsigned char*)in; *p && used + 1 < capacity; ++p) {
+            if (*p >= 0x20 && *p != 0x7F) out[used++] = (char)*p;
+        }
+    }
+    if (used == 0) {
+        const char* fallback = "Unnamed BLE Device";
+        while (*fallback && used + 1 < capacity) out[used++] = *fallback++;
+    }
+    out[used] = '\0';
+}
 
 // BLE advertisements around the house often carry "names" that are actually
 // binary payloads (temperature counters, control bytes, ...). ArduinoJson only
@@ -203,23 +223,11 @@ static void on_battery_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData,
 // ble_audio_rx_diagnostics_tick() does the printing from the Arduino loop task.
 // ---------------------------------------------------------------------------
 
-typedef struct {
-    volatile uint32_t frames;
-    volatile uint32_t len_other;
-    volatile uint32_t dt_sum;
-    volatile uint32_t dt_max;
-    volatile uint32_t gaps;
-    volatile uint32_t decode_us_sum;
-    volatile uint32_t decode_us_max;
-    volatile uint32_t partial;    // notifications that did not end on a frame boundary
-    volatile uint32_t decode_drop; // frames the pipeline accepted but emitted nothing for
-    uint32_t win_start_ms;   // window start; written by the tick, not the callback
-    uint32_t win_last_ms;    // last notification seen in the window
-} audio_rx_window_t;
-
-static audio_rx_window_t s_rx_win = {0};
-static volatile uint32_t s_rx_prev_ms = 0;
-static volatile bool     s_rx_dirty = false;
+static ble_audio_diag_window_t s_rx_win = {};
+static uint32_t s_rx_prev_ms = 0;
+static bool s_rx_have_prev = false;
+static bool s_rx_dirty = false;   // protected by s_rx_mux
+static portMUX_TYPE s_rx_mux = portMUX_INITIALIZER_UNLOCKED;
 // Bumped on every disconnect. The handshake sleeps ~350 ms in vTaskDelay calls
 // spread across GATT discovery, and NimBLE frees its service/characteristic
 // objects the moment the link drops. isConnected() is not a safe liveness test
@@ -236,8 +244,8 @@ static bool handshake_still_valid(uint32_t gen) {
 }
 static uint32_t          s_link_log_due_ms = 0;   // one-shot settle log after connect
 
-// A 120-byte ADPCM frame is 240 samples = 15 ms at 16 kHz, so anything past
-// 1.5x that means at least one notification went missing.
+// A 120-byte ADPCM frame represents 15 ms at 16 kHz. Longer arrival intervals
+// are reported as timing jitter; they do not prove that packets were dropped.
 static const uint32_t AUDIO_RX_GAP_MS = 22;
 
 // IMA ADPCM is a strong recursive predictor: the decoder carries `predictor` and
@@ -265,7 +273,9 @@ static audio_frame_acc_t s_facc = {0};
 // remote's AUDIO_SYNC (op 0x0A), so discarding a partial frame is safe.
 static void audio_frame_acc_reset(void) {
     s_facc.fill = 0;
+    portENTER_CRITICAL(&s_rx_mux);
     s_facc.realigns++;
+    portEXIT_CRITICAL(&s_rx_mux);
 }
 
 // Runs in the NimBLE host task. Deliberately allocation-free and shallow: an
@@ -276,18 +286,24 @@ static void on_audio_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, s
     const uint32_t now = millis();
     s_last_audio_ms = now;
 
-    uint32_t dt = (s_rx_prev_ms == 0) ? 0 : (now - s_rx_prev_ms);
+    uint32_t dt;
+    portENTER_CRITICAL(&s_rx_mux);
+    dt = s_rx_have_prev ? (uint32_t)(now - s_rx_prev_ms) : 0;
     s_rx_prev_ms = now;
+    s_rx_have_prev = true;
+    portEXIT_CRITICAL(&s_rx_mux);
 
     // A notification longer than the buffer cannot be a frame or a pair of
     // frames, so treat it as a link fault and re-align from the next packet.
     if (length > AUD_FRAME_MAX_BYTES + AUDIO_DEFAULT_FRAME_BYTES) {
+        portENTER_CRITICAL(&s_rx_mux);
         s_facc.oversized++;
+        portEXIT_CRITICAL(&s_rx_mux);
         audio_frame_acc_reset();
         return;
     }
 
-    if (length != s_frame_size) s_rx_win.len_other++;
+    const uint32_t len_other = (length != s_frame_size) ? 1u : 0u;
 
     if (s_facc.fill + length > sizeof(s_facc.buf)) {
         // Cannot happen once the size check above passes, but never memcpy
@@ -299,6 +315,7 @@ static void on_audio_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, s
 
     const uint32_t t0 = micros();
     uint32_t decoded_frames = 0;
+    uint32_t decode_drop = 0;
     while (s_facc.fill >= s_frame_size && s_frame_size > 0) {
         // Always consume exactly one frame's worth of bytes: alignment is a
         // structural property of the accumulator, not something to infer from
@@ -313,35 +330,32 @@ static void on_audio_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, s
         // cases above, handled at session boundaries; genuine decode failures
         // are just counted here.
         if (audio_pipeline_feed_adpcm(&g_audio_pipeline, s_facc.buf, s_frame_size) == 0) {
-            s_rx_win.decode_drop++;
+            decode_drop++;
         }
         s_facc.fill -= s_frame_size;
         memmove(s_facc.buf, s_facc.buf + s_frame_size, s_facc.fill);
         decoded_frames++;
     }
+    portENTER_CRITICAL(&s_rx_mux);
     s_facc.frames_out += decoded_frames;
+    portEXIT_CRITICAL(&s_rx_mux);
     if (decoded_frames) {
         __atomic_store_n(&s_last_audio_frame_ms, now, __ATOMIC_RELEASE);
     }
 
     // A partial frame left over means the link is not delivering whole frames
     // back to back. Count it once per notification rather than per frame.
-    if (s_facc.fill > 0) {
-        s_rx_win.partial++;
-    }
+    const uint32_t partial = s_facc.fill > 0 ? 1u : 0u;
 
     const uint32_t us = micros() - t0;   // window-averaged, so 1 us quantisation washes out
-
-    if (dt && decoded_frames) {
-        s_rx_win.frames += decoded_frames;
-        s_rx_win.dt_sum += dt;
-        if (dt > s_rx_win.dt_max) s_rx_win.dt_max = dt;
-        if (dt >= AUDIO_RX_GAP_MS) s_rx_win.gaps++;
-        s_rx_win.decode_us_sum += us;
-        if (us > s_rx_win.decode_us_max) s_rx_win.decode_us_max = us;
-    }
-    s_rx_win.win_last_ms = now;
+    // Decoder and accumulator work stays outside the short cross-core lock.
+    // This one callback then publishes only primitive counters atomically as a
+    // group for the loop's snapshot/reset operation.
+    portENTER_CRITICAL(&s_rx_mux);
+    ble_audio_diag_record(&s_rx_win, now, dt, decoded_frames, us, len_other,
+                          partial, decode_drop, AUDIO_RX_GAP_MS);
     s_rx_dirty = true;
+    portEXIT_CRITICAL(&s_rx_mux);
 }
 
 // Called from the Arduino loop task. All formatting and logging happens here so
@@ -354,53 +368,56 @@ static void on_audio_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, s
 
 void ble_audio_rx_diagnostics_tick(void) {
     log_settled_conn_params();   // one-shot, fires even while no audio is flowing
-    if (!s_rx_dirty) return;
     const uint32_t now = millis();
-    // Close the window on *elapsed* time, and force a flush once audio has been
-    // silent for a while. Gating only on time-since-last-notification stretched
-    // a single window over the whole hold, so "5s: frames=918" actually covered
-    // 13.8 s of audio and the frame rate could not be trusted.
-    const uint32_t elapsed = now - s_rx_win.win_start_ms;
-    const bool timed_out = (now - s_rx_win.win_last_ms) >= AUDIO_RX_GAP_MS * 4;
-    if (elapsed < 5000 && !timed_out) return;
-    s_rx_dirty = false;
+    ble_audio_diag_window_t window;
+    bool should_flush = false;
+    portENTER_CRITICAL(&s_rx_mux);
+    if (s_rx_dirty) {
+        const uint32_t elapsed = ble_audio_diag_elapsed_ms(&s_rx_win);
+        const bool timed_out = (now - s_rx_win.last_rx_ms) >= AUDIO_RX_GAP_MS * 4;
+        if (elapsed >= 5000 || timed_out) {
+            window = s_rx_win;
+            ble_audio_diag_reset(&s_rx_win);
+            s_rx_dirty = false;
+            should_flush = true;
+        }
+    }
+    portEXIT_CRITICAL(&s_rx_mux);
+    if (!should_flush) return;
 
-    const uint32_t n         = s_rx_win.frames;
-    const uint32_t dt_avg    = n ? (s_rx_win.dt_sum / n) : 0;
-    const uint32_t dec_avg   = n ? (s_rx_win.decode_us_sum / n) : 0;
-    // 66.7 frames/s is a complete 16 kHz stream; anything less is dropped audio.
-    const uint32_t fps_x10   = elapsed ? (n * 10000u / elapsed) : 0;
-    const uint32_t lost_pct  = n ? (s_rx_win.gaps * 100u / n) : 0;
-    app_log("AUDIN",
-             "%ums: frames=%u fps=%u.%u (%u%% of 66.7) len_ok=%u len_other=%u partial=%u "
-             "nodec=%u | dt_avg=%ums dt_max=%ums gaps>=%ums=%u (%u%%) | decode avg=%uus max=%uus @%uMHz",
-             (unsigned)elapsed,
-             (unsigned)n, (unsigned)(fps_x10 / 10), (unsigned)(fps_x10 % 10),
-             (unsigned)((fps_x10 * 100u + 333u) / 667u),
-             (unsigned)(n - s_rx_win.len_other), (unsigned)s_rx_win.len_other,
-             (unsigned)s_rx_win.partial, (unsigned)s_rx_win.decode_drop,
-             (unsigned)dt_avg, (unsigned)s_rx_win.dt_max, (unsigned)AUDIO_RX_GAP_MS,
-             (unsigned)s_rx_win.gaps, (unsigned)lost_pct, (unsigned)dec_avg,
-             (unsigned)s_rx_win.decode_us_max, (unsigned)ESP.getCpuFreqMHz());
+    const uint32_t n = window.frames;
+    const uint32_t elapsed = ble_audio_diag_elapsed_ms(&window);
+    const uint32_t fps_x10 = ble_audio_diag_fps_x10(&window);
+    const uint32_t interval_avg = window.interval_count
+        ? window.interval_sum_ms / window.interval_count : 0;
+    const uint32_t dec_avg = window.decode_count
+        ? window.decode_us_sum / window.decode_count : 0;
+    // Keep each line well below app_log's 128-byte message buffer so avg and
+    // max decode times remain visible in the ring log and WebUI.
+    app_log("AUDIN", "%ums frames=%u fps=%u.%u len_other=%u partial=%u nodec=%u",
+            (unsigned)elapsed, (unsigned)n, (unsigned)(fps_x10 / 10),
+            (unsigned)(fps_x10 % 10), (unsigned)window.len_other, (unsigned)window.partial,
+            (unsigned)window.decode_drop);
+    app_log("AUDIN", "interval avg=%ums max=%ums long>=%ums=%u (timing only)",
+            (unsigned)interval_avg, (unsigned)window.interval_max_ms,
+            (unsigned)AUDIO_RX_GAP_MS, (unsigned)window.long_intervals);
+    app_log("AUDIN", "decode avg=%uus max=%uus @%uMHz",
+            (unsigned)dec_avg, (unsigned)window.decode_us_max,
+            (unsigned)ESP.getCpuFreqMHz());
 
-    s_rx_win.frames = 0;
-    s_rx_win.len_other = 0;
-    s_rx_win.partial = 0;
-    s_rx_win.decode_drop = 0;
-    s_rx_win.dt_sum = 0;
-    s_rx_win.dt_max = 0;
-    s_rx_win.gaps = 0;
-    s_rx_win.decode_us_sum = 0;
-    s_rx_win.decode_us_max = 0;
-    s_rx_win.win_start_ms = now;
     // Frame realignments are a cumulative link-health counter, not a per-window
     // rate, so report and reset them together with the window.
-    if (s_facc.realigns || s_facc.oversized) {
+    uint32_t realigns, oversized, frames_total;
+    portENTER_CRITICAL(&s_rx_mux);
+    realigns = s_facc.realigns;
+    oversized = s_facc.oversized;
+    frames_total = s_facc.frames_out;
+    s_facc.realigns = 0;
+    s_facc.oversized = 0;
+    portEXIT_CRITICAL(&s_rx_mux);
+    if (realigns || oversized) {
         app_log("AUDIN", "frame resync: realigns=%u oversized=%u frames_total=%u",
-                (unsigned)s_facc.realigns, (unsigned)s_facc.oversized,
-                (unsigned)s_facc.frames_out);
-        s_facc.realigns = 0;
-        s_facc.oversized = 0;
+                (unsigned)realigns, (unsigned)oversized, (unsigned)frames_total);
     }
 }
 
@@ -412,6 +429,15 @@ static void on_ctl_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, siz
 
     // AUDIO_START with HTT reason: byte1 == 0x03
     if (op == 0x04 && length >= 2 && pData[1] == 0x03) {
+        // A physical AUDIO_START begins a fresh diagnostic session. In
+        // particular, discard idle time between button presses from the first
+        // interval and the reported frames-per-second window.
+        portENTER_CRITICAL(&s_rx_mux);
+        ble_audio_diag_reset(&s_rx_win);
+        s_rx_dirty = false;
+        s_rx_prev_ms = 0;
+        s_rx_have_prev = false;
+        portEXIT_CRITICAL(&s_rx_mux);
         s_session_id = (length >= 4) ? pData[3] : 0;
         s_ble_state = BLE_STATE_TALKING;
         s_last_audio_ms = millis();
@@ -673,44 +699,50 @@ class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) override {
         String name = advertisedDevice->getName().c_str();
         String addr = advertisedDevice->getAddress().toString().c_str();
+        char clean_name[BLE_NAME_MAX_LEN];
+        char mac[18] = {};
+        copy_clean_ble_name(clean_name, sizeof(clean_name), name.length() ? name.c_str() : nullptr);
+        strncpy(mac, addr.c_str(), sizeof(mac) - 1);
+        const int rssi = advertisedDevice->getRSSI();
+        const uint8_t address_type = (uint8_t)advertisedDevice->getAddress().getType();
         uint32_t now = millis();
 
-        // Update in-memory discovered BLE devices cache for WebUI (thread-safe, non-blocking)
+        // Fixed-size records make the callback's shared-cache update bounded and
+        // allocation-free while interrupts are masked.
         portENTER_CRITICAL(&s_disc_mux);
+        size_t write = 0;
+        for (size_t read = 0; read < s_discovered_count; ++read) {
+            if (now - s_discovered_devices[read].last_seen_ms <= 20000) {
+                if (write != read) s_discovered_devices[write] = s_discovered_devices[read];
+                ++write;
+            }
+        }
+        s_discovered_count = write;
         bool found = false;
-        for (auto& item : s_discovered_devices) {
-            if (item.mac.equalsIgnoreCase(addr)) {
-                if (name.length() > 0) {
-                    String clean = sanitize_ble_name(name);
-                    if (clean.length() > 0) item.name = clean;
-                }
-                item.rssi = advertisedDevice->getRSSI();
-                item.type = (uint8_t)advertisedDevice->getAddress().getType();
+        for (size_t i = 0; i < s_discovered_count; ++i) {
+            auto& item = s_discovered_devices[i];
+            if (strcasecmp(item.mac, mac) == 0) {
+                if (name.length() > 0) strncpy(item.name, clean_name, sizeof(item.name) - 1);
+                item.rssi = rssi;
+                item.type = address_type;
                 item.last_seen_ms = now;
                 found = true;
                 break;
             }
         }
         if (!found) {
-            if (s_discovered_devices.size() >= 30) {
-                s_discovered_devices.erase(s_discovered_devices.begin());
+            if (s_discovered_count == BLE_DISCOVERY_LIMIT) {
+                memmove(&s_discovered_devices[0], &s_discovered_devices[1],
+                        sizeof(s_discovered_devices[0]) * (BLE_DISCOVERY_LIMIT - 1));
+                s_discovered_count--;
             }
-            DiscoveredBleDevice d;
-            d.name = (name.length() > 0) ? sanitize_ble_name(name) : "Unnamed BLE Device";
-            d.mac = addr;
-            d.rssi = advertisedDevice->getRSSI();
-            d.type = (uint8_t)advertisedDevice->getAddress().getType();
+            DiscoveredBleDevice& d = s_discovered_devices[s_discovered_count++];
+            memset(&d, 0, sizeof(d));
+            strncpy(d.name, clean_name, sizeof(d.name) - 1);
+            strncpy(d.mac, mac, sizeof(d.mac) - 1);
+            d.rssi = rssi;
+            d.type = address_type;
             d.last_seen_ms = now;
-            s_discovered_devices.push_back(d);
-        }
-
-        // Purge devices not seen for over 20 seconds
-        for (auto it = s_discovered_devices.begin(); it != s_discovered_devices.end(); ) {
-            if (now - it->last_seen_ms > 20000) {
-                it = s_discovered_devices.erase(it);
-            } else {
-                ++it;
-            }
         }
         portEXIT_CRITICAL(&s_disc_mux);
 
@@ -766,17 +798,12 @@ class ClientCallbacks : public NimBLEClientCallbacks {
           s_session_id = 0;
           s_caps_version = 0;
           s_caps_codec_mask = 0;
-          s_rx_prev_ms = 0;
+          portENTER_CRITICAL(&s_rx_mux);
+          ble_audio_diag_reset(&s_rx_win);
           s_rx_dirty = false;
-          s_rx_win.frames = 0;
-          s_rx_win.dt_sum = 0;
-          s_rx_win.dt_max = 0;
-          s_rx_win.gaps = 0;
-          s_rx_win.len_other = 0;
-          s_rx_win.partial = 0;
-          s_rx_win.decode_drop = 0;
-          s_rx_win.win_start_ms = millis();
-          s_rx_win.win_last_ms = s_rx_win.win_start_ms;
+          s_rx_prev_ms = 0;
+          s_rx_have_prev = false;
+          portEXIT_CRITICAL(&s_rx_mux);
           audio_frame_acc_reset();
           key_engine_release_all(&g_key_engine, millis());
         usb_hid_keyboard_release();
@@ -1107,12 +1134,11 @@ static bool setup_services_and_handshake() {
 // energy on the 6.5 kHz bin, and CAPS advertises codecs=0x02 = 16 kHz), so a
 // complete stream needs 240 samples every 15 ms = 66.7 notifications/s.
 //
-// At a 15 ms interval the link carries exactly 66.7 events/s, i.e. 100%
-// utilisation with zero headroom. That measured out as ~26% of frames never
-// arriving (gaps>=22ms = 141 of 541 frames) because the ESP32-S3 shares one
-// 2.4 GHz radio with WiFi, and a single collision loses a whole frame: BLE
-// notifications are not retransmitted, and the ADPCM stream then has a hole in
-// it that the decoder cannot fill.
+// At a 15 ms interval the link carries exactly 66.7 events/s, with little
+// scheduling headroom. Long observed notification intervals while Wi-Fi shared
+// the radio motivated shorter connection events. An interval over 22 ms shows
+// timing jitter, not a proven count of missing audio frames: delayed or
+// coalesced notifications can produce the same observation.
 //
 // 7.5 ms therefore doubles the event budget for the same 66.7 fps, leaving half
 // the events idle so a collided event does not cost audio. Latency stays 0
@@ -1126,10 +1152,12 @@ static bool setup_services_and_handshake() {
 
 static void request_audio_conn_params() {
     if (!s_client || !s_client->isConnected()) return;
-    // Drop the inter-frame clock. Without this the first notification after a
-    // reconnect reports the whole offline span as one inter-frame gap, which
-    // produced a bogus dt_max=410464 ms and poisoned the AUDIN statistics.
+    // Drop the inter-frame clock at the new link boundary. Protect the reset
+    // because the NimBLE callback can be dispatched from another task.
+    portENTER_CRITICAL(&s_rx_mux);
     s_rx_prev_ms = 0;
+    s_rx_have_prev = false;
+    portEXIT_CRITICAL(&s_rx_mux);
     s_client->updateConnParams(AUDIO_CONN_MIN_ITVL, AUDIO_CONN_MAX_ITVL,
                                AUDIO_CONN_LATENCY, AUDIO_CONN_TIMEOUT);
     // Reading the interval here would report the pre-update value: the LL
@@ -1238,13 +1266,16 @@ static bool do_connect_mac(const String& mac_str, uint8_t addr_type) {
     s_connected_mac = mac_str;
     s_connected_name = "Xiaomi Voice Remote";
     portENTER_CRITICAL(&s_disc_mux);
-    for (const auto& d : s_discovered_devices) {
-        if (d.mac.equalsIgnoreCase(mac_str) && d.name.length() > 0 && d.name != "Unnamed BLE Device") {
-            s_connected_name = d.name;
+    char discovered_name[BLE_NAME_MAX_LEN] = {};
+    for (size_t i = 0; i < s_discovered_count; ++i) {
+        const auto& d = s_discovered_devices[i];
+        if (strcasecmp(d.mac, mac_str.c_str()) == 0 && d.name[0] && strcmp(d.name, "Unnamed BLE Device") != 0) {
+            strncpy(discovered_name, d.name, sizeof(discovered_name) - 1);
             break;
         }
     }
     portEXIT_CRITICAL(&s_disc_mux);
+    if (discovered_name[0]) s_connected_name = discovered_name;
 
     s_bound_mac = s_connected_mac;
     s_bound_name = s_connected_name;
@@ -1710,7 +1741,7 @@ void ble_remote_task(void) {
     bool burst_now = (s_scan_burst_until_ms != 0) && (burst_ms < s_scan_burst_until_ms);
     if (s_burst_was_active && !burst_now) {
         portENTER_CRITICAL(&s_disc_mux);
-        size_t n = s_discovered_devices.size();
+        size_t n = s_discovered_count;
         portEXIT_CRITICAL(&s_disc_mux);
         app_log("BLE", "Scan burst finished: %u device(s) cached", (unsigned)n);
         s_scan_burst_until_ms = 0;
@@ -1833,6 +1864,28 @@ uint32_t ble_remote_last_audio_frame_ms(void) {
     return __atomic_load_n(&s_last_audio_frame_ms, __ATOMIC_ACQUIRE);
 }
 
+void ble_remote_get_audio_rx_diagnostics(ble_audio_rx_diagnostics_t* out) {
+    if (!out) return;
+    ble_audio_diag_window_t snapshot;
+    portENTER_CRITICAL(&s_rx_mux);
+    snapshot = s_rx_win;
+    portEXIT_CRITICAL(&s_rx_mux);
+    out->frames = snapshot.frames;
+    out->elapsed_ms = ble_audio_diag_elapsed_ms(&snapshot);
+    out->fps_x10 = ble_audio_diag_fps_x10(&snapshot);
+    out->interval_count = snapshot.interval_count;
+    out->interval_avg_ms = snapshot.interval_count
+        ? snapshot.interval_sum_ms / snapshot.interval_count : 0;
+    out->interval_max_ms = snapshot.interval_max_ms;
+    out->long_intervals = snapshot.long_intervals;
+    out->decode_avg_us = snapshot.decode_count
+        ? snapshot.decode_us_sum / snapshot.decode_count : 0;
+    out->decode_max_us = snapshot.decode_us_max;
+    out->len_other = snapshot.len_other;
+    out->partial = snapshot.partial;
+    out->decode_drop = snapshot.decode_drop;
+}
+
 void ble_remote_request_mic_stop(void) {
     __atomic_store_n(&s_req_mic_stop, true, __ATOMIC_RELEASE);
 }
@@ -1843,25 +1896,27 @@ void ble_remote_trigger_reconnect(void) {
 }
 
 String ble_remote_scan_devices_json(void) {
-    JsonDocument doc;
-    JsonArray arr = doc["devices"].to<JsonArray>();
-
+    DiscoveredBleDevice snapshot[BLE_DISCOVERY_LIMIT];
+    size_t count = 0;
     uint32_t now = millis();
     portENTER_CRITICAL(&s_disc_mux);
-    for (const auto& dev : s_discovered_devices) {
-        // Only report devices the scan actually saw recently; without the
-        // continuous scan the cache is no longer self-purging on every event.
-        if (now - dev.last_seen_ms > 20000) {
-            continue;
+    for (size_t i = 0; i < s_discovered_count; ++i) {
+        if (now - s_discovered_devices[i].last_seen_ms <= 20000) {
+            snapshot[count++] = s_discovered_devices[i];
         }
+    }
+    portEXIT_CRITICAL(&s_disc_mux);
+
+    JsonDocument doc;
+    JsonArray arr = doc["devices"].to<JsonArray>();
+    for (size_t i = 0; i < count; ++i) {
+        const auto& dev = snapshot[i];
         JsonObject obj = arr.add<JsonObject>();
         obj["name"] = dev.name;
         obj["mac"] = dev.mac;
         obj["rssi"] = dev.rssi;
         obj["type"] = (int)dev.type;
     }
-    portEXIT_CRITICAL(&s_disc_mux);
-
     String out;
     serializeJson(doc, out);
     return out;
@@ -1900,17 +1955,20 @@ bool ble_remote_connect_target(const String& mac_str, uint8_t addr_type, const S
 bool ble_remote_connect_mac(const String& mac_str) {
     uint8_t addr_type = BLE_ADDR_PUBLIC;
     String dev_name = "Xiaomi Voice Remote";
+    char found_name[BLE_NAME_MAX_LEN] = {};
     portENTER_CRITICAL(&s_disc_mux);
-    for (const auto& d : s_discovered_devices) {
-        if (d.mac.equalsIgnoreCase(mac_str)) {
+    for (size_t i = 0; i < s_discovered_count; ++i) {
+        const auto& d = s_discovered_devices[i];
+        if (strcasecmp(d.mac, mac_str.c_str()) == 0) {
             addr_type = d.type;
-            if (d.name.length() > 0 && d.name != "Unnamed BLE Device") {
-                dev_name = d.name;
+            if (d.name[0] && strcmp(d.name, "Unnamed BLE Device") != 0) {
+                strncpy(found_name, d.name, sizeof(found_name) - 1);
             }
             break;
         }
     }
     portEXIT_CRITICAL(&s_disc_mux);
+    if (found_name[0]) dev_name = found_name;
     return ble_remote_connect_target(mac_str, addr_type, dev_name);
 }
 

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-Model tests for the core_diagnostics task registry.
+Registry model and source-contract tests for core_diagnostics.
 
 The firmware module reads live FreeRTOS handles, which cannot run on the host.
 These tests reimplement its registry semantics and check the logic that the
-firmware cannot self-check at runtime: slot exhaustion, duplicate handles,
+firmware cannot self-check at runtime: slot exhaustion,
 affinity classification and the per-core tally that backs the pinning contract.
 
-They do not exercise the C++ code. Passing them shows the intended semantics
-are well defined, not that the firmware matches.
+The model does not execute the C++ code. The source-contract tests additionally
+inspect the actual firmware implementation to reject FreeRTOS queries, stack
+scans and JSON work under its interrupt-disabling registry lock. Neither group
+replaces a firmware build or hardware timing measurement.
 """
 
-import sys
+from pathlib import Path
+import re
 import unittest
 
 MAX_TASKS = 16
@@ -43,12 +46,11 @@ class Registry:
         )
         return True
 
-    def snapshot(self, affinity_of=None, live_name=None):
+    def snapshot(self, affinity_of=None):
         """
         affinity_of(handle) -> core or tskNO_AFFINITY, standing in for
-        xTaskGetAffinity(). live_name(handle) -> str or None, standing in for
-        pcTaskGetName(); None means the task is gone and the recorded name is
-        used instead.
+        xTaskGetAffinity(). All registered handles must remain alive; FreeRTOS
+        offers no deleted-handle validity check through pcTaskGetName().
         """
         tasks = []
         per_core = [0] * NUM_CORES
@@ -56,10 +58,6 @@ class Registry:
         for slot in self.slots:
             affinity = affinity_of(slot["handle"]) if affinity_of else AFF_UNBOUND
             name = slot["name"]
-            if live_name:
-                seen = live_name(slot["handle"])
-                if seen is not None:
-                    name = seen
             # The firmware classifies affinity before tallying.
             if affinity is AFF_UNBOUND or affinity == AFF_UNBOUND:
                 core = -1
@@ -69,6 +67,7 @@ class Registry:
                 per_core[affinity] += 1
             else:
                 core = -2
+                unpinned += 1
             tasks.append(
                 {
                     "name": name,
@@ -165,18 +164,87 @@ class TestPerCoreTally(unittest.TestCase):
         self.assertFalse(snap["tasks"][0]["as_expected"])
 
 
-class TestDeletedTask(unittest.TestCase):
-    def test_deleted_task_reports_unknown_name(self):
-        # The firmware cannot detect deletion without a kernel lock, so
-        # pcTaskGetName() may come back null and the recorded name is used as
-        # the fallback. Pin that: a recycled or deleted handle must still yield
-        # a well-formed record rather than a crash or a null name.
+class TestRegisteredNames(unittest.TestCase):
+    def test_snapshot_uses_the_registered_name(self):
         r = Registry()
         r.register("uac_push", 0x1, 1)
-        snap = r.snapshot(affinity_of=lambda h: AFF_CORE1, live_name=lambda h: None)
+        snap = r.snapshot(affinity_of=lambda h: AFF_CORE1)
         self.assertEqual(len(snap["tasks"]), 1)
         self.assertEqual(snap["tasks"][0]["name"], "uac_push")
         self.assertEqual(snap["tasks"][0]["core"], 1)
+
+
+class TestFirmwareCriticalSection(unittest.TestCase):
+    """Regression checks against actual source, rather than the Python model."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).resolve().parents[2]
+        cls.source = (root / "src/core_diagnostics.cpp").read_text(encoding="utf-8")
+        # Comments document forbidden operations, so do not treat them as calls.
+        cls.code = re.sub(r"//[^\n]*|/\*.*?\*/", "", cls.source, flags=re.S)
+        cls.json_code = cls.code.split("void core_diagnostics_json(JsonObject out)", 1)[1]
+
+    @staticmethod
+    def assert_copy_only(testcase, critical_body):
+        # A conservative whitelist: this bounded copy is the whole allowed
+        # interrupt-off body, so future helper calls or allocations need review.
+        compact = re.sub(r"\s+", "", critical_body)
+        testcase.assertEqual(
+            compact,
+            "for(inti=0;i<CORE_DIAGNOSTICS_MAX_TASKS;i++){snapshot[i]=s_entries[i];}",
+        )
+
+    def test_json_lock_contains_only_the_bounded_registry_copy(self):
+        regions = re.findall(
+            r"portENTER_CRITICAL\(&s_mux\);(.*?)portEXIT_CRITICAL\(&s_mux\);",
+            self.json_code,
+            flags=re.S,
+        )
+        self.assertEqual(len(regions), 1)
+        self.assert_copy_only(self, regions[0])
+        self.assertEqual(self.json_code.count("portENTER_CRITICAL"), 1)
+        self.assertEqual(self.json_code.count("portEXIT_CRITICAL"), 1)
+
+    def test_the_previous_long_critical_section_is_rejected(self):
+        # These are the exact operations which used to extend the lock across
+        # kernel queries and allocations. Ensure the guard fails for that code.
+        with self.assertRaises(AssertionError):
+            self.assert_copy_only(
+                self,
+                'JsonArray tasks = out["tasks"].to<JsonArray>(); '
+                'uxTaskGetStackHighWaterMark(e.handle);',
+            )
+
+    def test_task_queries_and_json_happen_after_unlock(self):
+        before_unlock, after_unlock = self.json_code.split("portEXIT_CRITICAL(&s_mux);", 1)
+        for operation in (
+            "xTaskGetAffinity(",
+            "uxTaskPriorityGet(",
+            "uxTaskGetStackHighWaterMark(",
+            "JsonArray tasks",
+            "tasks.add<JsonObject>()",
+        ):
+            self.assertNotIn(operation, before_unlock)
+            self.assertIn(operation, after_unlock)
+        # The JSON loop must use the immutable local snapshot, never a live
+        # registry entry which another core can update after unlocking.
+        self.assertIn("const Entry &e = snapshot[i];", after_unlock)
+        self.assertNotIn("s_entries", after_unlock)
+
+    def test_name_query_is_not_used_as_handle_validation(self):
+        self.assertNotRegex(self.code, r"pcTaskGetName\s*\(")
+        self.assertIn('o["name"] = e.name ? e.name : "unnamed";', self.json_code)
+
+    def test_http_handler_initializes_the_json_root(self):
+        root = Path(__file__).resolve().parents[2]
+        web = (root / "src/web/web_server.cpp").read_text(encoding="utf-8")
+        handler = web.split("static void handle_cores()", 1)[1].split(
+            "static void handle_guard()", 1)[0]
+        # A fresh document is null. as<JsonObject>() would pass a null view and
+        # silently serialize null; to<JsonObject>() creates the writable root.
+        self.assertIn("core_diagnostics_json(doc.to<JsonObject>());", handler)
+        self.assertNotIn("core_diagnostics_json(doc.as<JsonObject>());", handler)
 
 
 if __name__ == "__main__":

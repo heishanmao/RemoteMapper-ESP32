@@ -1,6 +1,7 @@
 #include "led_indicator.h"
 #include "app_config.h"
 #include "core_diagnostics.h"
+#include "log/app_log.h"
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -118,11 +119,15 @@ static void led_task(void *arg) {
     }
 }
 
-void led_indicator_init(void) {
+bool led_indicator_init(void) {
     update_hardware_led(LED_STATE_WAIT_CONNECTION);
     TaskHandle_t led = nullptr;
-    xTaskCreatePinnedToCore(led_task, "led_task", 2048, NULL, PRIO_TASK_LED, &led, TASK_CORE_LED);
+    if (xTaskCreatePinnedToCore(led_task, "led_task", 2048, NULL, PRIO_TASK_LED, &led, TASK_CORE_LED) != pdPASS) {
+        app_log("LED", "Failed to spawn indicator task");
+        return false;
+    }
     core_diagnostics_register("led_task", led, TASK_CORE_LED);
+    return true;
 }
 
 void led_indicator_set(led_state_t state) {

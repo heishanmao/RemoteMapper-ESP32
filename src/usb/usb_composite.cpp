@@ -25,6 +25,8 @@ USBCDC USBSerial;
 static USBHIDKeyboard        s_keyboard;
 static USBHIDConsumerControl s_consumer;
 static bool                  s_usb_ready = false;
+static bool                  s_usb_initialized = false;
+static uint32_t               s_recovery_by_reason[4] = {};
 // Uses the same framework HID instance/semaphore as keyboard and consumer.
 static USBHID                s_hid_transport;
 
@@ -100,6 +102,18 @@ static uint32_t s_hid_tx_ok = 0;
 static uint32_t s_hid_tx_failed = 0;
 static bool s_hid_blocked = false;
 static uint32_t s_hid_blocked_since_ms = 0;
+// Protected by hid_lock(). Recovery first closes this gate, then clears the
+// desired reports. It reopens only after a new synchronous TinyUSB mount.
+static bool s_hid_recovering = false;
+static uint32_t s_reconnect_mount_seq = 0;
+static uint32_t s_usb_mount_seq = 0;
+
+// Runs directly in TinyUSB's lifecycle callback, before Arduino posts its
+// asynchronous event. Never take hid_lock(): a sender may be waiting for this
+// USB task to deliver its completion.
+extern "C" void remotemapper_usb_lifecycle(bool mounted) {
+    if (mounted) __atomic_add_fetch(&s_usb_mount_seq, 1, __ATOMIC_RELEASE);
+}
 static uint32_t s_usb_recovery_request = USB_RECOVERY_NONE;
 static uint32_t s_usb_recovery_count = 0;
 static bool s_usb_recovery_exhausted = false;
@@ -114,7 +128,7 @@ static bool s_voice_drain_pending = false;
 static uint32_t s_voice_release_ms = 0;
 static bool s_voice_hid_active = false;
 
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
 static usb_hid_stress_stats_t s_hid_stress = {};
 static bool s_hid_stress_stop = false;
 
@@ -141,7 +155,7 @@ static void hid_stress_task(void *) {
         if (s_hid_stress_stop) reason = "stop";
         else if (!hid_stress_user_idle_locked()) reason = "user-input";
         else if (elapsed >= s_hid_stress.duration_ms) reason = "duration";
-        else if (!s_usb_ready || !tud_ready() || tud_suspended()) reason = "usb-unavailable";
+        else if (s_hid_recovering || !s_usb_ready || !tud_ready() || tud_suspended()) reason = "usb-unavailable";
         if (reason) {
             s_hid_stress.user_aborted = strcmp(reason, "user-input") == 0;
             snprintf(s_hid_stress.stop_reason, sizeof(s_hid_stress.stop_reason), "%s", reason);
@@ -178,7 +192,7 @@ static void hid_stress_task(void *) {
 bool usb_hid_stress_start(uint32_t seconds) {
     if (seconds < 1 || seconds > 300) return false;
     hid_lock();
-    if (s_hid_stress.active || !s_usb_ready || !tud_ready() || tud_suspended() ||
+    if (s_hid_stress.active || s_hid_recovering || !s_usb_ready || !tud_ready() || tud_suspended() ||
             !hid_stress_user_idle_locked()) {
         hid_unlock();
         return false;
@@ -247,6 +261,12 @@ uint32_t usb_composite_recovery_count(void) {
     return __atomic_load_n(&s_usb_recovery_count, __ATOMIC_ACQUIRE);
 }
 
+void usb_composite_recovery_reason_counts(uint32_t *audio, uint32_t *hid, uint32_t *wakeup) {
+    if (audio) *audio = __atomic_load_n(&s_recovery_by_reason[USB_RECOVERY_AUDIO], __ATOMIC_ACQUIRE);
+    if (hid) *hid = __atomic_load_n(&s_recovery_by_reason[USB_RECOVERY_HID], __ATOMIC_ACQUIRE);
+    if (wakeup) *wakeup = __atomic_load_n(&s_recovery_by_reason[USB_RECOVERY_WAKE], __ATOMIC_ACQUIRE);
+}
+
 // Loop task owns the physical recovery for both audio and HID. A healthy
 // microphone must not conceal a blocked keyboard release (or vice versa).
 static bool usb_recovery_tick(uint32_t now) {
@@ -263,6 +283,9 @@ static bool usb_recovery_tick(uint32_t now) {
     }
     if (detached) {
         if (now - detached_ms >= 350) {
+            // An old queued Arduino Started event cannot reopen the gate. Only
+            // a synchronous mount processed after this attach can do so.
+            s_reconnect_mount_seq = __atomic_load_n(&s_usb_mount_seq, __ATOMIC_ACQUIRE);
             tud_connect();
             detached = false;
             s_waiting_reconnect_ms = now;
@@ -270,15 +293,30 @@ static bool usb_recovery_tick(uint32_t now) {
         }
         return true;
     }
+    hid_lock();
+    const bool recovering = s_hid_recovering;
+    const bool remounted = recovering && tud_mounted() &&
+            __atomic_load_n(&s_usb_mount_seq, __ATOMIC_ACQUIRE) != s_reconnect_mount_seq;
+    if (remounted) s_hid_recovering = false;
+    hid_unlock();
+    if (remounted) {
+        s_waiting_reconnect_ms = 0;
+        app_log("USB", "Recovery: new host mount confirmed; HID retries enabled");
+    }
+    if (recovering && !remounted) return false; // loop owns the reconnect deadline
     if (!__atomic_load_n(&s_usb_recovery_request, __ATOMIC_ACQUIRE)) return false;
     if (usb_composite_recovery_count() && now - last_recovery_ms < 10000) return false;
     uint32_t reason = __atomic_exchange_n(&s_usb_recovery_request, USB_RECOVERY_NONE, __ATOMIC_ACQ_REL);
-    if (reason == USB_RECOVERY_HID) {
-        hid_lock();
-        const bool still_pending = s_keyboard_pending || s_consumer_pending;
+    // Serialize with every sender before touching recovery state or the PHY.
+    // Force-release below preserves zero-report debt without submitting to an
+    // endpoint that is about to be detached.
+    hid_lock();
+    if (reason == USB_RECOVERY_HID && !s_keyboard_pending && !s_consumer_pending) {
         hid_unlock();
-        if (!still_pending) return false; // it recovered during the cooldown
+        return false; // it recovered during the cooldown; no detach is needed
     }
+    s_hid_recovering = true;
+    hid_unlock();
     hid_diagnostics_capture(reason);
     if (reason == USB_RECOVERY_AUDIO) {
         uac_tx_stats_t tx = {};
@@ -307,26 +345,30 @@ static bool usb_recovery_tick(uint32_t now) {
             return true;
         }
     }
-    usb_composite_force_release_all(reason == USB_RECOVERY_HID ? "hid-tx-stalled" : "uac-stalled");
+    const char *cause = reason == USB_RECOVERY_HID ? "hid-tx-stalled" :
+            reason == USB_RECOVERY_AUDIO ? "uac-stalled" : "usb-wakeup";
+    usb_composite_force_release_all(cause);
     hid_lock();
     s_hid_blocked = false;
     hid_unlock();
     __atomic_add_fetch(&s_usb_recovery_count, 1, __ATOMIC_RELEASE);
+    if (reason >= USB_RECOVERY_AUDIO && reason <= USB_RECOVERY_WAKE)
+        __atomic_add_fetch(&s_recovery_by_reason[reason], 1, __ATOMIC_RELEASE);
     last_recovery_ms = now;
     s_hw_sleep_detected = false;
     s_boot_grace_until_ms = now + 5000;
     tud_disconnect();
     detached_ms = now;
     detached = true;
-    app_log("USB", "Recovery #%u: %s stalled, detach 350ms",
-            (unsigned)usb_composite_recovery_count(), reason == USB_RECOVERY_HID ? "HID" : "audio");
+    app_log("USB", "Recovery #%u: %s, detach 350ms",
+            (unsigned)usb_composite_recovery_count(), cause);
     return true;
 }
 
 // Caller holds hid_lock(). A failure retains the desired state indefinitely.
 static bool hid_flush_keyboard_locked(void) {
     if (!s_keyboard_pending) return true;
-    if (!s_usb_ready || !tud_ready()) return false;
+    if (s_hid_recovering || !s_usb_ready || !tud_ready()) return false;
     bool ok = s_hid_transport.SendReport(HID_REPORT_ID_KEYBOARD,
             &s_keyboard_report, sizeof(s_keyboard_report), 20);
     if (ok) {
@@ -342,7 +384,7 @@ static bool hid_flush_keyboard_locked(void) {
 
 static bool hid_flush_consumer_locked(void) {
     if (!s_consumer_pending) return true;
-    if (!s_usb_ready || !tud_ready()) return false;
+    if (s_hid_recovering || !s_usb_ready || !tud_ready()) return false;
     bool ok = s_hid_transport.SendReport(HID_REPORT_ID_CONSUMER_CONTROL,
             &s_consumer_report, sizeof(s_consumer_report), 20);
     if (ok) { s_consumer_pending = false; s_hid_tx_ok++; }
@@ -507,6 +549,7 @@ bool usb_composite_guard_get(usb_guard_config_t *cfg, usb_guard_stats_t *stats) 
         stats->pending_ms = s_hid_blocked ? millis() - s_hid_blocked_since_ms : 0;
         stats->usb_recoveries = usb_composite_recovery_count();
         stats->recovery_exhausted = s_usb_recovery_exhausted;
+        stats->transport_recovering = s_hid_recovering;
         hid_unlock();
         stats->forced_releases = s_force_release_count;
         stats->last_force_ms   = s_last_force_ms;
@@ -603,6 +646,10 @@ void usb_composite_init(void) {
     // Create the mutex before USB/BLE callbacks can race its initialization.
     hid_lock();
     hid_unlock();
+    if (!s_hid_mutex) {
+        app_log("USB", "Initialization failed: HID mutex allocation");
+        return;
+    }
     USB.VID(0x303A);
     USB.PID(0x8089);
     USB.productName("RemoteMapper Audio & Remote Bridge");
@@ -626,7 +673,6 @@ void usb_composite_init(void) {
             hid_clear_locked();
             hid_unlock();
         } else if (id == ARDUINO_USB_STARTED_EVENT) {
-            s_waiting_reconnect_ms = 0;
             app_log("USB", "USB Started / Mounted");
             usb_composite_force_release_all("usb-mounted");
             hid_lock();
@@ -643,14 +689,19 @@ void usb_composite_init(void) {
     USBSerial.begin();
 #endif
 
-    uac_microphone_init();
+    const bool audio_ready = uac_microphone_init();
 
     s_keyboard.begin();
     s_consumer.begin();
     s_hid_transport.begin();
-    s_usb_ready = true;
-    USB.begin();
+    const bool usb_started = USB.begin();
+    s_usb_initialized = audio_ready && usb_started;
+    s_usb_ready = s_usb_initialized;
+    if (!s_usb_initialized)
+        app_log("USB", "Initialization failed: audio=%u stack=%u", audio_ready, usb_started);
 }
+
+bool usb_composite_is_initialized(void) { return s_usb_initialized; }
 
 void usb_composite_task(void) {
     uac_microphone_task();
@@ -735,22 +786,9 @@ void usb_composite_task(void) {
     // 2. Detect PC waking up (SOF resumed after sleeping for > 2s)
     else if (s_hw_sleep_detected && !is_hw_suspended && sof_active) {
         if (now - s_hw_sleep_start_ms >= 2000) {
-            app_log("USB_HW", "PC Wakeup Detected! SOF resumed -> soft USB re-enumeration (no reboot)...");
-            vTaskDelay(pdMS_TO_TICKS(500));
-            // Signal a disconnect to the Windows kernel by pulling D+(20)/D-(19).
-            // The 350ms SE0 forces Windows to drop and re-enumerate the device.
-            pinMode(20, OUTPUT);
-            pinMode(19, OUTPUT);
-            digitalWrite(20, LOW);
-            digitalWrite(19, LOW);
-            vTaskDelay(pdMS_TO_TICKS(350));
-            // Release the pads back to the internal USB PHY (hi-Z GPIO no longer
-            // overrides them); the D+ pull-up reappears and the host sees a fresh attach.
-            pinMode(20, INPUT);
-            pinMode(19, INPUT);
+            app_log("USB_HW", "PC Wakeup Detected! Requesting coordinated USB re-enumeration");
             s_hw_sleep_detected = false;
-            s_waiting_reconnect_ms = millis();
-            app_log("USB_HW", "D+/D- released -> waiting for host re-enumeration (4s fallback before restart)");
+            usb_composite_request_recovery(USB_RECOVERY_WAKE);
         } else {
             s_hw_sleep_detected = false;
         }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -15,7 +16,7 @@ typedef enum {
     LED_STATE_MIC_KEY_PRESS        // Red flash
 } led_state_t;
 
-void led_indicator_init(void);
+bool led_indicator_init(void);
 void led_indicator_set(led_state_t state);
 // When the ON_DEMAND Wi-Fi radio powers down (idle) or is disabled, the LED
 // shows a steady dim red instead of the BLE-driven status colours, giving an

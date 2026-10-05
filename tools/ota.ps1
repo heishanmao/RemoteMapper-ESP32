@@ -1,4 +1,7 @@
 # Upload firmware to the device OTA endpoint.
+# The default N16R8 build includes the shared DWC2 timing fixes (1.2.48).
+# To upload a reviewed archive instead, pass -Bin explicitly, for example:
+#   .\tools\ota.ps1 -Bin .\.cache\firmware-1.2.48\firmware.bin
 # Invoke-WebRequest mangles large bodies on this PowerShell build, so build the
 # multipart payload by hand and post it through System.Net.Http instead.
 param(
@@ -11,7 +14,12 @@ $OutputEncoding = [Console]::OutputEncoding = [Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Net.Http
 
 if (-not (Test-Path -LiteralPath $Bin)) { throw "firmware not found: $Bin" }
-$bytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $Bin))
+$firmwarePath = (Resolve-Path -LiteralPath $Bin).Path
+$bytes = [IO.File]::ReadAllBytes($firmwarePath)
+if ($bytes.Length -eq 0) { throw "firmware is empty: $firmwarePath" }
+$firmwareHash = (Get-FileHash -LiteralPath $firmwarePath -Algorithm SHA256).Hash.ToLowerInvariant()
+"firmware: $firmwarePath"
+"size: $($bytes.Length) bytes; SHA256: $firmwareHash"
 
 $boundary = "----oc$([guid]::NewGuid().ToString('N'))"
 $head = "--$boundary`r`n" +

@@ -96,38 +96,29 @@ def main():
             sys.stderr.write(
                 "[patches] WARNING: WebServer.h anchor line not found\n")
 
-    # Patch 3: optional HID diagnostics. Preserve SendReport semantics and the
-    # framework semaphore. Fail the build if its source changes underneath us.
+    # Patch 3: bounded, generation-checked HID completion. Upgrade stock and
+    # TRACE_V1 reproducibly, and refresh the embedded V2 state machine on each
+    # build. Validate both transformations before writing either SDK file.
+    patch_dir = os.path.join(env.subst("$PROJECT_DIR"), "tools", "patches")
+    sys.path.insert(0, patch_dir)
+    from hid_tx_patch import patch_hid_source, patch_usb_source
+
     hid_cpp = os.path.join(fw, "libraries", "USB", "src", "USBHID.cpp")
-    src = _read(hid_cpp)
-    marker = "// REMOTEMAPPER_HID_TRACE_V1"
-    if marker in src:
-        print("[patches] USBHID diagnostics V1: already patched")
+    usb_cpp = os.path.join(fw, "cores", "esp32", "USB.cpp")
+    hid_src = _read(hid_cpp)
+    usb_src = _read(usb_cpp)
+    hid_patched = patch_hid_source(hid_src)
+    usb_patched = patch_usb_source(usb_src)
+    if hid_patched != hid_src:
+        _write(hid_cpp, hid_patched)
+        print("[patches] USBHID completion guard V2: APPLIED/REFRESHED")
     else:
-        edits = [
-            ("bool USBHID::ready(void){", marker + '\nextern "C" void remotemapper_hid_trace(uint8_t, uint8_t) __attribute__((weak));\n'
-             "static void rm_hid_trace(uint8_t stage, uint8_t report) {\n"
-             "    if (remotemapper_hid_trace) remotemapper_hid_trace(stage, report);\n}\n\n"
-             "bool USBHID::ready(void){"),
-            ("    if (tinyusb_hid_device_input_sem) {\n        xSemaphoreGive(tinyusb_hid_device_input_sem);",
-             "    rm_hid_trace(8, (report && len) ? report[0] : 0);\n"
-             "    if (tinyusb_hid_device_input_sem) {\n        xSemaphoreGive(tinyusb_hid_device_input_sem);"),
-            ("bool USBHID::SendReport(uint8_t id, const void* data, size_t len, uint32_t timeout_ms){",
-             "bool USBHID::SendReport(uint8_t id, const void* data, size_t len, uint32_t timeout_ms){\n    rm_hid_trace(0, id);"),
-            ('        log_e("TX Semaphore is NULL.', '        rm_hid_trace(1, id);\n        log_e("TX Semaphore is NULL.'),
-            ('        log_e("report %u mutex failed", id);', '        rm_hid_trace(2, id);\n        log_e("report %u mutex failed", id);'),
-            ('        log_e("not ready");', '        rm_hid_trace(3, id);\n        log_e("not ready");'),
-            ("        res = tud_hid_n_report(0, id, data, len);", "        res = tud_hid_n_report(0, id, data, len);\n        rm_hid_trace(res ? 4 : 5, id);"),
-            ('                log_e("report %u wait failed", id);', '                rm_hid_trace(6, id);\n                log_e("report %u wait failed", id);'),
-            ("    xSemaphoreGive(tinyusb_hid_device_input_mutex);\n    return res;",
-             "    if (res) rm_hid_trace(7, id);\n    xSemaphoreGive(tinyusb_hid_device_input_mutex);\n    return res;"),
-        ]
-        for old, new in edits:
-            if src.count(old) != 1:
-                raise RuntimeError("USBHID diagnostics anchor mismatch: " + old)
-            src = src.replace(old, new)
-        _write(hid_cpp, src)
-        print("[patches] USBHID diagnostics V1: APPLIED")
+        print("[patches] USBHID completion guard V2: current")
+    if usb_patched != usb_src:
+        _write(usb_cpp, usb_patched)
+        print("[patches] synchronous USB mount/unmount hooks: APPLIED")
+    else:
+        print("[patches] synchronous USB mount/unmount hooks: current")
 
 
 main()

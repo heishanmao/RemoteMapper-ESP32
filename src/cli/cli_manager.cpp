@@ -25,7 +25,15 @@ static void cli_write_line(const String& line) {
     Serial.println(line);
 #if !ARDUINO_USB_CDC_ON_BOOT
     if (USBSerial) {
-        USBSerial.println(line);
+        // Queue the entire response behind other CDC messages. The common
+        // background sender performs bounded FIFO writes, preserving JSON
+        // line boundaries without blocking this loop on a slow terminal.
+        String response = line;
+        response += "\r\n";
+        if (!app_log_queue_cdc_text(response.c_str(), response.length())) {
+            app_log("CLI", "CDC response discarded: queue full or payload too large (%u bytes)",
+                    (unsigned)response.length());
+        }
     }
 #endif
 }
@@ -220,7 +228,7 @@ static void handle_log_command(const String& arg) {
     }
 }
 
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
 static void add_usb_stress_json(JsonObject out) {
     usb_hid_stress_stats_t stats = {};
     usb_hid_stress_get(&stats);
@@ -290,7 +298,7 @@ static void handle_command(const String& line) {
         return;
     }
 
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
     if (head.equalsIgnoreCase("usb")) {
         handle_usb_stress_command(tail);
         return;
@@ -309,7 +317,7 @@ static void handle_command(const String& line) {
         doc["free_heap"] = ESP.getFreeHeap();
         doc["free_psram"] = ESP.getFreePsram();
         doc["wifi_enabled"] = wifi_manager_get_enabled();
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
         add_usb_stress_json(doc["usb_stress"].to<JsonObject>());
 #endif
 
@@ -352,7 +360,7 @@ static void handle_command(const String& line) {
         cli_write_line("  log on|off    - Mirror full logs to USB CDC (default: off)");
         cli_write_line("  log console on|off - Mute/enable routine UART console logs (default: muted after boot)");
         cli_write_line("  log status    - Show log mirror/console state (JSON)");
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
         cli_write_line("  usb stress <1..300>|stop|status - Bounded idle-only zero-report HID test");
 #endif
         cli_write_line("  help          - Show available commands");
@@ -369,7 +377,11 @@ void cli_manager_init(void) {
 }
 
 void cli_manager_task(void) {
-    while (Serial.available() > 0) {
+    // A stream of console input must not monopolize USB recovery maintenance.
+    // Preserve the partial command and finish it over subsequent loop turns.
+    static const unsigned RX_BUDGET = 64;
+    unsigned uart_read = 0;
+    while (uart_read++ < RX_BUDGET && Serial.available() > 0) {
         char c = (char)Serial.read();
         cli_feed_char(c);
     }
@@ -377,7 +389,8 @@ void cli_manager_task(void) {
     // Received bytes are valid even when the host hasn't asserted both
     // control lines required by USBCDC::operator bool(). Always drain RX;
     // otherwise commands accumulate until a later terminal handshake.
-    while (USBSerial.available() > 0) {
+    unsigned cdc_read = 0;
+    while (cdc_read++ < RX_BUDGET && USBSerial.available() > 0) {
         char c = (char)USBSerial.read();
         cli_feed_char(c);
     }

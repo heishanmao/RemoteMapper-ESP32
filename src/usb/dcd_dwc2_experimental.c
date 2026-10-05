@@ -29,10 +29,10 @@
 
 #include "tusb_option.h"
 
-// Opt-in prototype: the normal firmware continues to link Arduino's bundled
-// ESP32-Sx DCD. Keep this guard outside the upstream source so an ordinary
-// build never defines a second set of dcd_* symbols.
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+// Project DWC2 driver used by the N16R8 validation/release build. Other board
+// targets retain Arduino's bundled ESP32-Sx DCD. Keep this guard outside the
+// upstream source so each build defines only one set of dcd_* symbols.
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
 
 #if CFG_TUD_ENABLED && defined(TUP_USBIP_DWC2)
 
@@ -1518,4 +1518,4 @@ void dcd_int_handler(uint8_t rhport) {
 }
 
 #endif
-#endif // REMOTEMAPPER_EXPERIMENTAL_DWC2
+#endif // REMOTEMAPPER_DWC2_DRIVER

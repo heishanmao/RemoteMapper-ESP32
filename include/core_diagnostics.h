@@ -6,7 +6,7 @@
 //
 // What this reports, and why it is deliberately narrow:
 //
-//   * Each registered task's name, live priority, stack headroom and current
+//   * Each registered task's recorded name, live priority, stack headroom and current
 //     core affinity, queried through the handle it was created with.
 //   * Per-core counts of pinned tasks.
 //
@@ -25,14 +25,21 @@
 // Per-core load balance remains unmeasured; that needs a framework rebuild with
 // run-time stats, or a hardware PMU counter.
 //
-// Cost model: nothing runs on a timer. The snapshot is taken only when the
-// endpoint is read, and every field comes from an O(1) lookup by handle.
+// Cost model: nothing runs on a timer. A fixed-size registry copy is protected
+// by a short critical section when the endpoint is read. Task queries and JSON
+// construction run outside that section; stack headroom scans can take time
+// proportional to the task's untouched stack. The live task fields are read
+// individually and are not an atomic scheduler snapshot.
 
 #define CORE_DIAGNOSTICS_MAX_TASKS 16
 
-// Register a task created elsewhere in this project. Call once, right after the
-// task is created, and only with a handle the caller owns. A null handle (task
-// creation failed) is accepted and reported as such.
+// Register a permanent task created elsewhere in this project. Call once,
+// right after creation. The caller must keep the task and name storage alive
+// for this module's lifetime: querying a deleted or recycled handle is unsafe,
+// and pcTaskGetName() is not a handle-validity check. There is deliberately no
+// unregister API; supporting temporary tasks would require coordination with
+// in-flight readers before deleting the task. Null handles are ignored, and
+// registration beyond CORE_DIAGNOSTICS_MAX_TASKS is ignored.
 void core_diagnostics_register(const char *name, void *handle, uint8_t expected_core);
 
 // Emit one snapshot into `out`. Safe to call from any core.

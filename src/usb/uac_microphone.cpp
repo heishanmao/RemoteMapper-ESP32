@@ -27,6 +27,9 @@ static uint8_t s_uac_str_idx = 0;
 static uint8_t s_uac_alt     = 0;
 static volatile bool s_uac_streaming   = false;
 static bool          s_uac_initialized = false;
+static bool          s_uac_interface_enabled = false;
+static bool          s_audio_pipeline_initialized = false;
+static TaskHandle_t  s_uac_push_task = nullptr;
 
 // Controls
 static uint8_t  s_mic_mute   = 0;
@@ -53,7 +56,7 @@ static volatile uint32_t s_pcm_samples = 0;
 static volatile uint32_t s_pcm_nonzero = 0;
 static volatile uint64_t s_pcm_absolute_sum = 0;
 static volatile uint16_t s_pcm_peak = 0;
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
 static tusb_desc_endpoint_t s_uac_ep_desc = {};
 static bool s_uac_ep_open = false;
 #endif
@@ -70,7 +73,7 @@ static void uac_service(void*) {
     // the ring's one consumer. Otherwise a full old ring blocks new sessions.
     audio_ring_buffer_consume_pending_clear(&g_audio_pipeline.ring_buf);
     const uint32_t now = millis();
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
     if (remotemapper_dwc2_controller_faulted() && !s_recovery_requested) {
         s_recovery_requested = true;
         usb_composite_request_recovery(USB_RECOVERY_AUDIO);
@@ -93,7 +96,7 @@ static void uac_service(void*) {
     // had exactly this state (EP3, DIEPTSIZ=0x80040, DIEPINT TXFE, mask=0).
     // Re-arm only that precise state, from the serialized TinyUSB task, and
     // leave the 500 ms full-recovery path intact if it does not make progress.
-#if !defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if !defined(REMOTEMAPPER_DWC2_DRIVER)
     if (now - s_last_progress_ms >= 30 &&
             now - s_last_fifo_rearm_ms >= 40 &&
             usbd_edpt_busy(0, s_uac_ep_in | 0x80)) {
@@ -212,7 +215,7 @@ static void uac_driver_reset(uint8_t rhport) {
     s_uac_alt = 0;
     s_last_progress_ms = millis();
     s_recovery_requested = false;
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
     s_uac_ep_open = false;
 #endif
     app_log("UAC", "USB Bus Reset detected -> UAC state reset");
@@ -226,7 +229,7 @@ static uint16_t uac_driver_open(uint8_t rhport, tusb_desc_interface_t const *des
         if (p[1] == TUSB_DESC_INTERFACE) {
             if (((tusb_desc_interface_t const*)p)->bInterfaceClass != TUSB_CLASS_AUDIO) break;
         } else if (p[1] == TUSB_DESC_ENDPOINT) {
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
             // Alternate setting 0 has no audio endpoint. Save its descriptor
             // and activate only when the host selects alternate setting 1.
             memcpy(&s_uac_ep_desc, p, sizeof(s_uac_ep_desc));
@@ -239,7 +242,7 @@ static uint16_t uac_driver_open(uint8_t rhport, tusb_desc_interface_t const *des
     return len;
 }
 
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
 static bool uac_activate_endpoint(uint8_t rhport) {
     if (s_uac_ep_open) return true;
     if (s_recovery_requested) return false;
@@ -285,7 +288,7 @@ static bool uac_driver_control_xfer_cb(uint8_t rhport, uint8_t stage,
                 return alt == 0 && tud_control_status(rhport, req);
             }
             if (req->wValue > 1) return false;
-#if defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if defined(REMOTEMAPPER_DWC2_DRIVER)
             if (alt == 0) uac_deactivate_endpoint(rhport);
             else if (!uac_activate_endpoint(rhport)) return false;
 #endif
@@ -355,7 +358,7 @@ static bool uac_driver_xfer_cb(uint8_t rhport, uint8_t ep_addr,
             // Schedule the next packet from the USB completion, keeping its
             // cadence locked to host polls. The 2 ms task remains a fallback
             // when an endpoint is busy or a completion is missed.
-#if !defined(REMOTEMAPPER_EXPERIMENTAL_DWC2)
+#if !defined(REMOTEMAPPER_DWC2_DRIVER)
             if (s_uac_streaming) queue_uac_service();
 #endif
         } else {
@@ -390,27 +393,51 @@ extern "C" {
 
 bool uac_microphone_init(void) {
     if (s_uac_initialized) return true;
-    audio_pipeline_init(&g_audio_pipeline);
+    // UAC owns pipeline startup. Keep this guard so a retry after a partial
+    // interface/task failure never resets the live ring buffer or leaks it.
+    if (!s_audio_pipeline_initialized) {
+        audio_pipeline_init(&g_audio_pipeline);
+        s_audio_pipeline_initialized = true;
+    }
 
     if (s_uac_ep_in == 0) {
         s_uac_ep_in = tinyusb_get_free_in_endpoint();
     }
-
-    // Spawn the 500Hz TX pump.
-    TaskHandle_t uac_push = nullptr;
-    if (xTaskCreatePinnedToCore(uac_push_task, "uac_push", 4096, NULL, PRIO_TASK_USB, &uac_push,
-            TASK_CORE_USB) != pdPASS) {
-        app_log("UAC", "Failed to spawn TX pump task");
-    }
-    core_diagnostics_register("uac_push", uac_push, TASK_CORE_USB);
-    esp_err_t err = tinyusb_enable_interface(USB_INTERFACE_CUSTOM, UAC_DESC_TOTAL_LEN, uac_load_descriptor);
-    if (err != ESP_OK) {
-        app_log("UAC", "Failed to enable UAC interface: %d", err);
+    if (s_uac_ep_in == 0) {
+        app_log("UAC", "Failed to allocate microphone IN endpoint");
         return false;
     }
-    s_uac_initialized = true;
+
+    // Register the interface before starting its worker. On retry, retain the
+    // successful registration and only retry task creation; never leave a
+    // temporary worker running after an interface-registration failure.
+    if (!s_uac_interface_enabled) {
+        esp_err_t err = tinyusb_enable_interface(USB_INTERFACE_CUSTOM, UAC_DESC_TOTAL_LEN, uac_load_descriptor);
+        if (err != ESP_OK) {
+            app_log("UAC", "Failed to enable UAC interface: %d", err);
+            return false;
+        }
+        s_uac_interface_enabled = true;
+    }
+
+    // Spawn the 500Hz TX pump once. Failed creation leaves init unready and
+    // permits a later retry without duplicating the interface or worker.
+    if (s_uac_push_task == nullptr && xTaskCreatePinnedToCore(uac_push_task, "uac_push", 4096, NULL,
+            PRIO_TASK_USB, &s_uac_push_task, TASK_CORE_USB) != pdPASS) {
+        s_uac_push_task = nullptr;
+        app_log("UAC", "Failed to spawn TX pump task");
+        return false;
+    }
+    if (!s_uac_initialized) {
+        core_diagnostics_register("uac_push", s_uac_push_task, TASK_CORE_USB);
+        s_uac_initialized = true;
+    }
     app_log("UAC", "UAC 1.0 Microphone ready (EP %d IN, 500Hz serialized TX + recovery)", s_uac_ep_in);
     return true;
+}
+
+bool uac_microphone_is_ready(void) {
+    return s_uac_initialized && s_uac_interface_enabled && s_uac_push_task != nullptr;
 }
 
 void uac_microphone_task(void) {

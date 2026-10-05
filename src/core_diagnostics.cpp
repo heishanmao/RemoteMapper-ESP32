@@ -15,15 +15,11 @@ struct Entry {
 portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 Entry s_entries[CORE_DIAGNOSTICS_MAX_TASKS] = {};
 
-// A task handle can be recycled after the task is deleted, so a live handle
-// alone does not prove the task still exists. Detecting that reliably would
-// need a kernel lock this module does not take. Instead pcTaskGetName() returns
-// null for a dead task and the recorded name is used, so a stale entry shows up
-// as an affinity of tskNO_AFFINITY rather than as a plausible-looking core.
-const char *live_name(TaskHandle_t handle, const char *fallback) {
-    const char *name = pcTaskGetName(handle);
-    return name ? name : fallback;
-}
+// Entries refer only to permanent tasks. FreeRTOS task-query functions do not
+// validate deleted handles; this registry lock protects entries, not task
+// lifetime. Callers must keep both the task and its name alive for the module's
+// lifetime. Temporary tasks need separate lifecycle coordination before they
+// can be registered here.
 
 }  // namespace
 
@@ -44,15 +40,22 @@ void core_diagnostics_register(const char *name, void *handle, uint8_t expected_
 }
 
 void core_diagnostics_json(JsonObject out) {
+    Entry snapshot[CORE_DIAGNOSTICS_MAX_TASKS];
     portENTER_CRITICAL(&s_mux);
+    for (int i = 0; i < CORE_DIAGNOSTICS_MAX_TASKS; i++) {
+        snapshot[i] = s_entries[i];
+    }
+    portEXIT_CRITICAL(&s_mux);
 
+    // Stack headroom scans and JSON allocation can take significant time.
+    // Neither may hold the registry lock or extend its interrupt-off window.
     JsonArray tasks = out["tasks"].to<JsonArray>();
     int per_core[portNUM_PROCESSORS] = {0};
     int unregistered = 0;
     uint8_t count = 0;
 
     for (int i = 0; i < CORE_DIAGNOSTICS_MAX_TASKS; i++) {
-        const Entry &e = s_entries[i];
+        const Entry &e = snapshot[i];
         if (!e.in_use) continue;
         count++;
 
@@ -71,7 +74,7 @@ void core_diagnostics_json(JsonObject out) {
         }
 
         JsonObject o = tasks.add<JsonObject>();
-        o["name"] = live_name(e.handle, e.name);
+        o["name"] = e.name ? e.name : "unnamed";
         o["prio"] = (int)prio;
         o["stack_free"] = (int)stack_free;
         o["core"] = core;
@@ -94,6 +97,4 @@ void core_diagnostics_json(JsonObject out) {
     out["slots"] = CORE_DIAGNOSTICS_MAX_TASKS;
     // Stated explicitly so a reader does not mistake this for a load report.
     out["cpu_load_available"] = false;
-
-    portEXIT_CRITICAL(&s_mux);
 }

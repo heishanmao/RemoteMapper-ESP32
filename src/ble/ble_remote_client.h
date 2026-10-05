@@ -18,6 +18,24 @@ typedef enum {
     BLE_STATE_TALKING
 } ble_remote_state_t;
 
+// Current (not-yet-flushed) audio diagnostic window. Interval fields describe
+// observed notification arrival timing; long_intervals are not packet-loss
+// counts. Values are zero after a periodic diagnostic flush until RX resumes.
+typedef struct {
+    uint32_t frames;
+    uint32_t elapsed_ms;
+    uint32_t fps_x10;
+    uint32_t interval_count;
+    uint32_t interval_avg_ms;
+    uint32_t interval_max_ms;
+    uint32_t long_intervals;
+    uint32_t decode_avg_us;
+    uint32_t decode_max_us;
+    uint32_t len_other;
+    uint32_t partial;
+    uint32_t decode_drop;
+} ble_audio_rx_diagnostics_t;
+
 /**
  * @brief Initialize NimBLE Client for Xiaomi Remote
  */
@@ -25,6 +43,8 @@ void ble_remote_init(void);
 
 // Last complete ATVV frame received (independent of volume/USB backpressure).
 uint32_t ble_remote_last_audio_frame_ms(void);
+// Copy the live primitive-counter window for a status/API consumer.
+void ble_remote_get_audio_rx_diagnostics(ble_audio_rx_diagnostics_t* out);
 // Defer mic close to the BLE task; a new active session supersedes this request.
 void ble_remote_request_mic_stop(void);
 
