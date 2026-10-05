@@ -11,9 +11,115 @@
 extern void app_log(const char* tag, const char* format, ...);
 
 audio_pipeline_t g_audio_pipeline;
+static portMUX_TYPE s_audio_session_mux = portMUX_INITIALIZER_UNLOCKED;
 
 bool audio_pipeline_set_resample(audio_pipeline_t *pipeline, uint16_t num, uint16_t den);
 static void audio_spectrum_probe(audio_pipeline_t *pipeline, const int16_t *x, size_t n);
+
+static uint32_t next_session_epoch(uint32_t epoch) {
+    epoch++;
+    return epoch ? epoch : 1u;
+}
+
+static void audio_pipeline_reset_producer_state(audio_pipeline_t *pipeline, uint8_t session_id) {
+    adpcm_init_state(&pipeline->adpcm);
+    audio_filter_init(&pipeline->filter);
+    audio_agc_reset(&pipeline->agc);
+    pipeline->rs_prev = 0;
+    pipeline->rs_phase = 0;
+    pipeline->rs_primed = false;
+    memset(pipeline->spec_mag, 0, sizeof(pipeline->spec_mag));
+    memset(pipeline->spec_peak, 0, sizeof(pipeline->spec_peak));
+    pipeline->spec_frames = 0;
+    __atomic_store_n(&pipeline->session_id, session_id, __ATOMIC_RELEASE);
+    __atomic_store_n(&pipeline->total_frames_decoded, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&pipeline->total_samples_pushed, 0u, __ATOMIC_RELEASE);
+    pipeline->lead_mute_remaining = AUDIO_LEAD_MUTE_SAMPLES;
+    pipeline->fade_in_remaining = AUDIO_FADE_IN_SAMPLES;
+}
+
+static bool audio_pipeline_take_session_reset(audio_pipeline_t *pipeline,
+                                              uint32_t *epoch,
+                                              uint8_t *session_id) {
+    bool claimed = false;
+    portENTER_CRITICAL(&s_audio_session_mux);
+    if (pipeline->reset_pending && pipeline->reset_epoch == pipeline->session_epoch) {
+        *epoch = pipeline->session_epoch;
+        *session_id = pipeline->reset_session_id;
+        pipeline->reset_pending = false;
+        claimed = true;
+    }
+    portEXIT_CRITICAL(&s_audio_session_mux);
+    return claimed;
+}
+
+static void audio_pipeline_apply_requested_ratio(audio_pipeline_t *pipeline);
+
+static bool audio_pipeline_apply_session_reset(audio_pipeline_t *pipeline,
+                                               uint32_t *session_epoch) {
+    uint32_t epoch = 0;
+    uint8_t session_id = 0;
+    if (!audio_pipeline_take_session_reset(pipeline, &epoch, &session_id)) return false;
+    // This function is called only from the BLE producer (feed/sync/session
+    // preparation), so decoder/filter/resampler state has a single writer.
+    audio_pipeline_apply_requested_ratio(pipeline);
+    audio_pipeline_reset_producer_state(pipeline, session_id);
+    if (session_epoch) *session_epoch = epoch;
+    return true;
+}
+
+static bool audio_pipeline_begin_produce(audio_pipeline_t *pipeline, uint32_t *epoch_out) {
+    bool apply_reset = false;
+    uint32_t epoch = 0;
+    uint8_t session_id = 0;
+    portENTER_CRITICAL(&s_audio_session_mux);
+    if (__atomic_load_n(&pipeline->active, __ATOMIC_ACQUIRE)) {
+        epoch = pipeline->session_epoch;
+        if (pipeline->reset_pending && pipeline->reset_epoch == epoch) {
+            session_id = pipeline->reset_session_id;
+            pipeline->reset_pending = false;
+            apply_reset = true;
+        }
+    }
+    portEXIT_CRITICAL(&s_audio_session_mux);
+    if (!epoch) return false;
+    if (apply_reset) {
+        audio_pipeline_apply_requested_ratio(pipeline);
+        audio_pipeline_reset_producer_state(pipeline, session_id);
+    }
+    portENTER_CRITICAL(&s_audio_session_mux);
+    const bool valid = __atomic_load_n(&pipeline->active, __ATOMIC_ACQUIRE) &&
+                       pipeline->session_epoch == epoch;
+    portEXIT_CRITICAL(&s_audio_session_mux);
+    if (valid && epoch_out) *epoch_out = epoch;
+    return valid;
+}
+
+static size_t audio_pipeline_commit_prepared_write(audio_pipeline_t *pipeline,
+                                                   uint32_t epoch,
+                                                   uint32_t expected_head,
+                                                   size_t prepared,
+                                                   bool decoded_frame) {
+    size_t written = 0;
+    portENTER_CRITICAL(&s_audio_session_mux);
+    if (__atomic_load_n(&pipeline->active, __ATOMIC_ACQUIRE) &&
+            pipeline->session_epoch == epoch) {
+        if (decoded_frame) {
+            __atomic_fetch_add(&pipeline->total_frames_decoded, 1u, __ATOMIC_RELAXED);
+        }
+        if (prepared != 0 && audio_ring_buffer_commit_write(
+                    &pipeline->ring_buf, expected_head, prepared)) {
+            written = prepared;
+            __atomic_fetch_add(&pipeline->total_samples_pushed, (uint32_t)written, __ATOMIC_RELAXED);
+            if (__atomic_load_n(&pipeline->buffering, __ATOMIC_RELAXED) &&
+                    audio_ring_buffer_peek_available(&pipeline->ring_buf) >= AUDIO_JITTER_PREFILL_SAMPLES) {
+                __atomic_store_n(&pipeline->buffering, false, __ATOMIC_RELEASE);
+            }
+        }
+    }
+    portEXIT_CRITICAL(&s_audio_session_mux);
+    return written;
+}
 
 void audio_pipeline_init(audio_pipeline_t *pipeline) {
     if (!pipeline) return;
@@ -30,42 +136,60 @@ void audio_pipeline_init(audio_pipeline_t *pipeline) {
                 (unsigned)ring_capacity);
     }
     audio_ring_buffer_init(&pipeline->ring_buf, ring_storage, ring_capacity);
-    pipeline->active = false;
-    pipeline->buffering = false;
+    __atomic_store_n(&pipeline->active, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&pipeline->buffering, false, __ATOMIC_RELEASE);
     pipeline->session_id = 0;
     pipeline->total_frames_decoded = 0;
     pipeline->total_samples_pushed = 0;
-    // Passthrough by default: the spectral probe shows 1:1 is the true capture
-    // rate, so pitch is already correct and the defect is dropped samples rather
-    // than a rate mismatch. Applied here rather than in start_session so a runtime
-    // /api/audio/resample setting survives across sessions.
-    audio_pipeline_set_resample(pipeline, 1, 1);
+    // Passthrough is the applied/requested startup default. Later API settings
+    // are accepted atomically and applied only by the BLE producer at a session
+    // boundary.
+    pipeline->rs_interval = 1;
+    pipeline->rs_step = 1;
+    pipeline->rs_requested_packed = audio_rs_pack(1, 1);
+    pipeline->rs_applied_packed = audio_rs_pack(1, 1);
 }
 
 void audio_pipeline_start_session(audio_pipeline_t *pipeline, uint8_t session_id) {
     if (!pipeline) return;
-    adpcm_init_state(&pipeline->adpcm);
-    audio_filter_init(&pipeline->filter);
-    audio_agc_reset(&pipeline->agc);
+    portENTER_CRITICAL(&s_audio_session_mux);
+    if (pipeline->prepared_start) {
+        // BLE already reset the producer state at AUDIO_START. Retain any
+        // AUDIO_SYNC that arrived before this USB-side activation.
+        pipeline->prepared_start = false;
+    } else {
+        pipeline->session_epoch = next_session_epoch(pipeline->session_epoch);
+        pipeline->reset_epoch = pipeline->session_epoch;
+        pipeline->reset_session_id = session_id;
+        pipeline->reset_pending = true;
+    }
     audio_ring_buffer_clear(&pipeline->ring_buf);
-    // Re-prime the upsampler so the first frame does not interpolate against a
-    // sample from the previous session (which would be an audible click).
-    // The ratio itself is deliberately left alone: it is a runtime setting.
-    pipeline->rs_prev   = 0;
-    pipeline->rs_phase  = 0;
-    pipeline->rs_primed = false;
-    pipeline->session_id = session_id;
-    pipeline->active = true;
-    pipeline->buffering = true; // Wait for initial prefill cushion to prevent jitter underruns
-    pipeline->lead_mute_remaining = AUDIO_LEAD_MUTE_SAMPLES;
-    pipeline->fade_in_remaining = AUDIO_FADE_IN_SAMPLES;
-    pipeline->total_frames_decoded = 0;
-    pipeline->total_samples_pushed = 0;
-    pipeline->underrun_count = 0;
+    __atomic_store_n(&pipeline->buffering, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&pipeline->active, true, __ATOMIC_RELEASE);
+    portEXIT_CRITICAL(&s_audio_session_mux);
+}
+
+void audio_pipeline_prepare_session(audio_pipeline_t *pipeline, uint8_t session_id) {
+    if (!pipeline) return;
+    portENTER_CRITICAL(&s_audio_session_mux);
+    pipeline->session_epoch = next_session_epoch(pipeline->session_epoch);
+    pipeline->reset_epoch = pipeline->session_epoch;
+    pipeline->reset_session_id = session_id;
+    pipeline->reset_pending = true;
+    pipeline->prepared_start = true;
+    // Invalidate any frame already decoding in the previous session. The BLE
+    // callback and decoder share an owner task, and the epoch check also rejects
+    // a stale frame at its eventual ring-head commit.
+    __atomic_store_n(&pipeline->active, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&pipeline->buffering, true, __ATOMIC_RELEASE);
+    audio_ring_buffer_clear(&pipeline->ring_buf);
+    portEXIT_CRITICAL(&s_audio_session_mux);
+    audio_pipeline_apply_session_reset(pipeline, NULL);
 }
 
 void audio_pipeline_sync(audio_pipeline_t *pipeline, int16_t predictor, int8_t step_index) {
     if (!pipeline) return;
+    audio_pipeline_apply_session_reset(pipeline, NULL);
     adpcm_sync_state(&pipeline->adpcm, predictor, step_index);
     // The predictor reset makes the next decoded sample independent of the last
     // one, so the upsampler must re-prime rather than interpolate across that
@@ -75,11 +199,10 @@ void audio_pipeline_sync(audio_pipeline_t *pipeline, int16_t predictor, int8_t s
 
 // Linear-interpolating rational resampler, ratio = rs_interval / rs_step.
 //
-// The remote delivers 120-byte ADPCM frames (240 samples) at a steady ~50 fps.
-// AUDIO_SAMPLE_RATE is 16000, so at 1:1 the UAC consumer pulls 16000 samples/s
-// while only 12000 arrive, and the pipeline covers the 25% shortfall with
-// silence. Some amount of rate conversion is therefore mandatory; the only open
-// question is the exact ratio, which is why it is runtime-tunable.
+// The current field observation is 240 decoded samples per frame at roughly
+// 66.7 frames/s, which matches AUDIO_SAMPLE_RATE=16000 and the default 1:1 path.
+// The ratio remains runtime-tunable for measurement, but the spectral probe is
+// diagnostic evidence rather than proof of a fixed missing-sample fraction.
 //
 //   rs_interval  units per input-sample interval (the interpolation denominator)
 //   rs_step      read-position advance per output sample
@@ -93,8 +216,8 @@ void audio_pipeline_sync(audio_pipeline_t *pipeline, int16_t predictor, int8_t s
 //   emit in[3]                          (phase 0 again)
 // which is 4 outputs per 3 inputs, exactly, with no accumulated drift.
 //
-// Phase lives in integer units, so a ratio change only affects samples decoded
-// after the change; no fractional error builds up over frames or sessions.
+// Phase lives in integer units, so a ratio request takes effect at the next
+// session boundary; no fractional error builds up over frames or sessions.
 static size_t audio_resample_up(audio_pipeline_t *pipeline,
                                 const int16_t *in, size_t n, int16_t *out) {
     if (pipeline->rs_step == 0 || pipeline->rs_interval == 0) {
@@ -122,8 +245,10 @@ static size_t audio_resample_up(audio_pipeline_t *pipeline,
             // Worst case per input sample is ceil(interval/step)+1 outputs, and
             // callers cap the ratio so that this stays inside AUDIO_WORK_SAMPLES.
             if (o >= AUDIO_WORK_SAMPLES) { pipeline->rs_primed = false; return o; }
-            const int32_t d = (cur - pipeline->rs_prev) * (int32_t)pipeline->rs_phase;
-            out[o++] = (int16_t)(pipeline->rs_prev + d / (int32_t)interval);
+            // The phase is derived from uint16 ratios and can approach 65535;
+            // full-scale PCM deltas times phase exceed signed 32-bit range.
+            const int64_t d = (int64_t)(cur - pipeline->rs_prev) * pipeline->rs_phase;
+            out[o++] = (int16_t)(pipeline->rs_prev + d / (int64_t)interval);
             pipeline->rs_phase += step;
         }
         pipeline->rs_phase -= interval;
@@ -137,29 +262,69 @@ static size_t audio_resample_up(audio_pipeline_t *pipeline,
 // too large can exceed the work buffer.
 bool audio_pipeline_set_resample(audio_pipeline_t *pipeline, uint16_t num, uint16_t den) {
     if (!pipeline) return false;
-    if (den == 0 || num == 0) return false;                 // 0/0 = passthrough
-    if ((uint32_t)num * 100u > (uint32_t)den * AUDIO_RS_MAX_RATIO_PCT) return false;
-    if ((uint32_t)num * 100u < (uint32_t)den * AUDIO_RS_MIN_RATIO_PCT) return false;
+    if (!audio_rs_valid(num, den, AUDIO_RS_MIN_RATIO_PCT, AUDIO_RS_MAX_RATIO_PCT)) return false;
     // Reduce to lowest terms so the phase stays small and exact.
-    uint32_t a = num, b = den;
-    while (b) { uint32_t t = a % b; a = b; b = t; }
-    // Ratio is outputs-per-input = rs_interval / rs_step, so the interpolation
-    // denominator comes from `num` and the per-output advance from `den`.
-    pipeline->rs_interval = num / a;
-    pipeline->rs_step     = den / a;
-    pipeline->rs_primed   = false;                          // re-prime on next frame
+    const uint32_t gcd = audio_rs_gcd(num, den);
+    const uint16_t reduced_num = (uint16_t)(num / gcd);
+    const uint16_t reduced_den = (uint16_t)(den / gcd);
+    // Success means the request passed validation and was atomically queued.
+    // The active ratio and phase are untouched until the BLE owner applies it
+    // at a session boundary.
+    __atomic_store_n(&pipeline->rs_requested_packed,
+                     audio_rs_pack(reduced_num, reduced_den), __ATOMIC_RELEASE);
     return true;
 }
 
 void audio_pipeline_get_resample(const audio_pipeline_t *pipeline, uint16_t *num, uint16_t *den) {
     if (!pipeline || !num || !den) return;
-    if (pipeline->rs_interval == 0 || pipeline->rs_step == 0) { *num = 1; *den = 1; return; }
-    *num = (uint16_t)pipeline->rs_interval;                // outputs per input
-    *den = (uint16_t)pipeline->rs_step;
+    const uint32_t requested = __atomic_load_n(&pipeline->rs_requested_packed, __ATOMIC_ACQUIRE);
+    *num = audio_rs_num(requested);
+    *den = audio_rs_den(requested);
+}
+
+void audio_pipeline_get_resample_status(const audio_pipeline_t *pipeline, audio_resample_status_t *out) {
+    if (!pipeline || !out) return;
+    const uint32_t requested = __atomic_load_n(&pipeline->rs_requested_packed, __ATOMIC_ACQUIRE);
+    const uint32_t applied = __atomic_load_n(&pipeline->rs_applied_packed, __ATOMIC_ACQUIRE);
+    out->requested_num = audio_rs_num(requested);
+    out->requested_den = audio_rs_den(requested);
+    out->applied_num = audio_rs_num(applied);
+    out->applied_den = audio_rs_den(applied);
+    out->pending = audio_rs_is_pending(requested, applied) != 0;
+}
+
+static void audio_pipeline_apply_requested_ratio(audio_pipeline_t *pipeline) {
+    const uint32_t requested = __atomic_load_n(&pipeline->rs_requested_packed, __ATOMIC_ACQUIRE);
+    const uint32_t applied = __atomic_load_n(&pipeline->rs_applied_packed, __ATOMIC_RELAXED);
+    if (requested == applied) return;
+    const uint16_t num = audio_rs_num(requested);
+    const uint16_t den = audio_rs_den(requested);
+    // Setter validation guarantees these are non-zero and in range.
+    pipeline->rs_interval = num;
+    pipeline->rs_step = den;
+    pipeline->rs_primed = false;
+    __atomic_store_n(&pipeline->rs_applied_packed, requested, __ATOMIC_RELEASE);
+}
+
+bool audio_pipeline_is_active(const audio_pipeline_t *pipeline) {
+    return pipeline && __atomic_load_n(&pipeline->active, __ATOMIC_ACQUIRE);
+}
+
+bool audio_pipeline_is_buffering(const audio_pipeline_t *pipeline) {
+    return pipeline && __atomic_load_n(&pipeline->buffering, __ATOMIC_ACQUIRE);
+}
+
+void audio_pipeline_consume_pending_clear(audio_pipeline_t *pipeline) {
+    if (!pipeline) return;
+    portENTER_CRITICAL(&s_audio_session_mux);
+    audio_ring_buffer_consume_pending_clear(&pipeline->ring_buf);
+    portEXIT_CRITICAL(&s_audio_session_mux);
 }
 
 size_t audio_pipeline_feed_adpcm(audio_pipeline_t *pipeline, const uint8_t *adpcm_bytes, size_t len) {
-    if (!pipeline || !adpcm_bytes || len == 0 || !pipeline->active) return 0;
+    if (!pipeline || !adpcm_bytes || len == 0) return 0;
+    uint32_t session_epoch = 0;
+    if (!audio_pipeline_begin_produce(pipeline, &session_epoch)) return 0;
 
     // 0. ADPCM decode at the remote's native rate, then rate-convert to
     //    AUDIO_SAMPLE_RATE so everything below (rate-dependent filters,
@@ -169,7 +334,7 @@ size_t audio_pipeline_feed_adpcm(audio_pipeline_t *pipeline, const uint8_t *adpc
     // The spectral probe is diagnostic-only, and at one Goertzel pass per frame it
     // added ~3 ms to a 15 ms budget inside the NimBLE host task, which throttles
     // notification handling. 8 bins over a whole utterance is plenty, so sample
-    // one frame in AUDIO_SPEC_STRIDE; at 50-66 fps that is roughly 2-3 probes/s.
+    // one frame in AUDIO_SPEC_STRIDE; at about 66.7 fps that is roughly 2.7 probes/s.
     if ((pipeline->spec_frames++ % AUDIO_SPEC_STRIDE) == 0) {
         audio_spectrum_probe(pipeline, pipeline->decode_buf, decoded);
     }
@@ -223,50 +388,64 @@ size_t audio_pipeline_feed_adpcm(audio_pipeline_t *pipeline, const uint8_t *adpc
         pipeline->fade_in_remaining = fade - n;
     }
 
-    // 6. Enqueue into ring buffer
-    size_t written = audio_ring_buffer_write(&pipeline->ring_buf, pipeline->temp_pcm, samples_decoded);
-
-    pipeline->total_frames_decoded++;
-    pipeline->total_samples_pushed += written;
-
-    // Check if prefill threshold reached. Producer side, so use the pure peek:
-    // the applying accessor moves the consumer's tail, and doing that from the
-    // producer would discard the prefill this very loop is building.
-    if (pipeline->buffering) {
-        if (audio_ring_buffer_peek_available(&pipeline->ring_buf) >= AUDIO_JITTER_PREFILL_SAMPLES) {
-            pipeline->buffering = false;
-        }
-    }
-
-    return written;
+    // Copy into unpublished ring slots without a long critical section. The
+    // final short session lock decides whether these samples belong to the
+    // current epoch and publishes head atomically; stop/restart invalidates an
+    // in-flight frame before it can become visible to USB.
+    uint32_t expected_head = 0;
+    const size_t prepared = audio_ring_buffer_prepare_write(
+            &pipeline->ring_buf, pipeline->temp_pcm, samples_decoded, &expected_head);
+    return audio_pipeline_commit_prepared_write(
+            pipeline, session_epoch, expected_head, prepared, true);
 }
 
 size_t audio_pipeline_read_for_usb(audio_pipeline_t *pipeline, int16_t *out_pcm, size_t sample_count) {
     if (!pipeline || !out_pcm || sample_count == 0) return 0;
 
-    // Honour a session reset on the idle path too. start_session/stop_session
-    // run on the producer side and only post the request; without this the
-    // previous session's samples would sit in the ring for as long as the host
-    // keeps the stream muted, because the early return below never reaches the
-    // ring at all.
-    audio_ring_buffer_consume_pending_clear(&pipeline->ring_buf);
+    // Bound every session critical section to a small USB-sized chunk, even if
+    // another caller requests a much larger read than the usual 32 samples.
+    static const size_t READ_LOCK_CHUNK_SAMPLES = 64;
+    size_t offset = 0;
+    size_t short_avail = 0;
+    bool short_read = false;
+    bool became_silent = false;
+    while (offset < sample_count) {
+        const size_t chunk = (sample_count - offset < READ_LOCK_CHUNK_SAMPLES)
+            ? sample_count - offset : READ_LOCK_CHUNK_SAMPLES;
+        size_t n = 0;
+        portENTER_CRITICAL(&s_audio_session_mux);
+        audio_ring_buffer_consume_pending_clear(&pipeline->ring_buf);
+        const bool silent = !__atomic_load_n(&pipeline->active, __ATOMIC_ACQUIRE) ||
+                            __atomic_load_n(&pipeline->buffering, __ATOMIC_ACQUIRE);
+        if (!silent) {
+            short_avail = audio_ring_buffer_available_read(&pipeline->ring_buf);
+            const size_t wanted = short_avail < chunk ? short_avail : chunk;
+            n = audio_ring_buffer_read(&pipeline->ring_buf, out_pcm + offset, wanted);
+            __atomic_fetch_add(&pipeline->wire_samples, (uint32_t)n, __ATOMIC_RELAXED);
+            if (n < chunk) {
+                if (!short_read) {
+                    if (short_avail == 0) __atomic_fetch_add(&pipeline->starve_count, 1u, __ATOMIC_RELAXED);
+                    else __atomic_fetch_add(&pipeline->partial_count, 1u, __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&pipeline->underrun_count, 1u, __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&pipeline->padded_samples,
+                                       (uint32_t)(sample_count - offset - n), __ATOMIC_RELAXED);
+                }
+                short_read = true;
+            }
+        } else {
+            became_silent = true;
+        }
+        portEXIT_CRITICAL(&s_audio_session_mux);
 
-    if (!pipeline->active || pipeline->buffering) {
-// Feed pure silence while idle or building the initial prefill cushion
-// (AUDIO_JITTER_PREFILL_SAMPLES = 50ms).
-        memset(out_pcm, 0, sample_count * sizeof(int16_t));
-        return sample_count;
+        offset += n;
+        if (became_silent) {
+            memset(out_pcm + offset, 0, (sample_count - offset) * sizeof(int16_t));
+            return sample_count;
+        }
+        if (n < chunk) break;
     }
 
-    size_t avail = audio_ring_buffer_available_read(&pipeline->ring_buf);
-
-    if (avail < sample_count) {
-        if (avail == 0) pipeline->starve_count++;
-        else            pipeline->partial_count++;
-        pipeline->underrun_count++;
-        size_t n = audio_ring_buffer_read(&pipeline->ring_buf, out_pcm, avail);
-        pipeline->wire_samples    += n;
-        pipeline->padded_samples  += (sample_count - n);
+    if (short_read) {
         // Surface underruns (starved ring) at most once every 5s so the web log
         // stays readable during long voice sessions instead of a 2s periodic beat.
         // Report the split so a real producer shortfall is distinguishable from
@@ -276,45 +455,50 @@ size_t audio_pipeline_read_for_usb(audio_pipeline_t *pipeline, int16_t *out_pcm,
         uint32_t now = millis();
         if (now - s_last_underrun_log_ms >= 5000) {
             s_last_underrun_log_ms = now;
-            uint32_t d_starve  = pipeline->starve_count  - s_log_starve;
-            uint32_t d_partial = pipeline->partial_count - s_log_partial;
-            uint32_t d_padded  = pipeline->padded_samples - s_log_padded;
-            uint32_t d_wire    = pipeline->wire_samples   - s_log_wire;
-            s_log_starve = pipeline->starve_count;
-            s_log_partial = pipeline->partial_count;
-            s_log_padded = pipeline->padded_samples;
-            s_log_wire = pipeline->wire_samples;
+            const uint32_t starve = __atomic_load_n(&pipeline->starve_count, __ATOMIC_RELAXED);
+            const uint32_t partial = __atomic_load_n(&pipeline->partial_count, __ATOMIC_RELAXED);
+            const uint32_t padded = __atomic_load_n(&pipeline->padded_samples, __ATOMIC_RELAXED);
+            const uint32_t wire = __atomic_load_n(&pipeline->wire_samples, __ATOMIC_RELAXED);
+            uint32_t d_starve  = starve - s_log_starve;
+            uint32_t d_partial = partial - s_log_partial;
+            uint32_t d_padded  = padded - s_log_padded;
+            uint32_t d_wire    = wire - s_log_wire;
+            s_log_starve = starve;
+            s_log_partial = partial;
+            s_log_padded = padded;
+            s_log_wire = wire;
             uint32_t d_total = d_padded + d_wire;
             uint32_t loss_pct = d_total ? (d_padded * 100 / d_total) : 0;
             app_log("AUDIO_DBG",
                 "ring short: avail=%d req=%d | 5s window: starve=%u partial=%u "
                 "wire=%u padded=%u (%u%% silence) | frames=%u",
-                (int)avail, (int)sample_count,
+                (int)short_avail, (int)sample_count,
                 (unsigned)d_starve, (unsigned)d_partial,
                 (unsigned)d_wire, (unsigned)d_padded, (unsigned)loss_pct,
-                (unsigned)pipeline->total_frames_decoded);
+                (unsigned)__atomic_load_n(&pipeline->total_frames_decoded, __ATOMIC_RELAXED));
         }
         // Smooth hold / fade to 0 to prevent sharp sawtooth click
-        int16_t last_val = (n > 0) ? out_pcm[n - 1] : 0;
-        for (size_t i = n; i < sample_count; i++) {
+        int16_t last_val = (offset > 0) ? out_pcm[offset - 1] : 0;
+        for (size_t i = offset; i < sample_count; i++) {
             last_val = (int16_t)((last_val * 7) / 8); // Smooth exponential fade to 0
             out_pcm[i] = last_val;
         }
-        return sample_count;
     }
 
-    pipeline->wire_samples += sample_count;
-    audio_ring_buffer_read(&pipeline->ring_buf, out_pcm, sample_count);
     return sample_count;
 }
 
 void audio_pipeline_stop_session(audio_pipeline_t *pipeline) {
     if (!pipeline) return;
-    pipeline->active = false;
-    pipeline->buffering = false;
-    pipeline->lead_mute_remaining = 0;
-    pipeline->fade_in_remaining = 0;
+    portENTER_CRITICAL(&s_audio_session_mux);
+    __atomic_store_n(&pipeline->active, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&pipeline->buffering, false, __ATOMIC_RELEASE);
+    pipeline->session_epoch = next_session_epoch(pipeline->session_epoch);
+    pipeline->reset_epoch = pipeline->session_epoch;
+    pipeline->reset_pending = false;
+    pipeline->prepared_start = false;
     audio_ring_buffer_clear(&pipeline->ring_buf);
+    portEXIT_CRITICAL(&s_audio_session_mux);
 }
 
 // ---------------------------------------------------------------------------
@@ -336,9 +520,9 @@ static uint32_t audio_goertzel(const int16_t *x, size_t n, uint32_t bin_hz, uint
     return p > 0.0 ? (uint32_t)(p / (double)n) : 0u;
 }
 
-// Accumulate energy on the decoded sequence, before rate conversion, so the bins
-// are referenced to the remote's own sample spacing (1/12000 s). That is what
-// makes the 6 kHz bin meaningful: it sits exactly on the assumed Nyquist.
+// Accumulate energy on the decoded sequence, before rate conversion. The current
+// working interpretation is 240 samples/frame at about 66.7 fps (~16 kHz), but
+// the probe is diagnostic and cannot by itself prove the source sampling rate.
 static void audio_spectrum_probe(audio_pipeline_t *pipeline,
                                  const int16_t *x, size_t n) {
     for (int b = 0; b < AUDIO_SPEC_BINS; b++) {

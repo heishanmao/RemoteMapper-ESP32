@@ -1,44 +1,69 @@
-"""Regression contracts for the actual recovery/sender integration.
-
-These inspect firmware source and demonstrate the queued-event counterexample;
-they do not execute FreeRTOS or simulate the USB controller.
-"""
+"""Integration contracts for the sender queue and USB recovery gate."""
 from pathlib import Path
 import re
 import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class TestRecoveryGate(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        source = (Path(__file__).resolve().parents[2] /
-                  "src/usb/usb_composite.cpp").read_text(encoding="utf-8")
+        source = (ROOT / "src/usb/usb_composite.cpp").read_text(encoding="utf-8")
         cls.code = re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.S)
         cls.recovery = cls.code.split("static bool usb_recovery_tick(", 1)[1].split(
-            "static bool hid_flush_keyboard_locked(", 1)[0]
+            "static void hid_clear_locked(", 1)[0]
+        cls.queue = (ROOT / "src/usb/hid_command_queue.h").read_text(encoding="utf-8")
 
-    def test_recovery_closes_gate_before_release_and_detach(self):
-        gate = self.recovery.index("s_hid_recovering = true;")
-        prefix = self.recovery[:gate]
-        locked = prefix[prefix.rfind("hid_lock();"):]
-        # The only unlock before the gate is the resolved-HID early return.
-        # Pending recheck and closing the gate must otherwise share one lock.
-        self.assertRegex(locked, r"if\s*\(reason == USB_RECOVERY_HID && !s_keyboard_pending && !s_consumer_pending\)\s*\{\s*hid_unlock\(\);\s*return false;\s*\}\s*$")
-        self.assertEqual(locked.count("hid_unlock();"), 1)
-        self.assertLess(gate, self.recovery.index("usb_composite_force_release_all("))
-        self.assertLess(gate, self.recovery.index("tud_disconnect();"))
+    def test_recovery_invalidates_epoch_and_closes_sender_before_detach(self):
+        begin = self.recovery.index("s_hid_commands.begin_recovery();")
+        force = self.recovery.index("usb_composite_force_release_all(", begin)
+        pause = self.recovery.index("s_hid_commands.pause_for_detach();", force)
+        detach = self.recovery.index("tud_disconnect();", pause)
+        self.assertLess(begin, force)
+        self.assertLess(force, pause)
+        self.assertLess(pause, detach)
+        pause_helper = re.search(
+            r"static void hid_sender_pause_for_detach\(void\)\s*\{([^}]*)\}", self.code
+        ).group(1)
+        self.assertLess(pause_helper.index("hid_lock();"), pause_helper.index("pause_for_detach()"))
 
-    def test_all_sender_paths_observe_gate_under_their_existing_lock(self):
-        for start, end in (
-            ("static bool hid_flush_keyboard_locked(", "static bool hid_flush_consumer_locked("),
-            ("static bool hid_flush_consumer_locked(", "static void hid_clear_locked("),
+    def test_sender_checks_epoch_and_keeps_completion_guard_timeout(self):
+        sender = self.code.split("static bool hid_send_command_report(", 1)[1].split(
+            "static void hid_sender_task(", 1)[0]
+        self.assertIn("s_hid_commands.begin_send(command)", sender)
+        self.assertIn("hid_lock();", sender)
+        self.assertIn("SendReport(HID_REPORT_ID_KEYBOARD, &report, sizeof(report), 20)", sender)
+        self.assertIn("SendReport(HID_REPORT_ID_CONSUMER_CONTROL, &report, sizeof(report), 20)", sender)
+        self.assertIn("is_current(command)", self.code.split("static bool hid_command_current(", 1)[1].split("}", 1)[0])
+        self.assertIn("m_recovering && !is_emergency(command.kind)", self.queue)
+
+    def test_ble_producers_only_take_short_queue_lock_and_notify(self):
+        for name, next_name in (
+            ("bool usb_hid_keyboard_press(", "bool usb_hid_keyboard_release("),
+            ("bool usb_hid_keyboard_release(", "bool usb_hid_keyboard_tap("),
+            ("bool usb_hid_keyboard_tap(", "bool usb_hid_consumer_press("),
+            ("bool usb_hid_consumer_press(", "bool usb_hid_consumer_release("),
+            ("bool usb_hid_consumer_release(", "bool usb_hid_consumer_tap("),
         ):
-            body = self.code.split(start, 1)[1].split(end, 1)[0]
-            self.assertLess(body.index("s_hid_recovering"), body.index(".SendReport("))
-            self.assertRegex(body, r"if\s*\(s_hid_recovering.*?return false;")
+            body = self.code.split(name, 1)[1].split(next_name, 1)[0]
+            self.assertIn("s_hid_command_mux", body)
+            self.assertIn("hid_command_notify()", body)
+            self.assertNotIn("hid_lock()", body)
+            self.assertNotIn("SendReport", body)
+            self.assertNotIn("delay(", body)
+        tap = self.code.split("bool usb_hid_keyboard_tap(", 1)[1].split(
+            "bool usb_hid_consumer_press(", 1)[0]
+        self.assertIn("enqueue_keyboard(modifier, keycode, true)", tap)
+        self.assertNotIn("delay(", tap)
+
+    def test_worker_owns_tap_dwell_and_stress_observes_recovery(self):
+        worker = self.code.split("static void hid_sender_task(", 1)[1].split(
+            "bool usb_hid_stress_start(", 1)[0]
+        self.assertIn("pdMS_TO_TICKS(15)", worker)
+        self.assertIn("hid_command_current(command)", worker)
         stress = self.code.split("static void hid_stress_task(", 1)[1].split(
             "bool usb_hid_stress_start(", 1)[0]
-        self.assertLess(stress.index("hid_lock();"), stress.index("s_hid_recovering"))
         self.assertLess(stress.index("s_hid_recovering"), stress.index(".SendReport("))
 
     def test_reconnect_samples_mount_sequence_before_attach(self):
@@ -48,36 +73,59 @@ class TestRecoveryGate(unittest.TestCase):
         condition = self.recovery[self.recovery.index("const bool remounted"):reopen]
         self.assertIn("tud_mounted()", condition)
         self.assertIn("!= s_reconnect_mount_seq", condition)
-        self.assertIn("if (remounted)", condition)
 
     def test_asynchronous_started_event_cannot_reopen_transport(self):
         event = self.code.split("id == ARDUINO_USB_STARTED_EVENT", 1)[1].split(
             "id == ARDUINO_USB_STOPPED_EVENT", 1)[0]
         self.assertNotIn("s_hid_recovering = false", event)
-        self.assertNotIn("s_waiting_reconnect_ms = 0", event)
+        self.assertNotIn("end_recovery()", event)
         hook = self.code.split('extern "C" void remotemapper_usb_lifecycle(', 1)[1].split(
             "static uint32_t s_usb_recovery_request", 1)[0]
         self.assertIn("__atomic_add_fetch", hook)
-        self.assertNotIn("hid_lock(", hook)  # USB task must never wait for its sender
+        self.assertNotIn("hid_lock(", hook)
 
-    def test_wakeup_uses_coordinator_without_gpio_override_or_waits(self):
+    def test_wakeup_uses_coordinator_and_sender_wakes_before_ready_check(self):
         wake = self.code.split("if (now - s_hw_sleep_start_ms >= 2000)", 1)[1].split(
             "bool usb_hid_keyboard_press(", 1)[0]
         self.assertIn("usb_composite_request_recovery(USB_RECOVERY_WAKE)", wake)
         for call in ("pinMode(", "digitalWrite(", "vTaskDelay(", "tud_disconnect("):
             self.assertNotIn(call, wake)
+        sender = self.code.split("static bool hid_send_command_report(", 1)[1].split(
+            "static void hid_sender_task(", 1)[0]
+        self.assertLess(sender.index("tud_remote_wakeup();"), sender.index("if (!tud_ready())"))
 
-    def test_old_started_event_is_not_a_new_mount(self):
-        # Old implementation allowed an asynchronous Started reply to erase the
-        # reconnect deadline. It can be queued before recovery and delivered
-        # after detach. A synchronous mount sequence does not change on delivery.
-        sequence = 4
-        baseline = sequence  # sampled just before connect
-        stale_started_delivered = True
-        self.assertTrue(stale_started_delivered)  # would satisfy the old handler
-        self.assertFalse(sequence != baseline)
-        sequence += 1  # a new TinyUSB mount, rather than a queued Arduino event
-        self.assertTrue(sequence != baseline)
+    def test_voice_guard_clamps_nonzero_values_to_one_second_minimum(self):
+        load = self.code.split("static void guard_load_config(", 1)[1].split(
+            "static void guard_add(", 1)[0]
+        setter = self.code.split("bool usb_composite_guard_set(", 1)[1].split(
+            "void usb_composite_force_release_all(", 1)[0]
+        self.assertIn("stored_voice_ms < 1000 ? 1000 : stored_voice_ms", load)
+        self.assertIn("cfg->voice_ms < 1000 ? 1000 : cfg->voice_ms", setter)
+        for body in (load, setter):
+            self.assertIn("HID_GUARD_VOICE_EXTREME_MS", body)
+
+    def test_voice_drain_rechecks_epoch_under_lock_before_stopping_session(self):
+        drain = self.code.split("static bool finish_voice_drain(", 1)[1].split(
+            "void usb_composite_init(", 1)[0]
+        self.assertLess(drain.index("portENTER_CRITICAL(&s_voice_state_mux)"),
+                        drain.index("s_voice_diag_seq != expected_sequence"))
+        self.assertIn("!s_voice_drain_pending || s_voice_diag_seq != expected_sequence", drain)
+        self.assertLess(drain.index("if (!due)"), drain.index("audio_pipeline_stop_session(&g_audio_pipeline)"))
+        stop = drain.index("audio_pipeline_stop_session(&g_audio_pipeline)")
+        self.assertLess(stop, drain.index("portEXIT_CRITICAL(&s_voice_state_mux)", stop))
+
+        actions = self.code.split("case ACTION_VOICE_HOLD:", 1)[1].split(
+            "case ACTION_VOICE_RELEASE:", 1)[0]
+        hold_lock = actions.index("portENTER_CRITICAL(&s_voice_state_mux)")
+        sequence = actions.index("++s_voice_diag_seq", hold_lock)
+        start = actions.index("audio_pipeline_start_session(&g_audio_pipeline, 0)", sequence)
+        unlock = actions.index("portEXIT_CRITICAL(&s_voice_state_mux)", start)
+        self.assertLess(hold_lock, sequence)
+        self.assertLess(sequence, start)
+        self.assertLess(start, unlock)
+        critical = actions[hold_lock:unlock]
+        for forbidden in ("app_log(", "SendReport(", "key_engine_"):
+            self.assertNotIn(forbidden, critical)
 
 
 if __name__ == "__main__":

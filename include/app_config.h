@@ -136,7 +136,7 @@ extern "C" {
 // 0 disables a rule. Values are milliseconds.
 #define HID_GUARD_MOD_SOLO_MS      20000    // Any modifier held > 20s (independent of other keys)
 #define HID_GUARD_KEY_IDLE_MS      60000    // Non-voice key held with zero output for > 60s
-#define HID_GUARD_VOICE_EXTREME_MS 900000   // Absolute ceiling for a voice recording (15 min)
+#define HID_GUARD_VOICE_EXTREME_MS 62000    // Remote stops at 60s; allow 2s for final release/drain
 #define HID_GUARD_VOICE_RX_GAP_MS  5000     // No complete ATVV frames (not acoustic silence)
 
 #ifdef __cplusplus

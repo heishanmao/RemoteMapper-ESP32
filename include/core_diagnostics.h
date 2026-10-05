@@ -10,8 +10,8 @@
 //     core affinity, queried through the handle it was created with.
 //   * Per-core counts of pinned tasks.
 //
-// What it cannot report: CPU load percentages, and an enumeration of tasks the
-// project does not create. Both need FreeRTOS run-time stats and the task-list
+// What it cannot report: CPU load percentages or a complete task enumeration.
+// Both need FreeRTOS run-time stats and the task-list
 // walk, which this framework build does not provide: sdkconfig.h contains
 // neither CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS nor
 // CONFIG_FREERTOS_USE_TRACE_FACILITY, so configGENERATE_RUN_TIME_STATS is
@@ -19,9 +19,10 @@
 // The panic-oriented uxTaskGetSnapshotAll() is present but documented as unsafe
 // while the scheduler runs.
 //
-// Registering only our own tasks is a deliberate limit, not an oversight: it
-// makes the output a direct check of the pinning contract in app_config.h
-// rather than a partial view of kernel-internal tasks nobody here controls.
+// Named framework tasks usbd and nimble_host are discovered once through the
+// supported xTaskGetHandle API. This project never deinitializes their stacks,
+// so they obey the same permanent-lifetime contract as our own tasks. This is
+// still a selected inventory, not a complete kernel task enumeration.
 // Per-core load balance remains unmeasured; that needs a framework rebuild with
 // run-time stats, or a hardware PMU counter.
 //
@@ -40,7 +41,12 @@
 // unregister API; supporting temporary tasks would require coordination with
 // in-flight readers before deleting the task. Null handles are ignored, and
 // registration beyond CORE_DIAGNOSTICS_MAX_TASKS is ignored.
-void core_diagnostics_register(const char *name, void *handle, uint8_t expected_core);
+// expected_core=-1 means the framework intentionally leaves the task unpinned.
+void core_diagnostics_register(const char *name, void *handle, int8_t expected_core);
+
+// Call from the loop task; retries only until both permanent framework tasks
+// have appeared. No querying of tasks while holding the registry spinlock.
+void core_diagnostics_discover_framework_tasks(void);
 
 // Emit one snapshot into `out`. Safe to call from any core.
 void core_diagnostics_json(JsonObject out);

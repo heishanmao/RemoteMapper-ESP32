@@ -2,13 +2,14 @@
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include "app_config.h"
 
 namespace {
 
 struct Entry {
     const char *name;
     TaskHandle_t handle;
-    uint8_t expected_core;
+    int8_t expected_core;
     bool in_use;
 };
 
@@ -23,7 +24,7 @@ Entry s_entries[CORE_DIAGNOSTICS_MAX_TASKS] = {};
 
 }  // namespace
 
-void core_diagnostics_register(const char *name, void *handle, uint8_t expected_core) {
+void core_diagnostics_register(const char *name, void *handle, int8_t expected_core) {
     const TaskHandle_t task = (TaskHandle_t)handle;
     if (!task) return;
 
@@ -37,6 +38,32 @@ void core_diagnostics_register(const char *name, void *handle, uint8_t expected_
         break;
     }
     portEXIT_CRITICAL(&s_mux);
+}
+
+void core_diagnostics_discover_framework_tasks(void) {
+    // Owned by loopTask. Neither USB.end nor NimBLEDevice::deinit is used by
+    // the bridge, hence these handles are not deleted/recycled after discovery.
+    static bool usb_found = false;
+    static bool ble_found = false;
+    static uint32_t last_check_ms = 0;
+    if (usb_found && ble_found) return;
+    const uint32_t now_ms = millis();
+    if (now_ms - last_check_ms < 1000) return;
+    last_check_ms = now_ms;
+    if (!usb_found) {
+        TaskHandle_t task = xTaskGetHandle("usbd");
+        if (task) {
+            core_diagnostics_register("usbd", task, -1);
+            usb_found = true;
+        }
+    }
+    if (!ble_found) {
+        TaskHandle_t task = xTaskGetHandle("nimble_host");
+        if (task) {
+            core_diagnostics_register("nimble_host", task, TASK_CORE_BLE);
+            ble_found = true;
+        }
+    }
 }
 
 void core_diagnostics_json(JsonObject out) {
@@ -97,4 +124,5 @@ void core_diagnostics_json(JsonObject out) {
     out["slots"] = CORE_DIAGNOSTICS_MAX_TASKS;
     // Stated explicitly so a reader does not mistake this for a load report.
     out["cpu_load_available"] = false;
+    out["cpu_load_reason"] = "framework_run_time_stats_disabled";
 }

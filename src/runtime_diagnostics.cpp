@@ -34,6 +34,7 @@ void runtime_diagnostics_set_startup_health(bool ready) { s_startup_tasks_ready 
 
 void runtime_diagnostics_json(JsonObject out) {
     out["cpu_load_available"] = false;
+    out["cpu_load_reason"] = "framework_run_time_stats_disabled";
     out["startup_tasks_ready"] = s_startup_tasks_ready;
     out["loop_count"] = s_loop_count;
     out["loop_work_last_us"] = s_loop_work_last_us;

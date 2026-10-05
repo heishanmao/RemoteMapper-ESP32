@@ -64,6 +64,7 @@ void setup() {
 
     // 1. Initialize Log System first
     app_log_init();
+    core_diagnostics_register("loopTask", xTaskGetCurrentTaskHandle(), TASK_CORE_USB);
     
     // 1.5. Initialize LED Indicator
     if (!led_indicator_init()) {
@@ -176,6 +177,7 @@ void loop() {
     // the NimBLE host task, which is the single dispatcher for every BLE
     // notification (key reports included) and has a shallow stack.
     ble_audio_rx_diagnostics_tick();
+    core_diagnostics_discover_framework_tasks();
     app_log_task();
     runtime_diagnostics_loop_end(loop_started_us);
 

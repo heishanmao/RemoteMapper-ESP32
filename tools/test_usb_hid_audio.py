@@ -21,7 +21,10 @@ from test_usb_capture import Caps, Format, Header, check
 
 def get_json(host, route):
     with urllib.request.urlopen(f"http://{host}/api/{route}", timeout=5) as response:
-        return json.loads(response.read().decode("utf-8", errors="replace"))
+        result = json.loads(response.read().decode("utf-8", errors="replace"))
+        if route == "status":
+            result.pop("ap_pass", None)
+        return result
 
 
 def remote_cdc_port(requested=None):

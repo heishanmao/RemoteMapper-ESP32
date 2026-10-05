@@ -71,7 +71,7 @@ static void queue_uac_service(void) {
 static void uac_service(void*) {
     // Even if the endpoint is stuck or Windows closed capture, honor resets on
     // the ring's one consumer. Otherwise a full old ring blocks new sessions.
-    audio_ring_buffer_consume_pending_clear(&g_audio_pipeline.ring_buf);
+    audio_pipeline_consume_pending_clear(&g_audio_pipeline);
     const uint32_t now = millis();
 #if defined(REMOTEMAPPER_DWC2_DRIVER)
     if (remotemapper_dwc2_controller_faulted() && !s_recovery_requested) {
@@ -130,7 +130,7 @@ static void uac_service(void*) {
         const uint8_t block = s_tx_cur & 1;
         audio_pipeline_read_for_usb(&g_audio_pipeline, s_tx_buf[block], UAC_TX_BLOCK_SAMPLES);
         if (usbd_edpt_xfer(0, ep, (uint8_t*)s_tx_buf[block], UAC_TX_BLOCK_BYTES)) {
-            if (g_audio_pipeline.active) {
+            if (audio_pipeline_is_active(&g_audio_pipeline)) {
                 for (unsigned i = 0; i < UAC_TX_BLOCK_SAMPLES; ++i) {
                     const int32_t v = s_tx_buf[block][i];
                     const uint32_t amplitude = v < 0 ? (uint32_t)-v : (uint32_t)v;

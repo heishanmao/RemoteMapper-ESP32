@@ -17,37 +17,31 @@ extern USBCDC USBSerial;
 
 extern key_mapper_engine_t g_key_engine;
 
-static String s_input_buffer = "";
+static String s_uart_input_buffer = "";
+static String s_cdc_input_buffer = "";
+static app_log_output_t s_response_output = APP_LOG_OUTPUT_UART;
 
 static void handle_command(const String& line);
 
 static void cli_write_line(const String& line) {
-    Serial.println(line);
-#if !ARDUINO_USB_CDC_ON_BOOT
-    if (USBSerial) {
-        // Queue the entire response behind other CDC messages. The common
-        // background sender performs bounded FIFO writes, preserving JSON
-        // line boundaries without blocking this loop on a slow terminal.
-        String response = line;
-        response += "\r\n";
-        if (!app_log_queue_cdc_text(response.c_str(), response.length())) {
-            app_log("CLI", "CDC response discarded: queue full or payload too large (%u bytes)",
-                    (unsigned)response.length());
-        }
-    }
-#endif
+    String response = line;
+    response += "\r\n";
+    app_log_queue_cli_text(s_response_output, response.c_str(), response.length());
 }
 
-static void cli_feed_char(char c) {
+static void cli_feed_char(char c, app_log_output_t source) {
+    String& input_buffer = source == APP_LOG_OUTPUT_CDC
+            ? s_cdc_input_buffer : s_uart_input_buffer;
     if (c == '\r' || c == '\n') {
-        if (s_input_buffer.length() > 0) {
-            handle_command(s_input_buffer);
-            s_input_buffer = "";
+        if (input_buffer.length() > 0) {
+            s_response_output = source;
+            handle_command(input_buffer);
+            input_buffer = "";
         }
     } else {
-        s_input_buffer += c;
-        if (s_input_buffer.length() > 250) {
-            s_input_buffer = "";
+        input_buffer += c;
+        if (input_buffer.length() > 250) {
+            input_buffer = "";
         }
     }
 }
@@ -222,6 +216,9 @@ static void handle_log_command(const String& arg) {
         JsonDocument doc;
         doc["cdc_log_enabled"] = app_log_get_cdc_enabled();
         doc["console_log_enabled"] = app_log_get_console_enabled();
+        doc["uart_cli_dropped"] = app_log_get_cli_dropped(APP_LOG_OUTPUT_UART);
+        doc["cdc_cli_dropped"] = app_log_get_cli_dropped(APP_LOG_OUTPUT_CDC);
+        doc["log_mirror_dropped"] = app_log_get_mirror_dropped();
         String out;
         serializeJson(doc, out);
         cli_write_line(out);
@@ -373,7 +370,8 @@ static void handle_command(const String& line) {
 extern "C" {
 
 void cli_manager_init(void) {
-    s_input_buffer.reserve(256);
+    s_uart_input_buffer.reserve(256);
+    s_cdc_input_buffer.reserve(256);
 }
 
 void cli_manager_task(void) {
@@ -383,7 +381,7 @@ void cli_manager_task(void) {
     unsigned uart_read = 0;
     while (uart_read++ < RX_BUDGET && Serial.available() > 0) {
         char c = (char)Serial.read();
-        cli_feed_char(c);
+        cli_feed_char(c, APP_LOG_OUTPUT_UART);
     }
 #if !ARDUINO_USB_CDC_ON_BOOT
     // Received bytes are valid even when the host hasn't asserted both
@@ -392,7 +390,7 @@ void cli_manager_task(void) {
     unsigned cdc_read = 0;
     while (cdc_read++ < RX_BUDGET && USBSerial.available() > 0) {
         char c = (char)USBSerial.read();
-        cli_feed_char(c);
+        cli_feed_char(c, APP_LOG_OUTPUT_CDC);
     }
 #endif
 }

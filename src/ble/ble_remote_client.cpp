@@ -441,6 +441,9 @@ static void on_ctl_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, siz
         s_session_id = (length >= 4) ? pData[3] : 0;
         s_ble_state = BLE_STATE_TALKING;
         s_last_audio_ms = millis();
+        // BLE owns decoder/filter/resampler state. Publish the new epoch and
+        // reset producer state here before key-engine delivery starts USB audio.
+        audio_pipeline_prepare_session(&g_audio_pipeline, s_session_id);
 
         key_engine_feed_key(&g_key_engine, MI_KEY_VOICE, true, millis());
         app_log("ATVV", ">>> Voice button PRESSED (session %d)", s_session_id);
@@ -805,6 +808,7 @@ class ClientCallbacks : public NimBLEClientCallbacks {
           s_rx_have_prev = false;
           portEXIT_CRITICAL(&s_rx_mux);
           audio_frame_acc_reset();
+          usb_composite_cancel_hid_epoch();
           key_engine_release_all(&g_key_engine, millis());
         usb_hid_keyboard_release();
         usb_hid_consumer_release();
@@ -1615,7 +1619,7 @@ void ble_remote_task(void) {
     uint32_t now = millis();
 
     if (__atomic_exchange_n(&s_req_mic_stop, false, __ATOMIC_ACQ_REL) &&
-            !g_audio_pipeline.active) {
+            !audio_pipeline_is_active(&g_audio_pipeline)) {
         if (s_client && s_client->isConnected() && s_char_cmd &&
                 (s_mic_open || s_ble_state == BLE_STATE_TALKING)) {
             uint8_t close[] = {0x0D, s_session_id};

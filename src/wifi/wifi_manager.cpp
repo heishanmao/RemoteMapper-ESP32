@@ -9,6 +9,7 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <esp_coexist.h>
+#include <esp_wifi.h>
 
 static_assert((int)WIFI_POLICY_ON_DEMAND == WIFI_DEFAULT_POLICY,
               "WIFI_DEFAULT_POLICY must match WIFI_POLICY_ON_DEMAND");
@@ -35,6 +36,25 @@ static bool               s_timeout_enabled  = WIFI_DEFAULT_TIMEOUT_ENABLED ? tr
 static wifi_radio_state_t s_radio_state      = WIFI_STATE_OFF;
 static uint32_t           s_last_activity_ms = 0;
 
+enum wifi_scan_state_t {
+    WIFI_SCAN_IDLE = 0,
+    WIFI_SCAN_WAIT_RADIO,
+    WIFI_SCAN_RUNNING_STATE,
+    WIFI_SCAN_COMPLETE_STATE,
+    WIFI_SCAN_FAILED_STATE
+};
+static const size_t WIFI_SCAN_CACHE_MAX = 32;
+static wifi_scan_state_t s_scan_state = WIFI_SCAN_IDLE;
+static String s_scan_ssid[WIFI_SCAN_CACHE_MAX];
+static int16_t s_scan_rssi[WIFI_SCAN_CACHE_MAX] = {};
+static bool s_scan_secure[WIFI_SCAN_CACHE_MAX] = {};
+static size_t s_scan_count = 0;
+static int s_scan_error = 0;
+static const char* s_scan_error_reason = "";
+static uint32_t s_scan_deadline_ms = 0;
+static uint32_t s_scan_completed_at_ms = 0;
+static bool s_scan_has_complete = false;
+
 // Deferred radio wake requested by the USB stack (host re-enumeration).
 // Consumed by wifi_manager_task() in the main-loop context so it can never
 // race the synchronous radio bring-up inside wifi_manager_init() at boot.
@@ -54,6 +74,12 @@ static volatile bool      s_pending_radio_wake = false;
 
 static void wifi_apply_config(void);    // forward decl (defined below)
 static void wifi_reconnect_light(void); // forward decl (defined below)
+static void wifi_scan_tick(void);
+
+// The manager deadline covers both radio wake and the scan itself. The Arduino
+// scan API retains its default per-channel dwell; a scanComplete() failure is
+// handled by stopping the driver scan in the owner task below.
+static const uint32_t WIFI_SCAN_DEADLINE_MS = 15000;
 
 static bool wifi_is_valid_timeout(uint32_t minutes) {
     return minutes == WIFI_TIMEOUT_NEVER || minutes == 1 || minutes == 2 ||
@@ -382,6 +408,141 @@ const char* wifi_manager_state_str(wifi_radio_state_t state) {
     }
 }
 
+static void wifi_scan_begin(void) {
+    WiFi.scanDelete();
+    s_scan_error = 0;
+    s_scan_error_reason = "";
+    const int result = WiFi.scanNetworks(true);
+    if (result == WIFI_SCAN_FAILED) {
+        s_scan_state = WIFI_SCAN_FAILED_STATE;
+        s_scan_error = result;
+        s_scan_error_reason = "start_failed";
+        WiFi.scanDelete();
+        app_log("WIFI", "Async network scan failed to start (%d)", result);
+        return;
+    }
+    s_scan_state = WIFI_SCAN_RUNNING_STATE;
+}
+
+static void wifi_scan_stop_and_delete(void) {
+    // scanDelete() only frees Arduino's cached results. Stop the driver scan
+    // itself as well, without restarting Wi-Fi or disturbing the STA link.
+    const esp_err_t result = esp_wifi_scan_stop();
+    if (result != ESP_OK && result != ESP_ERR_WIFI_NOT_STARTED &&
+        result != ESP_ERR_WIFI_NOT_INIT) {
+        app_log("WIFI", "Failed to stop async scan (%d)", (int)result);
+    }
+    WiFi.scanDelete();
+}
+
+static void wifi_scan_tick(void) {
+    if ((s_scan_state == WIFI_SCAN_WAIT_RADIO || s_scan_state == WIFI_SCAN_RUNNING_STATE) &&
+        (int32_t)(millis() - s_scan_deadline_ms) >= 0) {
+        if (s_scan_state == WIFI_SCAN_RUNNING_STATE) wifi_scan_stop_and_delete();
+        s_scan_state = WIFI_SCAN_FAILED_STATE;
+        s_scan_error = WIFI_SCAN_FAILED;
+        s_scan_error_reason = "timeout";
+        app_log("WIFI", "Wi-Fi scan timed out");
+        return;
+    }
+    if (s_scan_state == WIFI_SCAN_WAIT_RADIO) {
+        if (s_radio_state == WIFI_STATE_ON) {
+            wifi_scan_begin();
+        } else if (s_radio_state == WIFI_STATE_OFF) {
+            s_scan_state = WIFI_SCAN_FAILED_STATE;
+            s_scan_error = WIFI_SCAN_FAILED;
+            s_scan_error_reason = "radio_unavailable";
+        }
+        return;
+    }
+    if (s_scan_state != WIFI_SCAN_RUNNING_STATE) return;
+
+    const int result_count = WiFi.scanComplete();
+    if (result_count == WIFI_SCAN_RUNNING) return;
+    if (result_count < 0) {
+        s_scan_state = WIFI_SCAN_FAILED_STATE;
+        s_scan_error = result_count;
+        s_scan_error_reason = "scan_failed";
+        wifi_scan_stop_and_delete();
+        app_log("WIFI", "Async network scan failed (%d)", result_count);
+        return;
+    }
+
+    const size_t kept = result_count < (int)WIFI_SCAN_CACHE_MAX
+            ? (size_t)result_count : WIFI_SCAN_CACHE_MAX;
+    for (size_t i = 0; i < kept; ++i) {
+        s_scan_ssid[i] = WiFi.SSID((int)i);
+        s_scan_rssi[i] = (int16_t)WiFi.RSSI((int)i);
+        s_scan_secure[i] = WiFi.encryptionType((int)i) != WIFI_AUTH_OPEN;
+    }
+    s_scan_count = kept;
+    s_scan_state = WIFI_SCAN_COMPLETE_STATE;
+    s_scan_error = 0;
+    s_scan_error_reason = "";
+    s_scan_completed_at_ms = millis();
+    s_scan_has_complete = true;
+    WiFi.scanDelete();
+    app_log("WIFI", "Async network scan complete (%u results cached)",
+            (unsigned int)s_scan_count);
+}
+
+String wifi_manager_scan_status_json(bool request_new_scan) {
+    if (!s_wifi_enabled) {
+        return "{\"status\":\"failed\",\"scanning\":false,\"networks\":[],\"error\":\"wifi_disabled\"}";
+    }
+
+    if (request_new_scan && s_scan_state != WIFI_SCAN_RUNNING_STATE &&
+        s_scan_state != WIFI_SCAN_WAIT_RADIO) {
+        wifi_manager_mark_activity();
+        if (s_radio_state == WIFI_STATE_ON || s_radio_state == WIFI_STATE_ENABLING) {
+            s_scan_state = WIFI_SCAN_WAIT_RADIO;
+        } else if (wifi_manager_request_wifi(WIFI_WAKE_WEB_UI)) {
+            s_scan_state = WIFI_SCAN_WAIT_RADIO;
+        } else {
+            s_scan_state = WIFI_SCAN_FAILED_STATE;
+            s_scan_error = WIFI_SCAN_FAILED;
+            s_scan_error_reason = "radio_unavailable";
+        }
+        if (s_scan_state == WIFI_SCAN_WAIT_RADIO) {
+            s_scan_deadline_ms = millis() + WIFI_SCAN_DEADLINE_MS;
+            s_scan_error = 0;
+            s_scan_error_reason = "";
+        }
+    }
+
+    JsonDocument doc;
+    const bool scanning = s_scan_state == WIFI_SCAN_WAIT_RADIO ||
+                          s_scan_state == WIFI_SCAN_RUNNING_STATE;
+    const char* status = "idle";
+    switch (s_scan_state) {
+        case WIFI_SCAN_WAIT_RADIO: status = "starting"; break;
+        case WIFI_SCAN_RUNNING_STATE: status = "scanning"; break;
+        case WIFI_SCAN_COMPLETE_STATE: status = "complete"; break;
+        case WIFI_SCAN_FAILED_STATE: status = "failed"; break;
+        default: break;
+    }
+    doc["status"] = status;
+    doc["scanning"] = scanning;
+    doc["has_results"] = s_scan_has_complete;
+    doc["last_complete_ms"] = s_scan_completed_at_ms;
+    doc["last_complete_age_ms"] = s_scan_has_complete
+            ? (uint32_t)(millis() - s_scan_completed_at_ms) : 0;
+    if (s_scan_state == WIFI_SCAN_FAILED_STATE) {
+        doc["error"] = s_scan_error_reason;
+        doc["error_code"] = s_scan_error;
+    }
+    JsonArray arr = doc["networks"].to<JsonArray>();
+    for (size_t i = 0; i < s_scan_count; ++i) {
+        JsonObject obj = arr.add<JsonObject>();
+        obj["ssid"] = s_scan_ssid[i];
+        obj["rssi"] = s_scan_rssi[i];
+        obj["secure"] = s_scan_secure[i];
+    }
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
 void wifi_manager_task(void) {
     if (!s_wifi_enabled) {
         return;
@@ -432,6 +593,10 @@ void wifi_manager_task(void) {
         wifi_manager_request_wifi(WIFI_WAKE_MANUAL);
     }
 
+    // WiFi.scanNetworks(true) is started and harvested only from this owner
+    // task. HTTP handlers merely request a scan or serialize the cached result.
+    wifi_scan_tick();
+
     // ON_DEMAND: power down the STA radio after the idle timeout.
     // Any user input (wifi_manager_request_wifi) wakes it back up.
     // Sleep only disconnects + modem-sleeps: the WiFi driver stays initialized.
@@ -443,6 +608,8 @@ void wifi_manager_task(void) {
         s_timeout_enabled &&
         s_timeout_min != WIFI_TIMEOUT_NEVER &&
         s_radio_state == WIFI_STATE_ON &&
+        s_scan_state != WIFI_SCAN_WAIT_RADIO &&
+        s_scan_state != WIFI_SCAN_RUNNING_STATE &&
         s_sta_configured &&
         WiFi.status() == WL_CONNECTED &&
         (now - s_last_activity_ms) >= (uint32_t)s_timeout_min * 60000U) {
@@ -517,25 +684,7 @@ int8_t wifi_manager_get_sta_rssi(void) {
 }
 
 String wifi_manager_scan_json(void) {
-    if (!s_wifi_enabled) {
-        return "{\"networks\":[],\"error\":\"wifi_disabled\"}";
-    }
-    app_log("WIFI", "Scanning for 2.4GHz Wi-Fi networks...");
-    int n = WiFi.scanNetworks();
-    JsonDocument doc;
-    JsonArray arr = doc["networks"].to<JsonArray>();
-
-    for (int i = 0; i < n; i++) {
-        JsonObject obj = arr.add<JsonObject>();
-        obj["ssid"] = WiFi.SSID(i);
-        obj["rssi"] = WiFi.RSSI(i);
-        obj["secure"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
-    }
-
-    String out;
-    serializeJson(doc, out);
-    WiFi.scanDelete();
-    return out;
+    return wifi_manager_scan_status_json(true);
 }
 
 bool wifi_manager_save_sta_config(const String& ssid, const String& password) {

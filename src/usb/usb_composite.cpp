@@ -1,6 +1,8 @@
 #include "usb_composite.h"
 #include "hid_diagnostics.h"
+#include "core_diagnostics.h"
 #include "uac_microphone.h"
+#include "hid_command_queue.h"
 #include "app_config.h"
 #include "audio/audio_pipeline.h"
 #include "ble/ble_remote_client.h"
@@ -41,6 +43,11 @@ static uint32_t              s_boot_grace_until_ms  = 0;
 static uint32_t              s_waiting_reconnect_ms = 0; // non-zero while we await soft re-enumeration
 
 static SemaphoreHandle_t    s_hid_mutex = NULL;
+static portMUX_TYPE s_hid_command_mux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE s_hid_registry_mux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE s_voice_state_mux = portMUX_INITIALIZER_UNLOCKED;
+static remotemapper::HidCommandQueue s_hid_commands;
+static TaskHandle_t s_hid_sender_task = nullptr;
 
 // Non-recursive mutex guarding the USB HID reports + registry. Defined here in
 // plain C++ (file-local helpers): the guard section below lives outside the
@@ -88,14 +95,11 @@ static uint32_t         s_force_release_count     = 0;
 static uint32_t         s_last_force_ms           = 0;
 static char             s_last_force_reason[24]   = "";
 
-// Desired reports and retry state are serialized with hid_lock(). A newer
-// press/release replaces the previous desired state, including pending retries.
-// SendReport waits for TinyUSB's report-complete callback; never infer delivery
-// from an endpoint number (UAC and HID endpoints are allocated dynamically).
+// The NimBLE producer only touches s_hid_commands under its short portMUX. The
+// single sender task owns report submission; hid_lock serializes that task with
+// the optional laboratory stress sender and recovery's quiescence barrier.
 static hid_keyboard_report_t s_keyboard_report = {};
 static uint16_t s_consumer_report = 0;
-static bool s_keyboard_pending = false;
-static bool s_consumer_pending = false;
 static uint32_t s_hid_last_retry_ms = 0;
 static uint32_t s_hid_last_warning_ms = 0;
 static uint32_t s_hid_tx_ok = 0;
@@ -107,6 +111,8 @@ static uint32_t s_hid_blocked_since_ms = 0;
 static bool s_hid_recovering = false;
 static uint32_t s_reconnect_mount_seq = 0;
 static uint32_t s_usb_mount_seq = 0;
+static bool guard_has_held(void);
+static void hid_sender_pause_for_detach(void);
 
 // Runs directly in TinyUSB's lifecycle callback, before Arduino posts its
 // asynchronous event. Never take hid_lock(): a sender may be waiting for this
@@ -128,6 +134,142 @@ static bool s_voice_drain_pending = false;
 static uint32_t s_voice_release_ms = 0;
 static bool s_voice_hid_active = false;
 
+typedef struct {
+    uint32_t sequence;
+    uint32_t press_ms;
+    uint32_t release_ms;
+    bool drain_pending;
+    bool hid_active;
+} voice_state_snapshot_t;
+
+static voice_state_snapshot_t voice_state_snapshot(void) {
+    voice_state_snapshot_t state;
+    portENTER_CRITICAL(&s_voice_state_mux);
+    state.sequence = s_voice_diag_seq;
+    state.press_ms = s_voice_press_ms;
+    state.release_ms = s_voice_release_ms;
+    state.drain_pending = s_voice_drain_pending;
+    state.hid_active = s_voice_hid_active;
+    portEXIT_CRITICAL(&s_voice_state_mux);
+    return state;
+}
+
+static void hid_command_notify(void) {
+    if (s_hid_sender_task) xTaskNotifyGive(s_hid_sender_task);
+}
+
+static bool hid_command_pending(uint8_t channel = 0) {
+    portENTER_CRITICAL(&s_hid_command_mux);
+    const bool pending = channel ? s_hid_commands.has_pending(channel) : s_hid_commands.has_pending();
+    portEXIT_CRITICAL(&s_hid_command_mux);
+    return pending;
+}
+
+static bool hid_command_current(const remotemapper::HidCommandQueue::Command &command) {
+    portENTER_CRITICAL(&s_hid_command_mux);
+    const bool current = s_hid_commands.is_current(command);
+    portEXIT_CRITICAL(&s_hid_command_mux);
+    return current;
+}
+
+static bool hid_send_command_report(const remotemapper::HidCommandQueue::Command &command,
+        bool release_report) {
+    if (!s_usb_ready || !hid_command_current(command)) return false;
+    const bool keyboard = command.kind == remotemapper::HidCommandQueue::Kind::KeyboardState ||
+            command.kind == remotemapper::HidCommandQueue::Kind::KeyboardTap ||
+            command.kind == remotemapper::HidCommandQueue::Kind::KeyboardRelease ||
+            command.kind == remotemapper::HidCommandQueue::Kind::EmergencyKeyboardRelease;
+    if (tud_suspended() || s_hw_sleep_detected || (USB0.dsts & 1) != 0) {
+        tud_remote_wakeup();
+        vTaskDelay(pdMS_TO_TICKS(keyboard ? 15 : 10));
+        if (!s_usb_ready || !hid_command_current(command)) return false;
+    }
+    if (!tud_ready()) return false;
+
+    hid_lock();
+    portENTER_CRITICAL(&s_hid_command_mux);
+    const bool can_send = s_hid_commands.begin_send(command);
+    portEXIT_CRITICAL(&s_hid_command_mux);
+    if (!can_send) {
+        hid_unlock();
+        return false;
+    }
+
+    bool ok = false;
+    if (keyboard) {
+        hid_keyboard_report_t report = {};
+        if (!release_report) {
+            report.modifier = command.modifier;
+            report.keycode[0] = command.keycode;
+        }
+        s_keyboard_report = report;
+        ok = s_hid_transport.SendReport(HID_REPORT_ID_KEYBOARD, &report, sizeof(report), 20);
+    } else {
+        const uint16_t report = release_report ? 0 : command.consumer;
+        s_consumer_report = report;
+        ok = s_hid_transport.SendReport(HID_REPORT_ID_CONSUMER_CONTROL, &report, sizeof(report), 20);
+    }
+    portENTER_CRITICAL(&s_hid_command_mux);
+    s_hid_commands.end_send();
+    portEXIT_CRITICAL(&s_hid_command_mux);
+    if (ok) s_hid_tx_ok++;
+    else s_hid_tx_failed++;
+    hid_unlock();
+    return ok;
+}
+
+static void hid_sender_task(void *) {
+    using Queue = remotemapper::HidCommandQueue;
+    for (;;) {
+        Queue::Command command = {};
+        portENTER_CRITICAL(&s_hid_command_mux);
+        const bool available = s_hid_commands.peek(command);
+        const bool recovering = s_hid_commands.recovering();
+        portEXIT_CRITICAL(&s_hid_command_mux);
+        if (!available || recovering) {
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        const bool keyboard = command.kind == Queue::Kind::KeyboardState ||
+                command.kind == Queue::Kind::KeyboardTap ||
+                command.kind == Queue::Kind::KeyboardRelease ||
+                command.kind == Queue::Kind::EmergencyKeyboardRelease;
+        const bool tap = command.kind == Queue::Kind::KeyboardTap || command.kind == Queue::Kind::ConsumerTap;
+        const bool release = command.kind == Queue::Kind::KeyboardRelease ||
+                command.kind == Queue::Kind::ConsumerRelease ||
+                command.kind == Queue::Kind::EmergencyKeyboardRelease ||
+                command.kind == Queue::Kind::EmergencyConsumerRelease;
+
+        bool completed = hid_send_command_report(command, release);
+        if (!completed) {
+            if (!hid_command_current(command)) continue;
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        if (tap) {
+            // Keep the tap indivisible in the FIFO. Cancellation during the
+            // dwell invalidates its epoch; the urgent zero mailbox then wins.
+            vTaskDelay(pdMS_TO_TICKS(15));
+            if (!hid_command_current(command)) continue;
+            for (;;) {
+                completed = hid_send_command_report(command, true);
+                if (completed) break;
+                if (!hid_command_current(command)) break;
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            if (!completed) continue;
+        }
+
+        portENTER_CRITICAL(&s_hid_command_mux);
+        const bool retired = s_hid_commands.complete(command);
+        portEXIT_CRITICAL(&s_hid_command_mux);
+        if (!retired) continue;
+        if (keyboard && release) app_log("USB_HID", "Keyboard release TX complete");
+    }
+}
+
 #if defined(REMOTEMAPPER_DWC2_DRIVER)
 static usb_hid_stress_stats_t s_hid_stress = {};
 static bool s_hid_stress_stop = false;
@@ -135,12 +277,13 @@ static bool s_hid_stress_stop = false;
 // Caller holds hid_lock(), including the check and report submission. Never
 // replace desired reports or clear release debt to make the test progress.
 static bool hid_stress_user_idle_locked(void) {
-    if (s_keyboard_pending || s_consumer_pending || s_voice_hid_active ||
-            s_voice_drain_pending || g_audio_pipeline.active || s_consumer_report)
+    const voice_state_snapshot_t voice = voice_state_snapshot();
+    if (hid_command_pending() || voice.hid_active || voice.drain_pending ||
+            audio_pipeline_is_active(&g_audio_pipeline) || s_consumer_report)
         return false;
     const hid_keyboard_report_t idle = {};
     if (memcmp(&s_keyboard_report, &idle, sizeof(idle)) != 0) return false;
-    for (const auto &entry : s_held) if (entry.pressed) return false;
+    if (guard_has_held()) return false;
     return true;
 }
 
@@ -297,10 +440,16 @@ static bool usb_recovery_tick(uint32_t now) {
     const bool recovering = s_hid_recovering;
     const bool remounted = recovering && tud_mounted() &&
             __atomic_load_n(&s_usb_mount_seq, __ATOMIC_ACQUIRE) != s_reconnect_mount_seq;
-    if (remounted) s_hid_recovering = false;
+    if (remounted) {
+        s_hid_recovering = false;
+        portENTER_CRITICAL(&s_hid_command_mux);
+        s_hid_commands.end_recovery();
+        portEXIT_CRITICAL(&s_hid_command_mux);
+    }
     hid_unlock();
     if (remounted) {
         s_waiting_reconnect_ms = 0;
+        hid_command_notify();
         app_log("USB", "Recovery: new host mount confirmed; HID retries enabled");
     }
     if (recovering && !remounted) return false; // loop owns the reconnect deadline
@@ -311,12 +460,16 @@ static bool usb_recovery_tick(uint32_t now) {
     // Force-release below preserves zero-report debt without submitting to an
     // endpoint that is about to be detached.
     hid_lock();
-    if (reason == USB_RECOVERY_HID && !s_keyboard_pending && !s_consumer_pending) {
+    if (reason == USB_RECOVERY_HID && !hid_command_pending()) {
         hid_unlock();
         return false; // it recovered during the cooldown; no detach is needed
     }
     s_hid_recovering = true;
+    portENTER_CRITICAL(&s_hid_command_mux);
+    s_hid_commands.begin_recovery();
+    portEXIT_CRITICAL(&s_hid_command_mux);
     hid_unlock();
+    hid_command_notify();
     hid_diagnostics_capture(reason);
     if (reason == USB_RECOVERY_AUDIO) {
         uac_tx_stats_t tx = {};
@@ -340,6 +493,7 @@ static bool usb_recovery_tick(uint32_t now) {
             // If a restart also failed, stop cycling the USB device every 10 s.
             // Leave it detached so Windows drops the unusable capture device.
             s_usb_recovery_exhausted = true;
+            hid_sender_pause_for_detach();
             tud_disconnect();
             app_log("USB", "USB recovery exhausted; detached until power cycle");
             return true;
@@ -348,7 +502,13 @@ static bool usb_recovery_tick(uint32_t now) {
     const char *cause = reason == USB_RECOVERY_HID ? "hid-tx-stalled" :
             reason == USB_RECOVERY_AUDIO ? "uac-stalled" : "usb-wakeup";
     usb_composite_force_release_all(cause);
+    // The recovery gate is closed before taking the sender mutex. This bounded
+    // barrier proves no SendReport is still inside the framework before PHY
+    // detach; no producer takes this mutex.
     hid_lock();
+    portENTER_CRITICAL(&s_hid_command_mux);
+    s_hid_commands.pause_for_detach();
+    portEXIT_CRITICAL(&s_hid_command_mux);
     s_hid_blocked = false;
     hid_unlock();
     __atomic_add_fetch(&s_usb_recovery_count, 1, __ATOMIC_RELEASE);
@@ -365,56 +525,63 @@ static bool usb_recovery_tick(uint32_t now) {
     return true;
 }
 
-// Caller holds hid_lock(). A failure retains the desired state indefinitely.
-static bool hid_flush_keyboard_locked(void) {
-    if (!s_keyboard_pending) return true;
-    if (s_hid_recovering || !s_usb_ready || !tud_ready()) return false;
-    bool ok = s_hid_transport.SendReport(HID_REPORT_ID_KEYBOARD,
-            &s_keyboard_report, sizeof(s_keyboard_report), 20);
-    if (ok) {
-        s_keyboard_pending = false;
-        s_hid_tx_ok++;
-        if (s_keyboard_report.modifier == 0 && s_keyboard_report.keycode[0] == 0)
-            app_log("USB_HID", "Keyboard release TX complete");
-    } else {
-        s_hid_tx_failed++;
-    }
-    return ok;
-}
-
-static bool hid_flush_consumer_locked(void) {
-    if (!s_consumer_pending) return true;
-    if (s_hid_recovering || !s_usb_ready || !tud_ready()) return false;
-    bool ok = s_hid_transport.SendReport(HID_REPORT_ID_CONSUMER_CONTROL,
-            &s_consumer_report, sizeof(s_consumer_report), 20);
-    if (ok) { s_consumer_pending = false; s_hid_tx_ok++; }
-    else { s_hid_tx_failed++; }
-    return ok;
-}
-
 static void hid_clear_locked(void) {
     s_keyboard_report = {};
     s_consumer_report = 0;
-    s_keyboard_pending = true;
-    s_consumer_pending = true;
-    hid_flush_keyboard_locked();
-    hid_flush_consumer_locked();
+    portENTER_CRITICAL(&s_hid_command_mux);
+    s_hid_commands.force_release_all();
+    portEXIT_CRITICAL(&s_hid_command_mux);
+    hid_command_notify();
+}
+
+static void hid_force_cancel_commands(void) {
+    portENTER_CRITICAL(&s_hid_command_mux);
+    s_hid_commands.force_release_all();
+    portEXIT_CRITICAL(&s_hid_command_mux);
+    hid_command_notify();
+}
+
+static void hid_sender_pause_for_detach(void) {
+    // Worker owns SendReport under this mutex. Close its report gate before
+    // releasing the mutex, then PHY detach cannot race a fresh submission.
+    hid_lock();
+    portENTER_CRITICAL(&s_hid_command_mux);
+    s_hid_commands.pause_for_detach();
+    portEXIT_CRITICAL(&s_hid_command_mux);
+    hid_unlock();
 }
 
 static void guard_load_config(void) {
     if (s_guard_inited) return;
     s_guard_inited = true;
+    uint32_t stored_voice_ms = HID_GUARD_VOICE_EXTREME_MS;
     Preferences p;
     if (p.begin("guard_conf", true)) {
         s_guard_mod_ms   = p.getUInt("mod_ms", HID_GUARD_MOD_SOLO_MS);
         s_guard_key_ms   = p.getUInt("key_ms", HID_GUARD_KEY_IDLE_MS);
-        s_guard_voice_ms = p.getUInt("voice_ms", HID_GUARD_VOICE_EXTREME_MS);
+        stored_voice_ms = p.getUInt("voice_ms", HID_GUARD_VOICE_EXTREME_MS);
         p.end();
+    }
+    // The remote ends capture at 60s. Keep a 2s transport/drain allowance and
+    // migrate legacy 15-minute or disabled settings to that physical ceiling.
+    s_guard_voice_ms = stored_voice_ms == 0 || stored_voice_ms > HID_GUARD_VOICE_EXTREME_MS
+            ? HID_GUARD_VOICE_EXTREME_MS : (stored_voice_ms < 1000 ? 1000 : stored_voice_ms);
+    if (s_guard_voice_ms != stored_voice_ms) {
+        Preferences migrate;
+        if (migrate.begin("guard_conf", false)) {
+            const bool saved = migrate.putUInt("voice_ms", s_guard_voice_ms) != 0;
+            migrate.end();
+            if (!saved) app_log("GUARD", "Voice ceiling migration could not be persisted");
+        } else {
+            app_log("GUARD", "Voice ceiling migration could not open settings");
+        }
     }
 }
 
 static void guard_add(uint8_t modifier, uint8_t key_code, uint16_t consumer, bool voice) {
     uint32_t now = millis();
+    bool added = false;
+    portENTER_CRITICAL(&s_hid_registry_mux);
     for (int i = 0; i < HID_HELD_MAX; i++) {
         hid_held_entry_t *e = &s_held[i];
         if (!e->pressed) {
@@ -424,14 +591,18 @@ static void guard_add(uint8_t modifier, uint8_t key_code, uint16_t consumer, boo
             e->voice    = voice;
             e->pressed  = true;
             e->since_ms = now;
-            return;
+            added = true;
+            break;
         }
     }
+    portEXIT_CRITICAL(&s_hid_registry_mux);
+    if (added) return;
     // Registry full: force everything out rather than risk a stuck key.
     usb_composite_force_release_all("registry-full");
 }
 
 static void guard_clear_nonvoice(void) {
+    portENTER_CRITICAL(&s_hid_registry_mux);
     for (int i = 0; i < HID_HELD_MAX; i++) {
         hid_held_entry_t *e = &s_held[i];
         if (e->pressed && !e->voice) {
@@ -441,9 +612,11 @@ static void guard_clear_nonvoice(void) {
             e->consumer = 0;
         }
     }
+    portEXIT_CRITICAL(&s_hid_registry_mux);
 }
 
 static void guard_clear_voice(void) {
+    portENTER_CRITICAL(&s_hid_registry_mux);
     for (int i = 0; i < HID_HELD_MAX; i++) {
         hid_held_entry_t *e = &s_held[i];
         if (e->pressed && e->voice) {
@@ -453,9 +626,11 @@ static void guard_clear_voice(void) {
             e->consumer = 0;
         }
     }
+    portEXIT_CRITICAL(&s_hid_registry_mux);
 }
 
 static void guard_clear_all(void) {
+    portENTER_CRITICAL(&s_hid_registry_mux);
     for (int i = 0; i < HID_HELD_MAX; i++) {
         s_held[i].pressed  = false;
         s_held[i].modifier = 0;
@@ -463,13 +638,17 @@ static void guard_clear_all(void) {
         s_held[i].consumer = 0;
         s_held[i].voice    = false;
     }
+    portEXIT_CRITICAL(&s_hid_registry_mux);
 }
 
 static bool guard_has_held(void) {
+    bool held = false;
+    portENTER_CRITICAL(&s_hid_registry_mux);
     for (int i = 0; i < HID_HELD_MAX; i++) {
-        if (s_held[i].pressed) return true;
+        if (s_held[i].pressed) { held = true; break; }
     }
-    return false;
+    portEXIT_CRITICAL(&s_hid_registry_mux);
+    return held;
 }
 
 // Periodic stuck-key rule evaluation (called from usb_composite_task).
@@ -485,8 +664,12 @@ static void guard_tick(uint32_t now) {
     bool any_voice    = false;
     uint32_t first_ms      = 0; // earliest press among registered holds
     uint32_t first_voice_ms = 0;
+    hid_held_entry_t snapshot[HID_HELD_MAX];
+    portENTER_CRITICAL(&s_hid_registry_mux);
+    memcpy(snapshot, s_held, sizeof(snapshot));
+    portEXIT_CRITICAL(&s_hid_registry_mux);
     for (int i = 0; i < HID_HELD_MAX; i++) {
-        const hid_held_entry_t *e = &s_held[i];
+        const hid_held_entry_t *e = &snapshot[i];
         if (!e->pressed) continue;
         if (e->voice) {
             any_voice = true;
@@ -527,7 +710,8 @@ static void guard_tick(uint32_t now) {
     }
 
     // Rule K: a non-voice key held down with zero further output -> release.
-    if (any_held && s_guard_key_ms && (now - s_last_output_ms >= s_guard_key_ms)) {
+    const uint32_t last_output_ms = __atomic_load_n(&s_last_output_ms, __ATOMIC_ACQUIRE);
+    if (any_held && s_guard_key_ms && (now - last_output_ms >= s_guard_key_ms)) {
         usb_composite_force_release_all("key-idle");
     }
 }
@@ -540,9 +724,9 @@ bool usb_composite_guard_get(usb_guard_config_t *cfg, usb_guard_stats_t *stats) 
         cfg->voice_ms = s_guard_voice_ms;
     }
     if (stats) {
+        stats->keyboard_pending = hid_command_pending(1);
+        stats->consumer_pending = hid_command_pending(2);
         hid_lock();
-        stats->keyboard_pending = s_keyboard_pending;
-        stats->consumer_pending = s_consumer_pending;
         stats->desired_modifier = s_keyboard_report.modifier;
         stats->tx_complete = s_hid_tx_ok;
         stats->tx_failed = s_hid_tx_failed;
@@ -556,12 +740,14 @@ bool usb_composite_guard_get(usb_guard_config_t *cfg, usb_guard_stats_t *stats) 
         snprintf(stats->last_reason, sizeof(stats->last_reason), "%s", s_last_force_reason);
         stats->any_held  = false;
         stats->held_count = 0;
+        portENTER_CRITICAL(&s_hid_registry_mux);
         for (int i = 0; i < HID_HELD_MAX; i++) {
             if (s_held[i].pressed) {
                 stats->any_held = true;
                 stats->held_count++;
             }
         }
+        portEXIT_CRITICAL(&s_hid_registry_mux);
     }
     return true;
 }
@@ -571,7 +757,8 @@ bool usb_composite_guard_set(const usb_guard_config_t *cfg) {
     guard_load_config();
     s_guard_mod_ms   = cfg->mod_ms;
     s_guard_key_ms   = cfg->key_ms;
-    s_guard_voice_ms = cfg->voice_ms;
+    s_guard_voice_ms = cfg->voice_ms == 0 || cfg->voice_ms > HID_GUARD_VOICE_EXTREME_MS
+            ? HID_GUARD_VOICE_EXTREME_MS : (cfg->voice_ms < 1000 ? 1000 : cfg->voice_ms);
     Preferences p;
     if (!p.begin("guard_conf", false)) {
         return false;
@@ -588,35 +775,39 @@ bool usb_composite_guard_set(const usb_guard_config_t *cfg) {
 void usb_composite_force_release_all(const char* reason) {
     // Nothing held and nothing recording -> this is a no-op (e.g. the USB bus
     // stops during the very first enumeration at boot). Don't count/flash.
-    hid_lock();
-    const bool pending = s_keyboard_pending || s_consumer_pending;
-    hid_unlock();
-    if (!guard_has_held() && !g_audio_pipeline.active && !pending) return;
+    const bool pending = hid_command_pending();
+    if (!guard_has_held() && !audio_pipeline_is_active(&g_audio_pipeline) && !pending) return;
 
     s_force_release_count++;
     s_last_force_ms = millis();
     snprintf(s_last_force_reason, sizeof(s_last_force_reason), "%s", reason);
     app_log("GUARD", "Forced HID release (reason=%s, count=%u)",
             reason, (unsigned)s_force_release_count);
-    s_voice_drain_pending = false;
-    s_voice_hid_active = false;
+    const voice_state_snapshot_t voice_before = voice_state_snapshot();
 
-    // 1. Stop any running voice/audio session first (engine release will emit
-    //    a VOICE_RELEASE but the session must not outlive the forced release).
-    if (g_audio_pipeline.active) {
-        audio_pipeline_stop_session(&g_audio_pipeline);
-        ble_remote_request_mic_stop();
-    }
+    // Cancel queued or in-flight-era commands before key_engine_release_all()
+    // emits its ordinary releases. Producers never take hid_lock().
+    hid_force_cancel_commands();
 
-    // 2. Let the key engine release every slot: it emits the proper RELEASE
+    // Let the key engine release every slot: it emits the proper RELEASE
     //    actions and clears internal press state consistently.
     extern key_mapper_engine_t g_key_engine;
     key_engine_release_all(&g_key_engine, millis());
 
-    // Keep the release pending independently of the local held registry.
-    hid_lock();
-    hid_clear_locked();
-    hid_unlock();
+    // If a new voice hold won after key_engine_release_all completed, preserve
+    // it. Otherwise stop the old session after the engine has emitted releases.
+    portENTER_CRITICAL(&s_voice_state_mux);
+    const bool preserve_new_voice = s_voice_diag_seq != voice_before.sequence && s_voice_hid_active;
+    bool stopped_audio = false;
+    if (!preserve_new_voice) {
+        s_voice_drain_pending = false;
+        s_voice_hid_active = false;
+        stopped_audio = audio_pipeline_is_active(&g_audio_pipeline);
+        if (stopped_audio) audio_pipeline_stop_session(&g_audio_pipeline);
+    }
+    portEXIT_CRITICAL(&s_voice_state_mux);
+    if (stopped_audio) ble_remote_request_mic_stop();
+
     guard_clear_all();
 
     // 6. Visual: red flash so the user sees the guard fired, then normal status.
@@ -624,16 +815,38 @@ void usb_composite_force_release_all(const char* reason) {
     led_indicator_set(LED_STATE_CONNECTED);
 }
 
+void usb_composite_cancel_hid_epoch(void) {
+    hid_force_cancel_commands();
+}
+
 extern "C" {
 
-static void finish_voice_drain(const char* reason) {
-    if (!s_voice_drain_pending) return;
+static bool finish_voice_drain(uint32_t expected_sequence, bool timeout, const char* reason) {
+    uint32_t sequence = 0;
+    uint32_t release_ms = 0;
+    size_t remaining = 0;
+    portENTER_CRITICAL(&s_voice_state_mux);
+    const uint32_t now = millis();
+    if (!s_voice_drain_pending || s_voice_diag_seq != expected_sequence) {
+        portEXIT_CRITICAL(&s_voice_state_mux);
+        return false;
+    }
+    const size_t queued = audio_ring_buffer_peek_available(&g_audio_pipeline.ring_buf);
+    const bool due = timeout ? (now - s_voice_release_ms >= 1800) :
+            (queued <= 32 && now - s_voice_press_ms >= 1400);
+    if (!due) {
+        portEXIT_CRITICAL(&s_voice_state_mux);
+        return false;
+    }
+    sequence = s_voice_diag_seq;
+    release_ms = s_voice_release_ms;
+    remaining = queued;
     s_voice_drain_pending = false;
-    const size_t remaining = audio_ring_buffer_peek_available(&g_audio_pipeline.ring_buf);
     audio_pipeline_stop_session(&g_audio_pipeline);
+    portEXIT_CRITICAL(&s_voice_state_mux);
     app_log("VOICE_DRAIN", "seq=%u reason=%s delay=%ums remaining=%u",
-            (unsigned)s_voice_diag_seq, reason,
-            (unsigned)(millis() - s_voice_release_ms), (unsigned)remaining);
+            (unsigned)sequence, reason, (unsigned)(millis() - release_ms), (unsigned)remaining);
+    return true;
 }
 
 void usb_composite_init(void) {
@@ -695,10 +908,20 @@ void usb_composite_init(void) {
     s_consumer.begin();
     s_hid_transport.begin();
     const bool usb_started = USB.begin();
-    s_usb_initialized = audio_ready && usb_started;
+    TaskHandle_t sender = nullptr;
+    const bool sender_created = xTaskCreatePinnedToCore(hid_sender_task, "hid_sender", 4096,
+            nullptr, PRIO_TASK_USB, &sender, TASK_CORE_USB) == pdPASS;
+    if (sender_created) {
+        s_hid_sender_task = sender;
+        core_diagnostics_register("hid_sender", sender, TASK_CORE_USB);
+    } else {
+        app_log("USB_HID", "Failed to spawn dedicated report sender");
+    }
+    s_usb_initialized = audio_ready && usb_started && sender_created;
     s_usb_ready = s_usb_initialized;
     if (!s_usb_initialized)
-        app_log("USB", "Initialization failed: audio=%u stack=%u", audio_ready, usb_started);
+        app_log("USB", "Initialization failed: audio=%u stack=%u sender=%u", audio_ready, usb_started, sender_created);
+    hid_command_notify();
 }
 
 bool usb_composite_is_initialized(void) { return s_usb_initialized; }
@@ -709,26 +932,25 @@ void usb_composite_task(void) {
     uint32_t now = millis();
     if (usb_recovery_tick(now)) return;
     guard_tick(now);
-    if (s_voice_drain_pending) {
-        const size_t queued = audio_ring_buffer_peek_available(&g_audio_pipeline.ring_buf);
-        if (now - s_voice_release_ms >= 1800) {
-            finish_voice_drain("timeout");
-        } else if (queued <= 32 && now - s_voice_press_ms >= 1400) {
-            finish_voice_drain("empty");
+    const voice_state_snapshot_t voice = voice_state_snapshot();
+    if (voice.drain_pending) {
+        if (now - voice.release_ms >= 1800) {
+            finish_voice_drain(voice.sequence, true, "timeout");
+        } else if (now - voice.press_ms >= 1400) {
+            finish_voice_drain(voice.sequence, false, "empty");
         }
     }
 
-    // Checking pending state and sending are one critical section: no stale
-    // all-zero retry can race a newly pressed key. Retry at most every 50 ms;
-    // disconnect/suspend retains the debt without blocking or flooding logs.
+    // The sender task owns retries. The loop only observes durable queue/release
+    // debt and requests recovery if reports keep failing while USB is mounted.
     hid_lock();
     if (now - s_hid_last_retry_ms >= 50) {
         s_hid_last_retry_ms = now;
-        hid_flush_keyboard_locked();
-        hid_flush_consumer_locked();
+        const bool pending_keyboard = hid_command_pending(1);
+        const bool pending_consumer = hid_command_pending(2);
         // An idle local registry does NOT imply Windows received the release.
         // Keep this deadline independent of new presses and audio activity.
-        if ((s_keyboard_pending || s_consumer_pending) && tud_ready()) {
+        if ((pending_keyboard || pending_consumer) && tud_ready()) {
             const uint32_t checked_ms = millis();
             if (!s_hid_blocked) {
                 s_hid_blocked = true;
@@ -739,11 +961,11 @@ void usb_composite_task(void) {
         } else {
             s_hid_blocked = false;
         }
-        if ((s_keyboard_pending || s_consumer_pending) &&
+        if ((pending_keyboard || pending_consumer) &&
                 now - s_hid_last_warning_ms >= 5000) {
             s_hid_last_warning_ms = now;
             app_log("USB_HID", "TX pending: keyboard=%d consumer=%d mod=0x%02X ready=%d failures=%u",
-                    s_keyboard_pending, s_consumer_pending,
+                    pending_keyboard, pending_consumer,
                     s_keyboard_report.modifier, tud_ready(), (unsigned)s_hid_tx_failed);
         }
     }
@@ -797,83 +1019,61 @@ void usb_composite_task(void) {
 
 bool usb_hid_keyboard_press(uint8_t modifier, uint8_t keycode) {
     if (!s_usb_ready) return false;
-    hid_lock();
-
-    if (s_hw_sleep_detected || (USB0.dsts & 1) != 0 || tud_suspended()) {
-        app_log("USB_HW", "Key pressed while PC asleep -> Sending Remote Wakeup!");
-        tud_remote_wakeup();
-        vTaskDelay(pdMS_TO_TICKS(15));
-    }
-
-    s_keyboard_report = {};
-    s_keyboard_report.modifier = modifier;
-    s_keyboard_report.keycode[0] = keycode;
-    s_keyboard_pending = true;
-    bool ok = hid_flush_keyboard_locked();
-    app_log("USB_HID", "Keyboard DOWN mod=0x%02X key=0x%02X tx=%s",
-            modifier, keycode, ok ? "complete" : "pending");
-    hid_unlock();
-    return ok;
+    portENTER_CRITICAL(&s_hid_command_mux);
+    const bool queued = s_hid_commands.enqueue_keyboard(modifier, keycode, false);
+    portEXIT_CRITICAL(&s_hid_command_mux);
+    hid_command_notify();
+    return queued;
 }
 
 bool usb_hid_keyboard_release(void) {
-    hid_lock();
-    s_keyboard_report = {};
-    s_keyboard_pending = true;
-    bool ok = hid_flush_keyboard_locked();
-    hid_unlock();
-    return ok;
+    portENTER_CRITICAL(&s_hid_command_mux);
+    const bool queued = s_hid_commands.enqueue_keyboard_release();
+    portEXIT_CRITICAL(&s_hid_command_mux);
+    hid_command_notify();
+    return queued;
 }
 
 bool usb_hid_keyboard_tap(uint8_t modifier, uint8_t keycode) {
     if (!s_usb_ready) return false;
-    bool down = usb_hid_keyboard_press(modifier, keycode);
-    delay(15);
-    bool up = usb_hid_keyboard_release();
-    return down && up;
+    portENTER_CRITICAL(&s_hid_command_mux);
+    const bool queued = s_hid_commands.enqueue_keyboard(modifier, keycode, true);
+    portEXIT_CRITICAL(&s_hid_command_mux);
+    hid_command_notify();
+    return queued;
 }
 
 bool usb_hid_consumer_press(uint16_t usage_code) {
     if (!s_usb_ready) return false;
-    hid_lock();
-
-    if (tud_suspended()) {
-        app_log("USB", "PC Suspended -> tud_remote_wakeup");
-        tud_remote_wakeup();
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-
-    s_consumer_report = usage_code;
-    s_consumer_pending = true;
-    bool ok = hid_flush_consumer_locked();
-    hid_unlock();
-    return ok;
+    portENTER_CRITICAL(&s_hid_command_mux);
+    const bool queued = s_hid_commands.enqueue_consumer(usage_code, false);
+    portEXIT_CRITICAL(&s_hid_command_mux);
+    hid_command_notify();
+    return queued;
 }
 
 bool usb_hid_consumer_release(void) {
-    if (!s_usb_ready) return false;
-    hid_lock();
-
-    s_consumer_report = 0;
-    s_consumer_pending = true;
-    bool ok = hid_flush_consumer_locked();
-    hid_unlock();
-    return ok;
+    portENTER_CRITICAL(&s_hid_command_mux);
+    const bool queued = s_hid_commands.enqueue_consumer_release();
+    portEXIT_CRITICAL(&s_hid_command_mux);
+    hid_command_notify();
+    return queued;
 }
 
 bool usb_hid_consumer_tap(uint16_t usage_code) {
     if (!s_usb_ready) return false;
-    bool down = usb_hid_consumer_press(usage_code);
-    delay(15);
-    bool up = usb_hid_consumer_release();
-    return down && up;
+    portENTER_CRITICAL(&s_hid_command_mux);
+    const bool queued = s_hid_commands.enqueue_consumer(usage_code, true);
+    portEXIT_CRITICAL(&s_hid_command_mux);
+    hid_command_notify();
+    return queued;
 }
 
 void usb_hid_dispatch_action(const key_action_t *action) {
     if (!action) return;
 
     // Every emitted action counts as output activity for the stuck-key rules.
-    s_last_output_ms = millis();
+    __atomic_store_n(&s_last_output_ms, millis(), __ATOMIC_RELEASE);
 
     // User input feeds ON_DEMAND power management: keeps the radio alive, or
     // triggers the 5-press-of-same-key wake gesture after an idle power-down.
@@ -915,41 +1115,70 @@ void usb_hid_dispatch_action(const key_action_t *action) {
             guard_clear_nonvoice();
             usb_hid_consumer_release();
             break;
-        case ACTION_VOICE_HOLD:
-            // Hold Voice Hotkey and start audio session
-            finish_voice_drain("new-press");
-            ++s_voice_diag_seq;
-            s_voice_press_ms = millis();
+        case ACTION_VOICE_HOLD: {
+            // Serialize a new session against loop-side drain completion. The
+            // loop rechecks this sequence under the same short lock before stop.
             uac_microphone_get_pcm_stats(&s_voice_pcm_samples0,
                     &s_voice_pcm_nonzero0, &s_voice_pcm_abs0, nullptr);
+            uint32_t old_sequence = 0;
+            uint32_t old_release_ms = 0;
+            size_t old_remaining = 0;
+            bool ended_previous_drain = false;
             {
                 uac_tx_stats_t tx = {};
                 uac_microphone_get_stats(&tx);
                 s_voice_usb_completed0 = tx.completed;
                 s_voice_usb_claim_skips0 = tx.claim_skips;
             }
+            portENTER_CRITICAL(&s_voice_state_mux);
+            if (s_voice_drain_pending) {
+                ended_previous_drain = true;
+                old_sequence = s_voice_diag_seq;
+                old_release_ms = s_voice_release_ms;
+                old_remaining = audio_ring_buffer_peek_available(&g_audio_pipeline.ring_buf);
+                s_voice_drain_pending = false;
+                audio_pipeline_stop_session(&g_audio_pipeline);
+            }
+            ++s_voice_diag_seq;
+            s_voice_press_ms = millis();
+            const bool hid_active = action->modifier != 0 || action->key_code != 0;
+            s_voice_hid_active = hid_active;
             audio_pipeline_start_session(&g_audio_pipeline, 0);
-            s_voice_hid_active = action->modifier != 0 || action->key_code != 0;
-            if (s_voice_hid_active) {
+            portEXIT_CRITICAL(&s_voice_state_mux);
+            if (ended_previous_drain) {
+                app_log("VOICE_DRAIN", "seq=%u reason=new-press delay=%ums remaining=%u",
+                        (unsigned)old_sequence, (unsigned)(millis() - old_release_ms),
+                        (unsigned)old_remaining);
+            }
+            if (hid_active) {
                 guard_add(action->modifier, action->key_code, 0, true);
                 usb_hid_keyboard_press(action->modifier, action->key_code);
             }
             break;
+        }
         case ACTION_VOICE_RELEASE: {
             // Release Right Alt with the physical button. Some input methods
             // distinguish a tap from a hold, and keeping Alt down for audio
             // drain makes the keyboard appear stuck after a short press.
             // Keep only the audio pipeline alive for a bounded drain period;
             // apps that continue capture can consume it without holding HID.
-            s_voice_release_ms = millis();
-            const bool hid_was_active = s_voice_hid_active;
+            uint32_t sequence = 0;
+            uint32_t press_ms = 0;
+            uint32_t release_ms = 0;
+            bool hid_was_active = false;
+            portENTER_CRITICAL(&s_voice_state_mux);
+            release_ms = millis();
+            sequence = s_voice_diag_seq;
+            press_ms = s_voice_press_ms;
+            hid_was_active = s_voice_hid_active;
             s_voice_hid_active = false;
-            s_voice_drain_pending = hid_was_active && g_audio_pipeline.active;
+            s_voice_release_ms = release_ms;
+            s_voice_drain_pending = hid_was_active && audio_pipeline_is_active(&g_audio_pipeline);
+            if (!hid_was_active) audio_pipeline_stop_session(&g_audio_pipeline);
+            portEXIT_CRITICAL(&s_voice_state_mux);
             guard_clear_voice();
             if (hid_was_active) {
                 usb_hid_keyboard_release();
-            } else {
-                audio_pipeline_stop_session(&g_audio_pipeline);
             }
             {
                 uint32_t samples = 0, nonzero = 0;
@@ -958,11 +1187,11 @@ void usb_hid_dispatch_action(const key_action_t *action) {
                 uac_microphone_get_pcm_stats(&samples, &nonzero, &absolute_sum, nullptr);
                 uac_microphone_get_stats(&tx);
                 const uint32_t arm = uac_microphone_get_stream_start_ms();
-                const int32_t arm_delay = arm >= s_voice_press_ms && arm <= millis()
-                        ? (int32_t)(arm - s_voice_press_ms) : -1;
+                const int32_t arm_delay = arm >= press_ms && arm <= millis()
+                        ? (int32_t)(arm - press_ms) : -1;
                 const uint32_t pcm_n = samples - s_voice_pcm_samples0;
                 app_log("VOICE_AUDIO", "seq=%u hold=%u arm=%d ble=%u push=%u usb=%u skip=%u pcm=%u nz=%u avg=%u",
-                        (unsigned)s_voice_diag_seq, (unsigned)(millis() - s_voice_press_ms),
+                        (unsigned)sequence, (unsigned)(release_ms - press_ms),
                         (int)arm_delay, (unsigned)g_audio_pipeline.total_frames_decoded,
                         (unsigned)g_audio_pipeline.total_samples_pushed,
                         (unsigned)(tx.completed - s_voice_usb_completed0),

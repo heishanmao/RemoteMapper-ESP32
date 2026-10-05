@@ -8,6 +8,7 @@
 #include "audio_filter.h"
 #include "audio_agc.h"
 #include "audio_ring_buffer.h"
+#include "audio_resample_config.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,11 +18,11 @@ extern "C" {
 
 // Spectral probe on the decoded (pre-resample) sample sequence.
 //
-// Decoded frames are 240 samples arriving every 20 ms, so consecutive samples
-// are 1/12000 s apart. Under that assumption 6 kHz is Nyquist: content above it
-// is impossible for a genuine 12 kHz source, so real energy at 6.5-8 kHz proves
-// the remote captured at a higher rate (16 kHz) and ships only 75% of the
-// samples. That one measurement decides the resample ratio without guessing.
+// The current working interpretation is 240 decoded samples per frame at about
+// 66.7 frames/s (roughly 16 kHz), so the default output path is 1:1. Spectral
+// energy in the measured bins above 6 kHz would challenge a 12 kHz source-rate
+// hypothesis (whose Nyquist is 6 kHz), but this diagnostic alone does not prove
+// a fixed sample-loss fraction or the exact capture rate.
 #define AUDIO_SPEC_BINS       8
 #define AUDIO_SPEC_BIN0_HZ    3000
 #define AUDIO_SPEC_BIN_HZ_STEP 500
@@ -43,20 +44,28 @@ typedef struct {
     //               measured in 1/rs_interval units, so it is in [0, rs_interval)
     //   rs_step     how far the read position advances per output sample
     // Output/input ratio is therefore rs_interval / rs_step, held exactly.
-    // Runtime-tunable because the remote's true rate was measured two different
-    // ways that disagreed (arrival arithmetic said 12 kHz, pitch said otherwise).
+    // Runtime-tunable for diagnostics, but changes are queued and applied only
+    // at a producer-owned session boundary.
     int32_t              rs_prev;
     uint32_t             rs_phase;
     uint32_t             rs_interval;
     uint32_t             rs_step;
     bool                 rs_primed;
+    uint32_t             rs_requested_packed; // atomic, can be written from web/core 1
+    uint32_t             rs_applied_packed;   // atomic, applied by BLE/core 0 only
     // Running energy per spectral bin, accumulated over decoded frames.
     uint32_t             spec_mag[AUDIO_SPEC_BINS];
     uint32_t             spec_peak[AUDIO_SPEC_BINS];
     uint32_t             spec_frames;   // frame counter driving AUDIO_SPEC_STRIDE
     uint8_t              session_id;
-    bool                 active;
-    bool                 buffering;
+    volatile bool        active;    // accessed through atomic helpers across cores
+    volatile bool        buffering; // accessed through atomic helpers across cores
+    // Session control is protected by the short audio-session mux in .c.
+    uint32_t             session_epoch;
+    uint32_t             reset_epoch;
+    uint8_t              reset_session_id;
+    bool                 reset_pending;
+    bool                 prepared_start;
     uint32_t             total_frames_decoded;
     uint32_t             total_samples_pushed;
     uint32_t             underrun_count;
@@ -82,7 +91,7 @@ extern audio_pipeline_t g_audio_pipeline;
 void audio_pipeline_init(audio_pipeline_t *pipeline);
 
 /**
- * @brief Start a new speech session (resets filter, AGC, syncs state)
+ * @brief Publish a new speech session; BLE producer applies pending reset safely
  */
 void audio_pipeline_start_session(audio_pipeline_t *pipeline, uint8_t session_id);
 
@@ -91,20 +100,39 @@ void audio_pipeline_start_session(audio_pipeline_t *pipeline, uint8_t session_id
  */
 void audio_pipeline_sync(audio_pipeline_t *pipeline, int16_t predictor, int8_t step_index);
 
-/**
- * @brief Feed raw ADPCM frame from BLE, decode, filter, AGC, and push to ring buffer
- * @param pipeline Pipeline handle
- * @param adpcm_bytes Raw BLE ADPCM payload
- * @param len Byte count
- * @return Number of PCM samples produced and enqueued
- */
+/** @brief Queue a validated output/input ratio for the next audio session. */
 bool audio_pipeline_set_resample(audio_pipeline_t *pipeline, uint16_t num, uint16_t den);
+typedef struct {
+    uint16_t requested_num;
+    uint16_t requested_den;
+    uint16_t applied_num;
+    uint16_t applied_den;
+    bool pending;
+} audio_resample_status_t;
+// Compatibility getter reports the accepted/requested ratio, which may still
+// be pending. Use the status getter to distinguish applied from requested.
 void audio_pipeline_get_resample(const audio_pipeline_t *pipeline, uint16_t *num, uint16_t *den);
+void audio_pipeline_get_resample_status(const audio_pipeline_t *pipeline, audio_resample_status_t *out);
+// Called by the BLE producer at a session boundary. USB start_session only
+// publishes a bounded reset request; this function is producer-owned.
+void audio_pipeline_prepare_session(audio_pipeline_t *pipeline, uint8_t session_id);
+bool audio_pipeline_is_active(const audio_pipeline_t *pipeline);
+bool audio_pipeline_is_buffering(const audio_pipeline_t *pipeline);
+// USB consumer wrapper keeps clear acknowledgement ordered with start/stop and
+// producer head commits. Call only from the single USB audio consumer task.
+void audio_pipeline_consume_pending_clear(audio_pipeline_t *pipeline);
 // Scaled magnitudes, normalised so the strongest bin reads 1000.
 void audio_pipeline_get_spectrum(const audio_pipeline_t *pipeline, uint16_t out[AUDIO_SPEC_BINS]);
 // Raw accumulated energy per bin, for offline analysis without the scaling.
 void audio_pipeline_get_spectrum_raw(const audio_pipeline_t *pipeline, uint32_t out[AUDIO_SPEC_BINS]);
 
+/**
+ * @brief Feed raw BLE ADPCM, decode/filter/resample it, and enqueue PCM.
+ * @param pipeline Pipeline handle
+ * @param adpcm_bytes Raw BLE ADPCM payload
+ * @param len Byte count
+ * @return Number of PCM samples produced and enqueued
+ */
 size_t audio_pipeline_feed_adpcm(audio_pipeline_t *pipeline, const uint8_t *adpcm_bytes, size_t len);
 
 /**

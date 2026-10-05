@@ -12,14 +12,13 @@ typedef struct {
     int16_t *buffer;
     size_t   capacity;      // Must be power of 2
     size_t   mask;          // capacity - 1
-    volatile size_t head;   // Write index (producer-owned)
-    volatile size_t tail;   // Read index (consumer-owned)
-    // Set by the producer, consumed by the consumer. tail belongs to the
-    // consumer alone, so the producer cannot clear the ring by writing it:
-    // a consumer already parked in read() would overwrite the new tail with
-    // its own stale one and drive the read cursor backwards. The producer
-    // posts a request instead and the consumer applies it.
-    volatile bool clear_pending;
+    uint32_t head;          // Published write index (producer-owned, release/acquire)
+    uint32_t tail;          // Read index (consumer-owned, release/acquire)
+    // A clear advances the consumer to a fixed producer watermark. New samples
+    // committed after the request remain readable.
+    uint32_t clear_watermark;
+    uint32_t clear_request_seq;
+    uint32_t clear_ack_seq;
 } audio_ring_buffer_t;
 
 /**
@@ -62,6 +61,15 @@ size_t audio_ring_buffer_available_write(const audio_ring_buffer_t *rb);
  * @return Number of samples actually written
  */
 size_t audio_ring_buffer_write(audio_ring_buffer_t *rb, const int16_t *samples, size_t count);
+// Copy into currently free slots without publishing head. The sole producer
+// later commits this bounded write after validating its session epoch.
+size_t audio_ring_buffer_prepare_write(audio_ring_buffer_t *rb,
+                                       const int16_t *samples,
+                                       size_t count,
+                                       uint32_t *expected_head);
+bool audio_ring_buffer_commit_write(audio_ring_buffer_t *rb,
+                                    uint32_t expected_head,
+                                    size_t count);
 
 /**
  * @brief Read samples from ring buffer

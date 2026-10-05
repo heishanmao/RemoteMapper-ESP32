@@ -48,32 +48,44 @@ void usb_hid_stress_get(usb_hid_stress_stats_t *stats);
 #endif
 
 /**
- * @brief Send USB HID Keyboard Key Down (with modifier)
+ * @brief Enqueue USB HID Keyboard Key Down (with modifier).
+ * @return true when accepted by the bounded sender queue; this does not mean
+ *         the host has received the report.
  */
 bool usb_hid_keyboard_press(uint8_t modifier, uint8_t keycode);
 
 /**
- * @brief Send USB HID Keyboard Key Up (release all keys)
+ * @brief Enqueue USB HID Keyboard Key Up (release all keys).
+ * @return true when accepted as queued work or durable release debt; this does
+ *         not mean the host has received the report.
  */
 bool usb_hid_keyboard_release(void);
 
 /**
- * @brief Send USB HID Keyboard Tap (Press then Release)
+ * @brief Enqueue an atomic USB HID Keyboard Tap (Press then Release).
+ * @return true when accepted by the bounded sender queue; this does not mean
+ *         the host has received either report.
  */
 bool usb_hid_keyboard_tap(uint8_t modifier, uint8_t keycode);
 
 /**
- * @brief Send USB HID Consumer Control Code (e.g. Volume Up/Down, AC Back)
+ * @brief Enqueue USB HID Consumer Control Code (e.g. Volume Up/Down, AC Back).
+ * @return true when accepted by the bounded sender queue; this does not mean
+ *         the host has received the report.
  */
 bool usb_hid_consumer_press(uint16_t usage_code);
 
 /**
- * @brief Release USB HID Consumer Control
+ * @brief Enqueue USB HID Consumer Control release.
+ * @return true when accepted as queued work or durable release debt; this does
+ *         not mean the host has received the report.
  */
 bool usb_hid_consumer_release(void);
 
 /**
- * @brief Send USB HID Consumer Tap
+ * @brief Enqueue an atomic USB HID Consumer Tap.
+ * @return true when accepted by the bounded sender queue; this does not mean
+ *         the host has received either report.
  */
 bool usb_hid_consumer_tap(uint16_t usage_code);
 
@@ -88,12 +100,12 @@ void usb_hid_dispatch_action(const key_action_t *action);
 void usb_audio_task(void);
 
 /**
- * @brief Stuck-key guard configuration (0 disables a rule; units in ms).
+ * @brief Stuck-key guard configuration (units in ms).
  */
 typedef struct {
     uint32_t mod_ms;   // Modifier held longer than this -> force release (0 = off)
     uint32_t key_ms;   // Non-voice key down with zero output -> force release (0 = off)
-    uint32_t voice_ms; // Absolute ceiling for a voice recording (0 = off)
+    uint32_t voice_ms; // Voice ceiling, clamped to 1000..62000 ms (0 selects 62000 ms)
 } usb_guard_config_t;
 
 /**
@@ -131,6 +143,8 @@ bool usb_composite_guard_set(const usb_guard_config_t *cfg);
  *        in a consistent way (engine + USB report + audio + LED) and log the reason.
  */
 void usb_composite_force_release_all(const char* reason);
+// Cancels queued HID work on a remote disconnect and leaves durable zero reports.
+void usb_composite_cancel_hid_epoch(void);
 
 #ifdef __cplusplus
 }

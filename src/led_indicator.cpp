@@ -11,15 +11,25 @@
 #define RGB_BUILTIN 48 // Default for most ESP32-S3 boards if not defined
 #endif
 
-static led_state_t s_current_base_state = LED_STATE_WAIT_CONNECTION;
-static uint32_t s_flash_expire_time = 0;
-static led_state_t s_flash_state = LED_STATE_WAIT_CONNECTION;
-static bool s_is_flashing = false;
+struct LedState {
+    led_state_t base = LED_STATE_WAIT_CONNECTION;
+    uint32_t flash_until_ms = 0;
+    led_state_t flash = LED_STATE_WAIT_CONNECTION;
+    bool flashing = false;
+    uint32_t layer_color = 0x00FF00;
+    bool layer_flash = false;
+    bool low_battery = false;
+    bool wifi_sleep = false;
+};
+static LedState s_state;
+static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t s_led_task = nullptr;
 
-static uint32_t s_layer_color = 0x00FF00; // Default green for Layer 0
-static bool s_layer_flash = false;
-static bool s_low_battery = false;
-static bool s_wifi_sleep = false;
+// Setters run from BLE and management tasks. Only the LED task touches RMT;
+// publishing a small state snapshot never waits for the peripheral.
+static void wake_led_task() {
+    if (s_led_task) xTaskNotifyGive(s_led_task);
+}
 
 // Master brightness levels (0..255). The DevKit's WS2812 is very visible even
 // at low duty, so steady states stay extremely dim and short pulses carry the
@@ -46,15 +56,16 @@ static void apply_led_color(uint32_t rgb) {
     neopixelWrite(RGB_BUILTIN, (rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
 }
 
-static void update_hardware_led(led_state_t state) {
-    if (s_layer_flash && s_is_flashing) {
-        apply_led_color(dim_rgb(s_layer_color, LED_PULSE_BRIGHT));
+static void update_hardware_led(const LedState& snapshot, uint32_t now_ms) {
+    const led_state_t state = snapshot.flashing ? snapshot.flash : snapshot.base;
+    if (snapshot.layer_flash && snapshot.flashing) {
+        apply_led_color(dim_rgb(snapshot.layer_color, LED_PULSE_BRIGHT));
         return;
     }
 
     // Low battery white double-pulse alert when connected
-    if (s_low_battery && state == LED_STATE_CONNECTED) {
-        uint32_t phase = millis() % 2000;
+    if (snapshot.low_battery && state == LED_STATE_CONNECTED) {
+        uint32_t phase = now_ms % 2000;
         if ((phase < 120) || (phase >= 220 && phase < 340)) {
             apply_led_color(0x0C0C0Cu); // dim white pulse
             return;
@@ -62,7 +73,7 @@ static void update_hardware_led(led_state_t state) {
     }
 
     // Wi-Fi sleeping or disabled: steady dim red = device asleep / web unreachable.
-    if (s_wifi_sleep) {
+    if (snapshot.wifi_sleep) {
         apply_led_color(dim_rgb(0xFF0000, LED_STEADY_BRIGHT));
         return;
     }
@@ -70,12 +81,12 @@ static void update_hardware_led(led_state_t state) {
     switch (state) {
         case LED_STATE_WAIT_CONNECTION: {
             // Slow heartbeat instead of a steady red LED (150ms pulse / 4s).
-            uint32_t phase = millis() % 4000;
+            uint32_t phase = now_ms % 4000;
             apply_led_color((phase < 150) ? 0x0C0000u : 0x020000u);
             break;
         }
         case LED_STATE_CONNECTED:
-            apply_led_color(dim_rgb(s_layer_color, LED_STEADY_BRIGHT));
+            apply_led_color(dim_rgb(snapshot.layer_color, LED_STEADY_BRIGHT));
             break;
         case LED_STATE_MIC_STREAMING:
             apply_led_color(0x00000Cu); // dim blue
@@ -94,79 +105,90 @@ static void update_hardware_led(led_state_t state) {
 
 static void led_task(void *arg) {
     while (1) {
-        bool fast = false;
-        if (s_is_flashing) {
-            fast = true;
-            if (millis() > s_flash_expire_time) {
-                s_is_flashing = false;
-                update_hardware_led(s_current_base_state);
-            } else {
-                update_hardware_led(s_flash_state);
-            }
-        } else {
-            update_hardware_led(s_current_base_state);
-        }
+        const uint32_t now_ms = millis();
+        taskENTER_CRITICAL(&s_state_mux);
+        if (s_state.flashing && (int32_t)(now_ms - s_state.flash_until_ms) >= 0)
+            s_state.flashing = false;
+        const LedState snapshot = s_state;
+        taskEXIT_CRITICAL(&s_state_mux);
+        update_hardware_led(snapshot, now_ms);
 
         // Only animate when needed: flashes and the low-battery pulse run at
         // 20ms; the wait-connection heartbeat at 50ms; everything else 100ms.
         uint32_t tick_ms = 100;
-        if (fast || (s_low_battery && s_current_base_state == LED_STATE_CONNECTED)) {
+        if (snapshot.flashing || (snapshot.low_battery && snapshot.base == LED_STATE_CONNECTED)) {
             tick_ms = 20;
-        } else if (s_current_base_state == LED_STATE_WAIT_CONNECTION) {
+        } else if (snapshot.base == LED_STATE_WAIT_CONNECTION) {
             tick_ms = 50;
         }
-        vTaskDelay(pdMS_TO_TICKS(tick_ms));
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(tick_ms));
     }
 }
 
 bool led_indicator_init(void) {
-    update_hardware_led(LED_STATE_WAIT_CONNECTION);
-    TaskHandle_t led = nullptr;
-    if (xTaskCreatePinnedToCore(led_task, "led_task", 2048, NULL, PRIO_TASK_LED, &led, TASK_CORE_LED) != pdPASS) {
+    if (s_led_task) return true;
+    if (xTaskCreatePinnedToCore(led_task, "led_task", 2048, NULL, PRIO_TASK_LED, &s_led_task, TASK_CORE_LED) != pdPASS) {
         app_log("LED", "Failed to spawn indicator task");
         return false;
     }
-    core_diagnostics_register("led_task", led, TASK_CORE_LED);
+    core_diagnostics_register("led_task", s_led_task, TASK_CORE_LED);
     return true;
 }
 
 void led_indicator_set(led_state_t state) {
     if (state == LED_STATE_HID_KEY_PRESS || state == LED_STATE_MIC_KEY_PRESS) return; // Use trigger for flashes
-    s_is_flashing = false;
-    s_current_base_state = state;
-    update_hardware_led(state);
+    taskENTER_CRITICAL(&s_state_mux);
+    s_state.flashing = false;
+    s_state.base = state;
+    taskEXIT_CRITICAL(&s_state_mux);
+    wake_led_task();
 }
 
 void led_indicator_trigger_key(bool is_voice_key) {
-    s_layer_flash = false;
-    s_flash_state = is_voice_key ? LED_STATE_MIC_KEY_PRESS : LED_STATE_HID_KEY_PRESS;
-    s_flash_expire_time = millis() + 100; // Flash for 100ms
-    s_is_flashing = true;
+    const uint32_t until = millis() + 100;
+    taskENTER_CRITICAL(&s_state_mux);
+    s_state.layer_flash = false;
+    s_state.flash = is_voice_key ? LED_STATE_MIC_KEY_PRESS : LED_STATE_HID_KEY_PRESS;
+    s_state.flash_until_ms = until;
+    s_state.flashing = true;
+    taskEXIT_CRITICAL(&s_state_mux);
+    wake_led_task();
 }
 
 void led_indicator_trigger_stuck(void) {
-    s_layer_flash = false;
-    s_flash_state = LED_STATE_MIC_KEY_PRESS; // red
-    s_flash_expire_time = millis() + 300;     // Long red flash: guard fired
-    s_is_flashing = true;
+    const uint32_t until = millis() + 300;
+    taskENTER_CRITICAL(&s_state_mux);
+    s_state.layer_flash = false;
+    s_state.flash = LED_STATE_MIC_KEY_PRESS;
+    s_state.flash_until_ms = until;
+    s_state.flashing = true;
+    taskEXIT_CRITICAL(&s_state_mux);
+    wake_led_task();
 }
 
 void led_indicator_set_wifi_sleep(bool is_sleep) {
-    if (s_wifi_sleep == is_sleep) {
-        return;
-    }
-    s_wifi_sleep = is_sleep;
-    update_hardware_led(s_current_base_state);
+    taskENTER_CRITICAL(&s_state_mux);
+    const bool changed = s_state.wifi_sleep != is_sleep;
+    s_state.wifi_sleep = is_sleep;
+    taskEXIT_CRITICAL(&s_state_mux);
+    if (changed) wake_led_task();
 }
 
 void led_indicator_set_layer_color(uint32_t rgb_color) {
-    s_layer_color = (rgb_color == 0) ? 0x00FF00 : rgb_color;
-    s_layer_flash = true;
-    s_flash_expire_time = millis() + 200; // 200ms flash on layer change
-    s_is_flashing = true;
+    const uint32_t until = millis() + 200;
+    taskENTER_CRITICAL(&s_state_mux);
+    s_state.layer_color = (rgb_color == 0) ? 0x00FF00 : rgb_color;
+    s_state.layer_flash = true;
+    s_state.flash_until_ms = until;
+    s_state.flashing = true;
+    taskEXIT_CRITICAL(&s_state_mux);
+    wake_led_task();
 }
 
 void led_indicator_set_low_battery(bool is_low) {
-    s_low_battery = is_low;
+    taskENTER_CRITICAL(&s_state_mux);
+    s_state.low_battery = is_low;
+    taskEXIT_CRITICAL(&s_state_mux);
+    wake_led_task();
 }
 

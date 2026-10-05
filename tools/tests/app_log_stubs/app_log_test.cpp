@@ -92,20 +92,39 @@ int main() {
     assert(cdc_output == large);
     assert(tracked_allocations.size() == 1); // drained payload was freed
 
+    serial_output.clear();
+    assert(app_log_queue_cli_text(APP_LOG_OUTPUT_UART, large.data(), large.size()));
+    assert(tracked_allocations.size() == 2);
+    drain((large.size() + 31) / 32 + 1);
+    assert(serial_output == large); // UART uses the owned 16 KB payload too
+    assert(tracked_allocations.size() == 1);
+
     for (int i = 0; i < 16; ++i) {
         const std::string item = "payload-" + std::to_string(i);
-        assert(app_log_queue_cdc_text(item.data(), item.size()));
+        assert(app_log_queue_cli_text(APP_LOG_OUTPUT_UART, item.data(), item.size()));
     }
-    const uint32_t dropped_before = app_log_get_mirror_dropped();
-    assert(!app_log_queue_cdc_text("whole-message-rejected", 22));
-    assert(app_log_get_mirror_dropped() == dropped_before + 1);
+    const uint32_t dropped_before = app_log_get_cli_dropped(APP_LOG_OUTPUT_UART);
+    assert(!app_log_queue_cli_text(APP_LOG_OUTPUT_UART, "whole-message-rejected", 22));
+    assert(app_log_get_cli_dropped(APP_LOG_OUTPUT_UART) == dropped_before + 1);
     assert(tracked_allocations.size() == 17); // failed enqueue freed its copy
 
-    cdc_connected = false;
-    drain(16); // disconnected CDC releases every queued payload
+    drain(18); // all queued lines, then the reserved fixed-size error notice
+    assert(serial_output.find("output_queue_full") != std::string::npos);
     assert(tracked_allocations.size() == 1);
     const std::string oversize(16385, 'X');
-    assert(!app_log_queue_cdc_text(oversize.data(), oversize.size()));
+    cdc_output.clear();
+    assert(!app_log_queue_cli_text(APP_LOG_OUTPUT_CDC, oversize.data(), oversize.size()));
+    assert(tracked_allocations.size() == 1);
+
+    cdc_connected = true;
+    drain(2); // clear the oversize error notice before exercising queue-full
+    assert(cdc_output == "\r\n{\"error\":\"output_queue_full\"}\r\n");
+    for (int i = 0; i < 16; ++i) {
+        assert(app_log_queue_cli_text(APP_LOG_OUTPUT_CDC, "cdc", 3));
+    }
+    assert(!app_log_queue_cli_text(APP_LOG_OUTPUT_CDC, "rejected", 8));
+    cdc_connected = false;
+    drain(18); // disconnected CDC releases payloads and its pending error
     assert(tracked_allocations.size() == 1);
     return 0;
 }

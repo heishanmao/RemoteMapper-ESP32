@@ -42,6 +42,8 @@ String wifi_manager_get_mdns_url(void);
 bool   wifi_manager_is_sta_connected(void);
 int8_t wifi_manager_get_sta_rssi(void);
 String wifi_manager_scan_json(void);
+// Start or poll the asynchronous scan while preserving the cached last result.
+String wifi_manager_scan_status_json(bool request_new_scan);
 bool   wifi_manager_save_sta_config(const String& ssid, const String& password);
 String wifi_manager_get_ap_pass(void);
 bool   wifi_manager_save_ap_config(const String& ap_password);

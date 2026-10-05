@@ -807,15 +807,15 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                                 <input type="number" id="guard-key" min="0" max="3600" value="60" style="width:100%; padding:8px 10px; background:#151d2a; border:1px solid #243247; color:#fff; border-radius:8px; font-size:13px; outline:none;">
                             </div>
                             <div>
-                                <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">桥接器语音保护上限 (分钟, 0=关闭)</label>
-                                <input type="number" id="guard-voice" min="0" max="120" value="15" style="width:100%; padding:8px 10px; background:#151d2a; border:1px solid #243247; color:#fff; border-radius:8px; font-size:13px; outline:none;">
+                                <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">桥接器语音保护上限 (秒, 1–62)</label>
+                                <input type="number" id="guard-voice" min="1" max="62" value="62" style="width:100%; padding:8px 10px; background:#151d2a; border:1px solid #243247; color:#fff; border-radius:8px; font-size:13px; outline:none;">
                             </div>
                             <div style="display:flex; align-items:flex-end;">
                                 <button class="btn" style="width:100%; padding:9px 12px;" onclick="saveGuardSettings()">保存防卡键设置</button>
                             </div>
                         </div>
                         <div style="font-size:11px; color:var(--text-muted); margin-top:10px; line-height:1.6; border-top:1px dashed #243247; padding-top:8px;">
-                            语音不受普通按键超时限制。正常松手即结束；连续 5 秒未收到蓝牙音频数据，或达到所设保护上限时自动结束并释放按键。安静和说话停顿不会触发数据超时；上限设为 0 仍保留失联保护。<br><strong style="color:var(--accent-cyan)">当前遥控器单次录音最多 60 秒，到时自动断流；这里的保护上限不能延长遥控器录音。</strong>
+                            语音不受普通按键超时限制。正常松手即结束；连续 5 秒未收到蓝牙音频数据，或达到所设保护上限时自动结束并释放按键。安静和说话停顿不会触发数据超时；旧配置中的 0 值会恢复为 62 秒。<br><strong style="color:var(--accent-cyan)">保护上限最多 62 秒，为遥控器 60 秒录音保留最多 2 秒释放容错；它不能延长遥控器录音。</strong>
                         </div>
                     </div>
 <div class="card">
@@ -1447,7 +1447,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 if (g) {
                     const statsEl = document.getElementById('guard-stats');
                     if (statsEl) {
-                        statsEl.innerText = `规则: 修饰键 ${(g.mod_ms/1000)|0}s · 按键 ${(g.key_ms/1000)|0}s · 语音 ${(g.voice_ms/60000)|0}min | 已触发 ${g.forced} 次`;
+                        const voiceSeconds = Math.ceil((Number(g.voice_ms) || 62000) / 1000);
+                        statsEl.innerText = `规则: 修饰键 ${(g.mod_ms/1000)|0}s · 按键 ${(g.key_ms/1000)|0}s · 语音 ${voiceSeconds}s | 已触发 ${g.forced} 次`;
                     }
                     const lastEl = document.getElementById('guard-last');
                     if (lastEl) {
@@ -2851,20 +2852,44 @@ if (mod & 0x01) chips.push('左Ctrl');
             const list = document.getElementById('wifi-scan-list');
             list.innerHTML = '正在搜索周围 2.4GHz Wi-Fi 网络...';
             try {
-                const res = await fetch('/api/wifi/scan');
-                const d = await res.json();
+                const startedAt = Date.now();
+                let startScan = true;
+                let d;
+                while (Date.now() - startedAt < 20000) {
+                    const url = startScan ? '/api/wifi/scan' : '/api/wifi/scan?poll=1';
+                    startScan = false;
+                    const res = await fetch(url);
+                    d = await res.json();
+                    if (d.status === 'failed' || d.error) {
+                        list.innerText = d.error === 'wifi_disabled'
+                            ? 'Wi-Fi 已关闭，无法扫描'
+                            : `搜索失败 (${d.error || 'scan_failed'})`;
+                        return;
+                    }
+                    if (!d.scanning) break;
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                }
+                if (!d || d.scanning) {
+                    list.innerText = '搜索超时，请重试';
+                    return;
+                }
                 if (!d.networks || d.networks.length === 0) {
                     list.innerHTML = '未扫描到无线网络';
                     return;
                 }
-                let html = '<div style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;">';
+                const results = document.createElement('div');
+                results.style.cssText = 'display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;';
                 d.networks.forEach(net => {
                     if (net.ssid) {
-                        html += `<button class="btn btn-outline" style="font-size:12px; padding:6px 12px;" onclick="selectWifi('${net.ssid}')">${net.ssid} (${net.rssi}dBm)</button>`;
+                        const button = document.createElement('button');
+                        button.className = 'btn btn-outline';
+                        button.style.cssText = 'font-size:12px; padding:6px 12px;';
+                        button.textContent = `${net.ssid} (${net.rssi}dBm)`;
+                        button.addEventListener('click', () => selectWifi(net.ssid));
+                        results.appendChild(button);
                     }
                 });
-                html += '</div>';
-                list.innerHTML = html;
+                list.replaceChildren(results);
             } catch(e){ list.innerText = '搜索出错: ' + e; }
         }
 
@@ -3272,7 +3297,9 @@ if (mod & 0x01) chips.push('左Ctrl');
                 };
                 setVal('guard-mod', (d.mod_ms / 1000).toFixed(0));
                 setVal('guard-key', (d.key_ms / 1000).toFixed(0));
-                setVal('guard-voice', (d.voice_ms / 60000).toFixed(0));
+                const storedVoiceMs = Number(d.voice_ms) || 62000;
+                const voiceSeconds = Math.min(62, Math.max(1, Math.round(storedVoiceMs / 1000)));
+                setVal('guard-voice', String(voiceSeconds));
             } catch (e) {}
         }
 
@@ -3367,12 +3394,13 @@ if (mod & 0x01) chips.push('左Ctrl');
         async function saveGuardSettings() {
             const mod = parseInt(document.getElementById('guard-mod').value, 10) || 0;
             const key = parseInt(document.getElementById('guard-key').value, 10) || 0;
-            const voi = parseInt(document.getElementById('guard-voice').value, 10) || 0;
+            const rawVoiceSeconds = parseInt(document.getElementById('guard-voice').value, 10);
+            const voi = Number.isFinite(rawVoiceSeconds) ? Math.min(62, Math.max(1, rawVoiceSeconds)) : 62;
             try {
                 const res = await fetch('/api/guard', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ mod_ms: mod * 1000, key_ms: key * 1000, voice_ms: voi * 60000 })
+                    body: JSON.stringify({ mod_ms: mod * 1000, key_ms: key * 1000, voice_ms: voi * 1000 })
                 });
                 if (res.ok) {
                     showToast('防卡键设置已保存');

@@ -39,6 +39,17 @@ class BleAudioDiagnosticTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertTrue(output.is_file())
 
+    def test_resample_request_helpers_compile_with_behavior_assertions(self):
+        source = ROOT / "tools/tests/audio_resample_config_compile.cpp"
+        with tempfile.TemporaryDirectory(prefix="audio_rs_config_") as temporary:
+            output = Path(temporary) / "audio_rs_config.o"
+            result = subprocess.run([
+                self.compiler, "-std=gnu++11", "-Wall", "-Wextra", "-Werror", "-c",
+                str(source), "-o", str(output), "-I", str(ROOT / "src/audio")],
+                cwd=ROOT, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(output.is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

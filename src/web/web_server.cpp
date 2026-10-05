@@ -50,6 +50,8 @@ static void handle_status() {
     doc["usb_initialized"] = usb_composite_is_initialized();
     runtime_diagnostics_json(doc["runtime"].to<JsonObject>());
     doc["log_mirror_dropped"] = app_log_get_mirror_dropped();
+    doc["uart_cli_dropped"] = app_log_get_cli_dropped(APP_LOG_OUTPUT_UART);
+    doc["cdc_cli_dropped"] = app_log_get_cli_dropped(APP_LOG_OUTPUT_CDC);
     doc["ap_ip"] = wifi_manager_get_ap_ip();
     doc["sta_ip"] = wifi_manager_get_sta_ip();
     doc["sta_connected"] = wifi_manager_is_sta_connected();
@@ -149,9 +151,9 @@ static void handle_audio() {
     doc["alt"] = (int)uac_microphone_get_alt();
     doc["muted"] = (bool)(mute != 0);
     doc["volume_raw"] = volume;
-    doc["session_active"] = g_audio_pipeline.active;
+    doc["session_active"] = audio_pipeline_is_active(&g_audio_pipeline);
     doc["session_id"] = (int)g_audio_pipeline.session_id;
-    doc["buffering"] = g_audio_pipeline.buffering;
+    doc["buffering"] = audio_pipeline_is_buffering(&g_audio_pipeline);
     doc["ring_avail"] = (int)audio_ring_buffer_peek_available(&g_audio_pipeline.ring_buf);
     doc["ring_capacity"] = g_audio_pipeline.ring_buf.capacity;
     doc["underruns"] = (int)g_audio_pipeline.underrun_count;
@@ -331,19 +333,28 @@ static void handle_audio_resample() {
         }
     }
 
-    char body[128];
-    snprintf(body, sizeof(body),
-             "{\"num\":%u,\"den\":%u,\"enabled\":%s,\"ratio_pct\":%d,"
-             "\"outputs_per_frame_est\":%d,\"min_pct\":%d,\"max_pct\":%d}",
-             (unsigned)num, (unsigned)den, (num && den) ? "true" : "false",
-             (num && den) ? (int)((int)num * 100 / (int)den) : 100,
-             (num && den) ? (int)(AUDIO_DEFAULT_FRAME_SAMPS * (int)num / (int)den) : AUDIO_DEFAULT_FRAME_SAMPS,
-             AUDIO_RS_MIN_RATIO_PCT, AUDIO_RS_MAX_RATIO_PCT);
+    audio_resample_status_t status = {};
+    audio_pipeline_get_resample_status(&g_audio_pipeline, &status);
+    JsonDocument response;
+    response["num"] = status.requested_num;
+    response["den"] = status.requested_den;
+    response["enabled"] = true;
+    response["ratio_pct"] = (uint32_t)status.requested_num * 100 / status.requested_den;
+    response["outputs_per_frame_est"] = (uint32_t)AUDIO_DEFAULT_FRAME_SAMPS * status.requested_num / status.requested_den;
+    response["min_pct"] = AUDIO_RS_MIN_RATIO_PCT;
+    response["max_pct"] = AUDIO_RS_MAX_RATIO_PCT;
+    response["applied_num"] = status.applied_num;
+    response["applied_den"] = status.applied_den;
+    response["pending"] = status.pending;
+    response["apply_at"] = "next_session";
+    String body;
+    serializeJson(response, body);
     s_server.send(200, "application/json", body);
 }
 
 static void handle_wifi_scan() {
-    String json = wifi_manager_scan_json();
+    const bool request_new_scan = !s_server.hasArg("poll") || s_server.arg("poll") != "1";
+    String json = wifi_manager_scan_status_json(request_new_scan);
     s_server.send(200, "application/json", json);
 }
 
