@@ -50,8 +50,9 @@ bool   wifi_manager_save_ap_config(const String& ap_password);
 // Persisted STA credentials (for config backup/restore)
 String wifi_manager_get_sta_ssid(void);
 String wifi_manager_get_sta_pass(void);
-// Atomically persist a full Wi-Fi config from a backup restore. Does not touch
-// the radio; the caller is expected to reboot afterwards for policy to apply.
+// Persist a full Wi-Fi config from a backup restore with checked writes and
+// best-effort rollback. NVS cannot make these keys power-loss atomic. Does not
+// touch the radio; the caller is expected to reboot afterwards for policy to apply.
 bool wifi_manager_restore_backup(const String& ssid, const String& sta_pass,
                                  const String& ap_pass, wifi_policy_t policy,
                                  uint32_t timeout_min, bool timeout_enabled,
@@ -71,6 +72,12 @@ bool               wifi_manager_set_timeout_min(uint32_t minutes);
 // (no reboot): it only gates the idle check in wifi_manager_task().
 bool               wifi_manager_get_timeout_enabled(void);
 bool               wifi_manager_set_timeout_enabled(bool enabled);
+// Validate, persist, and publish only the selected power settings as one
+// in-process transaction. On write/readback failure, attempts to restore the
+// previous NVS values and leaves runtime state unchanged.
+bool               wifi_manager_update_power_config(bool set_policy, wifi_policy_t policy,
+                                                    bool set_timeout_min, uint32_t timeout_min,
+                                                    bool set_timeout_enabled, bool timeout_enabled);
 wifi_radio_state_t wifi_manager_get_radio_state(void);
 // Request the radio to be available (wake from idle power-down or broadcast needs).
 bool               wifi_manager_request_wifi(wifi_wake_reason_t reason);

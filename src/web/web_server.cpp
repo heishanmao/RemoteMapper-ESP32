@@ -2,6 +2,7 @@
 #include "web_ui.h"
 #include "log/app_log.h"
 #include "wifi/wifi_manager.h"
+#include "wifi_request_validation.h"
 #include "version.h"
 #include "ble/ble_remote_client.h"
 #include "audio/audio_pipeline.h"
@@ -370,15 +371,17 @@ static void handle_wifi_config() {
         return;
     }
 
-    String ssid = doc["ssid"] | "";
-    String pass = doc["pass"] | "";
-
-    if (ssid.length() == 0) {
-        s_server.send(400, "application/json", "{\"error\":\"empty_ssid\"}");
+    String ssid;
+    String pass;
+    if (!wifi_parse_sta_request(doc, &ssid, &pass)) {
+        s_server.send(400, "application/json", "{\"error\":\"invalid_wifi_credentials\"}");
         return;
     }
 
-    wifi_manager_save_sta_config(ssid, pass);
+    if (!wifi_manager_save_sta_config(ssid, pass)) {
+        s_server.send(500, "application/json", "{\"error\":\"save_failed\"}");
+        return;
+    }
     s_server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
@@ -394,11 +397,9 @@ static void handle_wifi_ap_config() {
         return;
     }
 
-    String ap_pass = doc["ap_pass"] | "";
-    ap_pass.trim();
-
-    if (ap_pass.length() > 0 && ap_pass.length() < 8) {
-        s_server.send(400, "application/json", "{\"error\":\"password_too_short\",\"message\":\"AP 密码至少需要 8 位字符，或留空设置为开放热点\"}");
+    String ap_pass;
+    if (!wifi_parse_ap_request(doc, &ap_pass)) {
+        s_server.send(400, "application/json", "{\"error\":\"invalid_ap_password\"}");
         return;
     }
 
@@ -571,28 +572,18 @@ static void handle_power_set() {
         return;
     }
 
-    bool policy_changed = false;
-    if (!doc["policy"].isNull()) {
-        int p = doc["policy"] | -1;
-        if (p < (int)WIFI_POLICY_ALWAYS_ON || p > (int)WIFI_POLICY_DISABLED) {
-            s_server.send(400, "application/json", "{\"error\":\"invalid_policy\",\"hint\":\"0=always_on,1=on_demand,2=disabled\"}");
-            return;
-        }
-        wifi_policy_t old_p = wifi_manager_get_policy();
-        if (wifi_manager_set_policy((wifi_policy_t)p)) {
-            policy_changed = (wifi_manager_get_policy() != old_p);
-        }
+    wifi_power_request_t request = {};
+    if (!wifi_parse_power_request(doc, &request)) {
+        s_server.send(400, "application/json", "{\"error\":\"invalid_power_fields\",\"hint\":\"policy=0..2, timeout_min=0,1,2,5,10,30, timeout_enabled=boolean\"}");
+        return;
     }
-    if (!doc["timeout_min"].isNull()) {
-        uint32_t t = doc["timeout_min"] | 0xFFFFFFFF;
-        if (!wifi_manager_set_timeout_min(t)) {
-            s_server.send(400, "application/json", "{\"error\":\"invalid_timeout\",\"hint\":\"1,5,10,30,0(never)\"}");
-            return;
-        }
-    }
-    // Idle auto-shutdown switch: applies immediately, no reboot needed.
-    if (!doc["timeout_enabled"].isNull()) {
-        wifi_manager_set_timeout_enabled(doc["timeout_enabled"] | false);
+    const bool policy_changed = request.set_policy &&
+            request.policy != wifi_manager_get_policy();
+    if (!wifi_manager_update_power_config(request.set_policy, request.policy,
+            request.set_timeout_min, request.timeout_min,
+            request.set_timeout_enabled, request.timeout_enabled)) {
+        s_server.send(500, "application/json", "{\"error\":\"save_failed\"}");
+        return;
     }
 
     JsonDocument res;

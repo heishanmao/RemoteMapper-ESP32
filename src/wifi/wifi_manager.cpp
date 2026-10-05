@@ -10,6 +10,8 @@
 #include <ArduinoJson.h>
 #include <esp_coexist.h>
 #include <esp_wifi.h>
+#include <nvs.h>
+#include <vector>
 
 static_assert((int)WIFI_POLICY_ON_DEMAND == WIFI_DEFAULT_POLICY,
               "WIFI_DEFAULT_POLICY must match WIFI_POLICY_ON_DEMAND");
@@ -19,6 +21,7 @@ static_assert((int)WIFI_POLICY_ON_DEMAND == WIFI_DEFAULT_POLICY,
 
 static DNSServer        s_dns_server;
 static Preferences      s_prefs;
+static bool             s_prefs_ready = false;
 static IPAddress        s_ap_ip(192, 168, 4, 1);
 static IPAddress        s_ap_netmask(255, 255, 255, 0);
 
@@ -174,7 +177,10 @@ static void wifi_reconnect_light(void) {
 }
 
 void wifi_manager_init(void) {
-    s_prefs.begin("wifi_conf", false);
+    s_prefs_ready = s_prefs.begin("wifi_conf", false);
+    if (!s_prefs_ready) {
+        app_log("WIFI", "Could not open Wi-Fi preferences; persistent settings are unavailable");
+    }
 
     // The ESP32-S3 has a single 2.4 GHz radio shared by WiFi and BLE. With the
     // default WiFi-preferred arbitration, a WiFi beacon or data TX during a BLE
@@ -251,17 +257,7 @@ bool wifi_manager_set_policy(wifi_policy_t policy) {
     if ((uint32_t)policy > WIFI_POLICY_DISABLED) {
         return false;
     }
-    if (s_policy == policy) {
-        return true;
-    }
-    s_prefs.putUInt("policy", (uint32_t)policy);
-    s_policy = policy;
-    s_wifi_enabled = (policy != WIFI_POLICY_DISABLED);
-    // Applying the change requires a reboot: the caller (CLI/web) must restart.
-    // Switching the WiFi stack on/off at runtime is unsafe while BLE is running.
-    app_log("WIFI", "Wi-Fi policy set to %s; reboot required to apply",
-            wifi_manager_policy_str(policy));
-    return true;
+    return wifi_manager_update_power_config(true, policy, false, 0, false, false);
 }
 
 uint32_t wifi_manager_get_timeout_min(void) {
@@ -272,14 +268,8 @@ bool wifi_manager_set_timeout_min(uint32_t minutes) {
     if (!wifi_is_valid_timeout(minutes)) {
         return false;
     }
-    if (s_timeout_min == minutes) {
-        return true;
-    }
-    s_prefs.putUInt("timeout_min", minutes);
-    s_timeout_min = minutes;
-    app_log("WIFI", "Wi-Fi idle timeout set to %u minute(s)%s", (unsigned int)minutes,
-            s_timeout_enabled ? "" : " (auto-shutdown still OFF)");
-    return true;
+    return wifi_manager_update_power_config(false, WIFI_POLICY_ON_DEMAND,
+            true, minutes, false, false);
 }
 
 bool wifi_manager_get_timeout_enabled(void) {
@@ -287,23 +277,8 @@ bool wifi_manager_get_timeout_enabled(void) {
 }
 
 bool wifi_manager_set_timeout_enabled(bool enabled) {
-    if (s_timeout_enabled == enabled) {
-        return true;
-    }
-    s_prefs.putBool("timeout_en", enabled);
-    s_timeout_enabled = enabled;
-    // Purely a gate on the idle check below, so it applies right away: no
-    // reboot and no radio transition (the driver stays initialized either way).
-    if (enabled) {
-        // Re-anchor the idle window so enabling does not immediately trip a
-        // timeout computed from a stale activity timestamp.
-        s_last_activity_ms = millis();
-        app_log("WIFI", "Wi-Fi idle auto-shutdown ENABLED (%u min, policy %s)",
-                (unsigned int)s_timeout_min, wifi_manager_policy_str(s_policy));
-    } else {
-        app_log("WIFI", "Wi-Fi idle auto-shutdown DISABLED (radio stays on; 'wifi off' powers it down)");
-    }
-    return true;
+    return wifi_manager_update_power_config(false, WIFI_POLICY_ON_DEMAND,
+            false, 0, true, enabled);
 }
 
 wifi_radio_state_t wifi_manager_get_radio_state(void) {
@@ -408,19 +383,234 @@ const char* wifi_manager_state_str(wifi_radio_state_t state) {
     }
 }
 
+static bool prefs_read_string_key(const char* key, bool* exists, String* value);
+static bool prefs_read_uint_key(const char* key, bool* exists, uint32_t* value);
+static bool prefs_read_bool_key(const char* key, bool* exists, bool* value);
+
 static bool prefs_put_string_verified(const char* key, const String& value) {
-    size_t written = s_prefs.putString(key, value);
-    return written == value.length() && s_prefs.getString(key, "") == value;
+    if (!s_prefs_ready) return false;
+    bool existed = false;
+    String current;
+    if (!prefs_read_string_key(key, &existed, &current)) return false;
+    if (existed && current == value) return true;
+    nvs_handle_t handle;
+    if (nvs_open("wifi_conf", NVS_READWRITE, &handle) != ESP_OK) return false;
+    esp_err_t write_result = nvs_set_str(handle, key, value.c_str());
+    if (write_result == ESP_OK) write_result = nvs_commit(handle);
+    nvs_close(handle);
+    if (write_result != ESP_OK) return false;
+    bool verify_exists = false;
+    String verify;
+    return prefs_read_string_key(key, &verify_exists, &verify) && verify_exists && verify == value;
 }
 
 static bool prefs_put_uint_verified(const char* key, uint32_t value) {
+    if (!s_prefs_ready) return false;
+    bool existed = false;
+    uint32_t current = 0;
+    if (!prefs_read_uint_key(key, &existed, &current)) return false;
+    if (existed && current == value) return true;
     size_t written = s_prefs.putUInt(key, value);
-    return written == sizeof(value) && s_prefs.getUInt(key, UINT32_MAX) == value;
+    if (written != sizeof(value)) return false;
+    bool verify_exists = false;
+    uint32_t verify = 0;
+    return prefs_read_uint_key(key, &verify_exists, &verify) && verify_exists && verify == value;
 }
 
 static bool prefs_put_bool_verified(const char* key, bool value) {
+    if (!s_prefs_ready) return false;
+    bool existed = false;
+    bool current = false;
+    if (!prefs_read_bool_key(key, &existed, &current)) return false;
+    if (existed && current == value) return true;
     size_t written = s_prefs.putBool(key, value);
-    return written == sizeof(uint8_t) && s_prefs.getBool(key, !value) == value;
+    if (written != sizeof(uint8_t)) return false;
+    bool verify_exists = false;
+    bool verify = false;
+    return prefs_read_bool_key(key, &verify_exists, &verify) && verify_exists && verify == value;
+}
+
+static bool prefs_open_readonly(nvs_handle_t* handle) {
+    return s_prefs_ready && handle && nvs_open("wifi_conf", NVS_READONLY, handle) == ESP_OK;
+}
+
+static bool prefs_read_string_key(const char* key, bool* exists, String* value) {
+    if (!exists || !value) return false;
+    *exists = false;
+    if (!s_prefs_ready) return false;
+    nvs_handle_t handle;
+    if (!prefs_open_readonly(&handle)) return false;
+    size_t length = 0;
+    esp_err_t result = nvs_get_str(handle, key, nullptr, &length);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        *value = "";
+        return true;
+    }
+    if (result != ESP_OK || length == 0 || length > 4096) {
+        nvs_close(handle);
+        return false;
+    }
+    std::vector<char> buffer(length);
+    result = nvs_get_str(handle, key, buffer.data(), &length);
+    nvs_close(handle);
+    if (result != ESP_OK || length == 0 || buffer[length - 1] != '\0') return false;
+    *value = String(buffer.data());
+    *exists = true;
+    return true;
+}
+
+static bool prefs_read_uint_key(const char* key, bool* exists, uint32_t* value) {
+    if (!exists || !value) return false;
+    *exists = false;
+    if (!s_prefs_ready) return false;
+    nvs_handle_t handle;
+    if (!prefs_open_readonly(&handle)) return false;
+    uint32_t current = 0;
+    const esp_err_t result = nvs_get_u32(handle, key, &current);
+    nvs_close(handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return true;
+    if (result != ESP_OK) return false;
+    *exists = true;
+    *value = current;
+    return true;
+}
+
+static bool prefs_read_bool_key(const char* key, bool* exists, bool* value) {
+    if (!exists || !value) return false;
+    *exists = false;
+    if (!s_prefs_ready) return false;
+    nvs_handle_t handle;
+    if (!prefs_open_readonly(&handle)) return false;
+    uint8_t current = 0;
+    const esp_err_t result = nvs_get_u8(handle, key, &current);
+    nvs_close(handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return true;
+    if (result != ESP_OK) return false;
+    if (current > 1) return false;
+    *exists = true;
+    *value = current != 0;
+    return true;
+}
+
+static bool prefs_restore_string(const char* key, bool existed, const String& value) {
+    if (existed) return prefs_put_string_verified(key, value);
+    if (!s_prefs_ready) return false;
+    bool remains = false;
+    String ignored;
+    if (!prefs_read_string_key(key, &remains, &ignored)) return false;
+    if (!remains) return true;
+    if (!s_prefs.remove(key)) return false;
+    return prefs_read_string_key(key, &remains, &ignored) && !remains;
+}
+
+static bool prefs_restore_uint(const char* key, bool existed, uint32_t value) {
+    if (existed) return prefs_put_uint_verified(key, value);
+    if (!s_prefs_ready) return false;
+    bool remains = false;
+    uint32_t ignored = 0;
+    if (!prefs_read_uint_key(key, &remains, &ignored)) return false;
+    if (!remains) return true;
+    if (!s_prefs.remove(key)) return false;
+    return prefs_read_uint_key(key, &remains, &ignored) && !remains;
+}
+
+static bool prefs_restore_bool(const char* key, bool existed, bool value) {
+    if (existed) return prefs_put_bool_verified(key, value);
+    if (!s_prefs_ready) return false;
+    bool remains = false;
+    bool ignored = false;
+    if (!prefs_read_bool_key(key, &remains, &ignored)) return false;
+    if (!remains) return true;
+    if (!s_prefs.remove(key)) return false;
+    return prefs_read_bool_key(key, &remains, &ignored) && !remains;
+}
+
+bool wifi_manager_update_power_config(bool set_policy, wifi_policy_t policy,
+                                      bool set_timeout_min, uint32_t timeout_min,
+                                      bool set_timeout_enabled, bool timeout_enabled) {
+    if ((set_policy && (uint32_t)policy > WIFI_POLICY_DISABLED) ||
+            (set_timeout_min && !wifi_is_valid_timeout(timeout_min))) {
+        return false;
+    }
+    if (!set_policy && !set_timeout_min && !set_timeout_enabled) return true;
+    if (!s_prefs_ready) {
+        app_log("WIFI", "Cannot save power settings: Wi-Fi preferences are unavailable");
+        return false;
+    }
+
+    bool had_policy = false;
+    bool had_timeout = false;
+    bool had_timeout_enabled = false;
+    uint32_t old_policy = WIFI_DEFAULT_POLICY;
+    uint32_t old_timeout = WIFI_DEFAULT_TIMEOUT_MIN;
+    bool old_timeout_enabled = WIFI_DEFAULT_TIMEOUT_ENABLED ? true : false;
+    if ((set_policy && !prefs_read_uint_key("policy", &had_policy, &old_policy)) ||
+            (set_timeout_min && !prefs_read_uint_key("timeout_min", &had_timeout, &old_timeout)) ||
+            (set_timeout_enabled && !prefs_read_bool_key("timeout_en", &had_timeout_enabled,
+                                                        &old_timeout_enabled))) {
+        app_log("WIFI", "Cannot save power settings: failed to read previous NVS value");
+        return false;
+    }
+
+    bool stored = true;
+    bool touched_policy = false;
+    bool touched_timeout = false;
+    bool touched_timeout_enabled = false;
+    if (set_policy) {
+        touched_policy = true;
+        stored = prefs_put_uint_verified("policy", (uint32_t)policy);
+    }
+    if (stored && set_timeout_min) {
+        touched_timeout = true;
+        stored = prefs_put_uint_verified("timeout_min", timeout_min);
+    }
+    if (stored && set_timeout_enabled) {
+        touched_timeout_enabled = true;
+        stored = prefs_put_bool_verified("timeout_en", timeout_enabled);
+    }
+    if (!stored) {
+        bool rolled_back = true;
+        if (touched_policy) rolled_back = prefs_restore_uint("policy", had_policy, old_policy) && rolled_back;
+        if (touched_timeout) rolled_back = prefs_restore_uint("timeout_min", had_timeout, old_timeout) && rolled_back;
+        if (touched_timeout_enabled) {
+            rolled_back = prefs_restore_bool("timeout_en", had_timeout_enabled,
+                    old_timeout_enabled) && rolled_back;
+        }
+        app_log("WIFI", "Power settings NVS write failed; rollback %s (power-loss atomicity is not available)",
+                rolled_back ? "completed" : "incomplete");
+        return false;
+    }
+
+    const bool policy_changed = set_policy && s_policy != policy;
+    const bool timeout_changed = set_timeout_min && s_timeout_min != timeout_min;
+    const bool timeout_enabled_changed = set_timeout_enabled && s_timeout_enabled != timeout_enabled;
+    if (set_policy) {
+        s_policy = policy;
+        s_wifi_enabled = policy != WIFI_POLICY_DISABLED;
+    }
+    if (set_timeout_min) s_timeout_min = timeout_min;
+    if (set_timeout_enabled) s_timeout_enabled = timeout_enabled;
+    if (policy_changed) {
+        app_log("WIFI", "Wi-Fi policy set to %s; reboot required to apply",
+                wifi_manager_policy_str(policy));
+    }
+    if (timeout_changed) {
+        app_log("WIFI", "Wi-Fi idle timeout set to %u minute(s)%s", (unsigned int)timeout_min,
+                s_timeout_enabled ? "" : " (auto-shutdown still OFF)");
+    }
+    if (timeout_enabled_changed) {
+        // This is only a gate on the idle check; the initialized radio remains
+        // untouched. Anchor a newly enabled window after persistence succeeds.
+        if (timeout_enabled) {
+            s_last_activity_ms = millis();
+            app_log("WIFI", "Wi-Fi idle auto-shutdown ENABLED (%u min, policy %s)",
+                    (unsigned int)s_timeout_min, wifi_manager_policy_str(s_policy));
+        } else {
+            app_log("WIFI", "Wi-Fi idle auto-shutdown DISABLED (radio stays on; 'wifi off' powers it down)");
+        }
+    }
+    return true;
 }
 
 static void wifi_scan_begin(void) {
@@ -704,10 +894,30 @@ String wifi_manager_scan_json(void) {
 
 bool wifi_manager_save_sta_config(const String& ssid, const String& password) {
     if (!s_wifi_enabled) return false;
-    if (ssid.length() == 0) return false;
+    if (ssid.length() == 0 || ssid.length() > 32 || password.length() > 64) return false;
+    if (!s_prefs_ready) {
+        app_log("WIFI", "Cannot save STA credentials: Wi-Fi preferences are unavailable");
+        return false;
+    }
 
-    s_prefs.putString("ssid", ssid);
-    s_prefs.putString("pass", password);
+    bool had_ssid = false;
+    bool had_pass = false;
+    String old_ssid;
+    String old_pass;
+    if (!prefs_read_string_key("ssid", &had_ssid, &old_ssid) ||
+            !prefs_read_string_key("pass", &had_pass, &old_pass)) {
+        app_log("WIFI", "Cannot save STA credentials: failed to read previous NVS value");
+        return false;
+    }
+    const bool stored = prefs_put_string_verified("ssid", ssid) &&
+                        prefs_put_string_verified("pass", password);
+    if (!stored) {
+        const bool rollback_ssid = prefs_restore_string("ssid", had_ssid, old_ssid);
+        const bool rollback_pass = prefs_restore_string("pass", had_pass, old_pass);
+        app_log("WIFI", "STA credential NVS write failed; rollback %s (power-loss atomicity is not available)",
+                rollback_ssid && rollback_pass ? "completed" : "incomplete");
+        return false;
+    }
     s_sta_configured = true;
     s_sta_disconnected_since = 0;
 
@@ -756,12 +966,21 @@ bool wifi_manager_restore_backup(const String& ssid, const String& sta_pass,
     String ap = ap_pass;
     ap.trim();
 
-    const String old_ssid = s_prefs.getString("ssid", "");
-    const String old_pass = s_prefs.getString("pass", "");
-    const String old_ap = s_prefs.getString("ap_pass", "");
-    const uint32_t old_policy = s_prefs.getUInt("policy", WIFI_DEFAULT_POLICY);
-    const uint32_t old_timeout = s_prefs.getUInt("timeout_min", WIFI_DEFAULT_TIMEOUT_MIN);
-    const bool old_timeout_enabled = s_prefs.getBool("timeout_en", WIFI_DEFAULT_TIMEOUT_ENABLED ? true : false);
+    bool had_ssid = false, had_pass = false, had_ap = false;
+    bool had_policy = false, had_timeout = false, had_timeout_enabled = false;
+    String old_ssid, old_pass, old_ap;
+    uint32_t old_policy = WIFI_DEFAULT_POLICY;
+    uint32_t old_timeout = WIFI_DEFAULT_TIMEOUT_MIN;
+    bool old_timeout_enabled = WIFI_DEFAULT_TIMEOUT_ENABLED ? true : false;
+    if (!prefs_read_string_key("ssid", &had_ssid, &old_ssid) ||
+            !prefs_read_string_key("pass", &had_pass, &old_pass) ||
+            !prefs_read_string_key("ap_pass", &had_ap, &old_ap) ||
+            !prefs_read_uint_key("policy", &had_policy, &old_policy) ||
+            !prefs_read_uint_key("timeout_min", &had_timeout, &old_timeout) ||
+            !prefs_read_bool_key("timeout_en", &had_timeout_enabled, &old_timeout_enabled)) {
+        app_log("WIFI", "Cannot restore Wi-Fi backup: failed to read previous NVS state");
+        return false;
+    }
 
     bool stored = prefs_put_string_verified("ssid", ssid) &&
                   prefs_put_string_verified("pass", sta_pass) &&
@@ -769,22 +988,15 @@ bool wifi_manager_restore_backup(const String& ssid, const String& sta_pass,
                   prefs_put_uint_verified("policy", (uint32_t)policy) &&
                   prefs_put_uint_verified("timeout_min", timeout_min) &&
                   prefs_put_bool_verified("timeout_en", timeout_enabled);
-    if (stored) {
-        stored = s_prefs.getString("ssid", "") == ssid &&
-                 s_prefs.getString("pass", "") == sta_pass &&
-                 s_prefs.getString("ap_pass", "") == ap &&
-                 s_prefs.getUInt("policy", UINT32_MAX) == (uint32_t)policy &&
-                 s_prefs.getUInt("timeout_min", UINT32_MAX) == timeout_min &&
-                 s_prefs.getBool("timeout_en", !timeout_enabled) == timeout_enabled;
-    }
     if (!stored) {
         bool rolled_back = true;
-        rolled_back = prefs_put_string_verified("ssid", old_ssid) && rolled_back;
-        rolled_back = prefs_put_string_verified("pass", old_pass) && rolled_back;
-        rolled_back = prefs_put_string_verified("ap_pass", old_ap) && rolled_back;
-        rolled_back = prefs_put_uint_verified("policy", old_policy) && rolled_back;
-        rolled_back = prefs_put_uint_verified("timeout_min", old_timeout) && rolled_back;
-        rolled_back = prefs_put_bool_verified("timeout_en", old_timeout_enabled) && rolled_back;
+        rolled_back = prefs_restore_string("ssid", had_ssid, old_ssid) && rolled_back;
+        rolled_back = prefs_restore_string("pass", had_pass, old_pass) && rolled_back;
+        rolled_back = prefs_restore_string("ap_pass", had_ap, old_ap) && rolled_back;
+        rolled_back = prefs_restore_uint("policy", had_policy, old_policy) && rolled_back;
+        rolled_back = prefs_restore_uint("timeout_min", had_timeout, old_timeout) && rolled_back;
+        rolled_back = prefs_restore_bool("timeout_en", had_timeout_enabled,
+                old_timeout_enabled) && rolled_back;
         app_log("WIFI", "Wi-Fi backup NVS write failed; rollback %s (power-loss atomicity is not available)",
                 rolled_back ? "completed" : "incomplete");
         return false;
@@ -814,7 +1026,18 @@ bool wifi_manager_save_ap_config(const String& ap_password) {
     if (p.length() > 0 && (p.length() < 8 || p.length() > 63)) {
         return false;
     }
-    s_prefs.putString("ap_pass", p);
+    bool had_ap = false;
+    String old_ap;
+    if (!prefs_read_string_key("ap_pass", &had_ap, &old_ap)) {
+        app_log("WIFI", "Cannot save AP password: failed to read previous NVS value");
+        return false;
+    }
+    if (!prefs_put_string_verified("ap_pass", p)) {
+        const bool rolled_back = prefs_restore_string("ap_pass", had_ap, old_ap);
+        app_log("WIFI", "AP password NVS write failed; rollback %s; running AP settings were not changed",
+                rolled_back ? "completed" : "incomplete");
+        return false;
+    }
 
     if (s_ap_running) {
         WiFi.softAPConfig(s_ap_ip, s_ap_ip, s_ap_netmask);
