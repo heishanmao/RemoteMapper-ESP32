@@ -59,16 +59,19 @@ ESP32-S3 配备 Xtensa® 双核 32 位 LX7 微处理器（主频 240MHz）。为
 * **遥控器型号**：**小米蓝牙语音遥控器 2 Pro（型号：RC003）**。
 * **供电**：USB 5V 直接供电，典型运行功耗约 110~130mA。
 
-### 2. 16MB Flash 分区表 (`default_16MB.csv`)
+### 2. 16MB Flash 分区表 (`partitions/remotemapper_n16r8.csv`)
 
 | 分区名 | 类型 | 子类型 | 起始偏移 (Offset) | 大小 (Size) | 用途说明 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `nvs` | data | nvs | `0x9000` | 24 KB (`0x6000`) | BLE 配对密钥、Wi-Fi 配置、自定义按键存储 |
-| `otadata` | data | ota | `0xf000` | 8 KB (`0x2000`) | OTA 升级状态标记 |
-| `app0` | app | ota_0 | `0x20000` | 6 MB (`0x600000`) | 当前运行的主固件镜像 |
-| `app1` | app | ota_1 | `0x620000` | 6 MB (`0x600000`) | 后续 OTA 固件备用镜像 |
-| `spiffs` | data | spiffs | `0xc20000` | 3.75 MB (`0x3c0000`)| 嵌入式静态资源 / 扩展文件系统 |
-| `coredump` | data | coredump | `0xfe0000` | 128 KB (`0x20000`) | 系统崩溃转储诊断日志 |
+| `nvs` | data | nvs | `0x9000` | 20 KB (`0x5000`) | BLE 配对密钥、Wi-Fi 配置、自定义按键存储 |
+| `otadata` | data | ota | `0xe000` | 8 KB (`0x2000`) | OTA 升级状态标记 |
+| `app0` | app | ota_0 | `0x10000` | 6.25 MB (`0x640000`) | 当前运行的主固件镜像 |
+| `app1` | app | ota_1 | `0x650000` | 6.25 MB (`0x640000`) | 后续 OTA 固件备用镜像 |
+| `spiffs` | data | spiffs | `0xc90000` | 3.375 MB (`0x360000`) | 嵌入式静态资源 / 扩展文件系统 |
+| `coredump` | data | coredump | `0xff0000` | 64 KB (`0x10000`) | 系统崩溃转储诊断日志 |
+
+> N16R8 显式引用本仓库的分区表，不使用 Arduino 的同名 `default_16MB.csv`（两者偏移不同）；
+> `0x10000` 与 `0xe000` 是串口抢救和双 OTA 的既定地址，不得迁移。
 
 ---
 
@@ -289,7 +292,7 @@ ESP32-S3 原生 USB OTG 在枚举时向操作系统呈现标准**复合多接口
 ```text
 D:\tool\RemoteMapper-ESP32/
 ├── platformio.ini              # PlatformIO 构建配置文件 (Flash/PSRAM/编译宏)
-├── default_16MB.csv            # 16MB Flash 分区表
+├── partitions/                 # 16MB Flash 分区表 (remotemapper_n16r8.csv)
 ├── build.bat                   # 一键编译脚本
 ├── flash.bat                   # 一键烧录脚本
 ├── monitor.bat                 # 串口监视器脚本
