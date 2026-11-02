@@ -277,4 +277,6 @@ pio run -e esp32s3_n4r2 -t upload
 
 ## 开源协议
 
-本项目采用 [MIT License](./LICENSE) 协议开源。
+本项目采用 [MIT License](./LICENSE) 协议开源，版权归 cuicui-V5（原始作者）与 RemoteMapper-ESP32 各贡献者共同所有。
+
+本项目依赖并分发的第三方组件仍各自遵循其原许可证：Arduino-ESP32 / ESP-IDF 与 NimBLE-Arduino 为 Apache-2.0，TinyUSB 与 ArduinoJson 为 MIT；从上游拷入本仓库的源文件（例如 `src/usb/dcd_dwc2_experimental.c`）保留其原有版权头。
