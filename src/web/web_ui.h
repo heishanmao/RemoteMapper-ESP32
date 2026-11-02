@@ -2453,8 +2453,13 @@ if (mod & 0x01) chips.push('左Ctrl');
                 document.getElementById('double-click-header').style.display = 'none';
                 currentTriggerTab = 'click';
                 selectActionMode(7, true);
-                const vMod = (editingBinding.click_mod !== undefined) ? editingBinding.click_mod : 64;
-                const vKey = (editingBinding.click_key !== undefined) ? editingBinding.click_key : 54;
+                // A missing click_key means "modifier only" (e.g. bare Alt),
+                // not "fall back to comma"; only a fully unconfigured voice
+                // key should show the RAlt+, default.
+                const hasVoiceHotkey = editingBinding.has_click &&
+                    (((editingBinding.click_mod || 0) !== 0) || ((editingBinding.click_key || 0) !== 0));
+                const vMod = hasVoiceHotkey ? (editingBinding.click_mod || 0) : 64;
+                const vKey = hasVoiceHotkey ? (editingBinding.click_key || 0) : 54;
                 renderTriggerView(7, vMod, vKey, 0);
             } else {
                 document.getElementById('trigger-tab-bar').style.display = 'flex';
