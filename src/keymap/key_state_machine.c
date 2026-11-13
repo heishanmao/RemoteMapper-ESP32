@@ -51,6 +51,9 @@ static int get_physical_key_slot(uint8_t raw_key) {
         case MI_KEY_VOL_UP:   return 10;
         case MI_KEY_VOL_DOWN: return 11;
         case MI_KEY_TV: case MI_KEY_TV_ALT: return 12;
+        case MI_KEY_MUTE:    return 13;
+        case MI_KEY_YOUTUBE: return 14;
+        case MI_KEY_NETFLIX: return 15;
         default: return -1;
     }
 }
@@ -384,6 +387,36 @@ static void key_engine_load_defaults_impl(key_mapper_engine_t *engine, bool upda
         l0->bindings[l0->binding_count++] = b;
     }
 
+    // 14. Mute (Chromecast-only): 0x90 -> Consumer Mute
+    {
+        key_binding_t b;
+        memset(&b, 0, sizeof(b));
+        b.source_vk = MI_KEY_MUTE;
+        b.has_click = true;
+        b.click_action = (key_action_t){ ACTION_CONSUMER_TAP, USB_MOD_NONE, USB_KEY_NONE, USB_CONSUMER_MUTE, 0 };
+        l0->bindings[l0->binding_count++] = b;
+    }
+
+    // 15. YouTube (Chromecast-only): 0x91 -> unmapped placeholder
+    {
+        key_binding_t b;
+        memset(&b, 0, sizeof(b));
+        b.source_vk = MI_KEY_YOUTUBE;
+        b.has_click = true;
+        b.click_action = (key_action_t){ ACTION_NONE, 0, 0, 0, 0 };
+        l0->bindings[l0->binding_count++] = b;
+    }
+
+    // 16. Netflix (Chromecast-only): 0x92 -> unmapped placeholder
+    {
+        key_binding_t b;
+        memset(&b, 0, sizeof(b));
+        b.source_vk = MI_KEY_NETFLIX;
+        b.has_click = true;
+        b.click_action = (key_action_t){ ACTION_NONE, 0, 0, 0, 0 };
+        l0->bindings[l0->binding_count++] = b;
+    }
+
     // ----------------------------------------------------
     // Preset Layers 1 ~ 4 (Inherit Layer 0 by default)
     // ----------------------------------------------------
@@ -616,10 +649,11 @@ void key_engine_tick(key_mapper_engine_t *engine, uint32_t now_ms) {
     uint8_t raw_keys[] = {
         MI_KEY_POWER, MI_KEY_VOICE, MI_KEY_UP, MI_KEY_DOWN,
         MI_KEY_LEFT, MI_KEY_RIGHT, MI_KEY_OK, MI_KEY_BACK,
-        MI_KEY_HOME, MI_KEY_MENU, MI_KEY_VOL_UP, MI_KEY_VOL_DOWN, MI_KEY_TV
+        MI_KEY_HOME, MI_KEY_MENU, MI_KEY_VOL_UP, MI_KEY_VOL_DOWN, MI_KEY_TV,
+        MI_KEY_MUTE, MI_KEY_YOUTUBE, MI_KEY_NETFLIX
     };
 
-    for (int slot = 0; slot < 13; slot++) {
+    for (int slot = 0; slot < 16; slot++) {
         key_slot_state_t *s = &engine->states[slot];
         if (!s->is_pressed && !s->waiting_double) continue;
 
@@ -656,7 +690,8 @@ void key_engine_release_all(key_mapper_engine_t *engine, uint32_t now_ms) {
     uint8_t raw_keys[] = {
         MI_KEY_POWER, MI_KEY_VOICE, MI_KEY_UP, MI_KEY_DOWN,
         MI_KEY_LEFT, MI_KEY_RIGHT, MI_KEY_OK, MI_KEY_BACK,
-        MI_KEY_HOME, MI_KEY_MENU, MI_KEY_VOL_UP, MI_KEY_VOL_DOWN, MI_KEY_TV
+        MI_KEY_HOME, MI_KEY_MENU, MI_KEY_VOL_UP, MI_KEY_VOL_DOWN, MI_KEY_TV,
+        MI_KEY_MUTE, MI_KEY_YOUTUBE, MI_KEY_NETFLIX
     };
 
     typedef struct {
@@ -666,7 +701,7 @@ void key_engine_release_all(key_mapper_engine_t *engine, uint32_t now_ms) {
     pending_release_t pending[MAX_KEY_BINDINGS];
     size_t pending_count = 0;
 
-    for (int slot = 0; slot < 13; slot++) {
+    for (int slot = 0; slot < 16; slot++) {
         key_slot_state_t *s = &engine->states[slot];
         if (s->is_pressed) {
             key_binding_t binding;

@@ -106,6 +106,21 @@ bool ble_remote_connect_mac(const String& mac_str);
 void ble_remote_unpair(void);
 
 /**
+ * @brief JSON list of all saved remotes: {"active":"<mac>","remotes":[{mac,name,type,active}]}
+ */
+String ble_remote_get_saved_json(void);
+
+/**
+ * @brief Switch the active binding to a previously saved remote (reuses its bond)
+ */
+bool ble_remote_switch_target(const String& mac);
+
+/**
+ * @brief Remove a saved remote and its bond; clears the active binding if it was active
+ */
+bool ble_remote_remove_saved(const String& mac);
+
+/**
  * @brief Get connected remote name and MAC
  */
 String ble_remote_get_connected_info(void);
@@ -148,6 +163,14 @@ bool ble_remote_gatt_dump_enabled(void);
  * under the "GATTX" tag.
  */
 void ble_remote_gatt_dump_request(bool on);
+
+/**
+ * @brief Chromecast toggle (开关型) voice mode. Persisted; only takes effect while
+ * a Chromecast remote is connected. Xiaomi always stays hold-to-talk.
+ */
+bool ble_remote_get_voice_toggle_mode(void);
+void ble_remote_set_voice_toggle_mode(bool on);
+bool ble_remote_voice_toggle_active(void);
 
 #ifdef __cplusplus
 }

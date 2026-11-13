@@ -145,6 +145,40 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         .remote-footer { margin-top: 10px; display: flex; flex-direction: column; align-items: center; color: #71717a; font-size: 11px; }
         .remote-footer .nfc-icon { width: 14px; height: 14px; border: 1px solid #71717a; border-radius: 2px; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: bold; margin-bottom: 14px; }
 
+        /* Chromecast / Google TV variant: white pill body, real G9N9N layout */
+        .real-remote-body.cc {
+            width: 200px;
+            background: linear-gradient(180deg, #ffffff 0%, #f4f4f6 45%, #ececef 75%, #e2e2e6 100%);
+            border: 2px solid #f8f8fa;
+            border-radius: 90px;
+            padding: 22px 16px 26px 16px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.6), inset 0 2px 6px rgba(255,255,255,0.9);
+        }
+        .cc .r-circle-btn { background: #fbfbfd; border: 1px solid #d8d8de; color: #3f3f46; box-shadow: 0 2px 4px rgba(0,0,0,0.12); }
+        .cc .r-circle-btn:hover { background: #ffffff; color: #18181b; }
+        .cc .r-circle-btn.power { background: #fbfbfd; color: #3f3f46; }
+        .cc .r-circle-btn.voice { background: #1c1c1e; border-color: #1c1c1e; color: #ffffff; }
+        .cc .real-dpad-ring { background: #fbfbfd; border: 1px solid #d8d8de; box-shadow: 0 2px 6px rgba(0,0,0,0.10); margin-bottom: 18px; }
+        .cc .dpad-part { color: #b9b9c2; }
+        .cc .dpad-part:hover { color: #52525b; }
+        .cc .d-center { background: #f4f4f6; border: 1px solid #d8d8de; color: #3f3f46; }
+        .cc-row { display: flex; width: 100%; justify-content: space-between; align-items: center; margin-bottom: 14px; padding: 0 6px; }
+        .cc .r-circle-btn.cc-sm { width: 40px; height: 40px; font-size: 14px; }
+        .cc-app-label { font-size: 9px; font-weight: 700; letter-spacing: 0.2px; color: #3f3f46; }
+        .cc-bottom-row { display: flex; width: 100%; justify-content: space-between; align-items: center; padding: 0 10px; margin-top: 2px; }
+        .cc-led { width: 10px; height: 3px; border-radius: 2px; background: #c9c9d2; }
+        .cc-vol-side {
+            position: absolute; right: -12px; top: 46%;
+            width: 26px; height: 84px;
+            background: #f4f4f6; border: 1px solid #d8d8de; border-radius: 13px;
+            display: flex; flex-direction: column; overflow: hidden;
+            box-shadow: 2px 2px 6px rgba(0,0,0,0.15);
+        }
+        .cc-vol-side .vol-half { color: #3f3f46; font-size: 14px; }
+        .cc-vol-side .vol-half:hover { background: #ffffff; color: #18181b; }
+        .cc-vol-side .vol-half:first-child { border-bottom: 1px solid #d8d8de; }
+        .cc-brand { margin-top: 16px; color: #9ca3af; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; }
+
         /* Key Event Monitor Panel */
         .event-box { flex: 1; min-width: 320px; background: #090d16; border: 1px solid var(--border-color); border-radius: 14px; padding: 20px; }
         .stat-badge { font-size: 26px; font-weight: 700; color: var(--accent-cyan); margin: 6px 0 14px 0; }
@@ -437,7 +471,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 
                 <div class="remote-tester-container">
                     <!-- Real Xiaomi Silver Metallic Remote DOM -->
-                    <div class="real-remote-body">
+                    <div class="real-remote-body" id="remote-xiaomi">
                         <!-- Top Row: Power & Voice -->
                         <div class="remote-top-row">
                             <div class="r-circle-btn power" id="btn-0x66" onclick="openRemapModal(0x66, '电源键')">⏻</div>
@@ -477,6 +511,57 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                             <div class="nfc-icon">N</div>
                             <span style="font-weight: 700; letter-spacing: 1px; font-size: 13px;">xiaomi</span>
                         </div>
+                    </div>
+
+                    <!-- Chromecast / Google TV Remote DOM (real G9N9N layout, white) -->
+                    <div class="real-remote-body cc" id="remote-chromecast" style="display:none">
+                        <!-- Top: circular D-pad + center OK -->
+                        <div class="real-dpad-ring">
+                            <button class="dpad-part d-up" id="cc-btn-0x52" onclick="openRemapModal(0x52, '方向上')">●</button>
+                            <button class="dpad-part d-down" id="cc-btn-0x51" onclick="openRemapModal(0x51, '方向下')">●</button>
+                            <button class="dpad-part d-left" id="cc-btn-0x50" onclick="openRemapModal(0x50, '方向左')">●</button>
+                            <button class="dpad-part d-right" id="cc-btn-0x4F" onclick="openRemapModal(0x4F, '方向右')">●</button>
+                            <button class="dpad-part d-center" id="cc-btn-0x28" onclick="openRemapModal(0x28, '确定键')">OK</button>
+                        </div>
+
+                        <!-- Back + Google Assistant (voice) -->
+                        <div class="cc-row">
+                            <div class="r-circle-btn" id="cc-btn-0xF1" onclick="openRemapModal(0xF1, '返回键')">←</div>
+                            <div class="r-circle-btn voice" id="cc-btn-0x04" onclick="openRemapModal(0x04, '语音键')" title="Google Assistant / 语音键">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:middle;"><circle cx="9" cy="11" r="3.4"/><circle cx="16.5" cy="7.5" r="1.7"/><circle cx="17" cy="13" r="1.2"/><circle cx="12.5" cy="16.5" r="1"/></svg>
+                            </div>
+                        </div>
+
+                        <!-- Home + Mute -->
+                        <div class="cc-row">
+                            <div class="r-circle-btn" id="cc-btn-0x24" onclick="openRemapModal(0x24, '主页键')">⌂</div>
+                            <div class="r-circle-btn" id="cc-btn-0x90" onclick="openRemapModal(0x90, '静音键')" title="静音键">
+                                <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:middle;"><path d="M3 9v6h4l5 4V5L7 9H3z"/><path d="M16 9.5l5 5M21 9.5l-5 5" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
+                            </div>
+                        </div>
+
+                        <!-- YouTube + Netflix -->
+                        <div class="cc-row">
+                            <div class="r-circle-btn" id="cc-btn-0x91" onclick="openRemapModal(0x91, 'YouTube键')" title="YouTube 键"><span class="cc-app-label">YouTube</span></div>
+                            <div class="r-circle-btn" id="cc-btn-0x92" onclick="openRemapModal(0x92, 'Netflix键')" title="Netflix 键"><span class="cc-app-label">NETFLIX</span></div>
+                        </div>
+
+                        <!-- Power + LED + Input/TV -->
+                        <div class="cc-bottom-row">
+                            <div class="r-circle-btn cc-sm power" id="cc-btn-0x66" onclick="openRemapModal(0x66, '电源键')">⏻</div>
+                            <div class="cc-led"></div>
+                            <div class="r-circle-btn cc-sm" id="cc-btn-0xC0" onclick="openRemapModal(0xC0, '电视键')" title="信号源 / 电视键">
+                                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M9 12h7M13.5 9.5L16 12l-2.5 2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            </div>
+                        </div>
+
+                        <!-- Side volume rocker (right edge) -->
+                        <div class="cc-vol-side">
+                            <button class="vol-half" id="cc-btn-0x80" onclick="openRemapModal(0x80, '音量+')">+</button>
+                            <button class="vol-half" id="cc-btn-0x81" onclick="openRemapModal(0x81, '音量-')">−</button>
+                        </div>
+
+                        <div class="cc-brand">Chromecast</div>
                     </div>
 
                     <!-- Live Key Event Telemetry -->
@@ -525,7 +610,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                     <div>
                         <span style="font-size: 16px;">蓝牙遥控器配对与绑定管理</span>
                         <div style="font-size: 12px; color: var(--text-muted); font-weight: normal; margin-top: 4px;">
-                            管理当前 ESP32 记忆的唯一配对目标。如果更换了遥控器或需要重新配对，可在此清空配对信息。
+                            管理 ESP32 记忆的多个配对目标，可在它们之间一键切换；每个遥控器的绑定密钥独立保留。清空将解除全部配对。
                         </div>
                     </div>
                     <div style="display: flex; gap: 8px;">
@@ -545,7 +630,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                         <div id="ble-detail-bat-tip" style="font-size: 13px; color: var(--text-muted); margin-top: 4px;">-</div>
                     </div>
                     <div style="background: #090d16; border: 1px solid var(--border-color); border-radius: 10px; padding: 14px;">
-                        <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">NVS 固化绑定目标 (专属独占)</div>
+                        <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">当前激活绑定 (自动重连此遥控)</div>
                         <div id="ble-detail-bound-info" style="font-size: 16px; font-weight: bold; color: var(--accent-cyan);">正在获取...</div>
                         <div id="ble-detail-bound-mac" style="font-size: 13px; color: var(--text-muted); margin-top: 4px; font-family: monospace;">-</div>
                     </div>
@@ -554,6 +639,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                         <div id="ble-detail-dev-model" style="font-size: 16px; font-weight: bold; color: var(--text-muted);">正在获取...</div>
                         <div id="ble-detail-dev-extra" style="font-size: 12px; color: var(--text-muted); margin-top: 4px; line-height: 1.6;">-</div>
                     </div>
+                </div>
+                <div style="margin-top: 16px;">
+                    <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 8px;">已保存的遥控器（点击「切换」即可改用该遥控器，原遥控器绑定保留可随时切回）</div>
+                    <div id="ble-saved-list" style="color: var(--text-muted);">正在加载...</div>
                 </div>
             </div>
 
@@ -876,7 +965,19 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             <div id="voice-mode-locked-card" style="display:none; background:rgba(59,130,246,0.15); border:2px solid #3b82f6; border-radius:10px; padding:12px 16px; margin-bottom:14px;">
                 <div>
                     <div style="font-size:14px; font-weight:700; color:#93c5fd;">语音对讲专属模式</div>
-                    <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">按住时开启硬件麦克风录音并发送输入法热键，松开时停止录音并释放热键。</div>
+                    <div id="voice-mode-desc" style="font-size:12px; color:var(--text-muted); margin-top:2px;">按住时开启硬件麦克风录音并发送输入法热键，松开时停止录音并释放热键。</div>
+                </div>
+                <div id="voice-toggle-row" style="display:none; margin-top:10px; padding-top:10px; border-top:1px solid rgba(59,130,246,0.35);">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <div>
+                            <b style="font-size:13px; color:#fff;">点按开关（免按住）</b>
+                            <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">按一次开始收音，松手后继续；再按一次结束</div>
+                        </div>
+                        <label class="switch-toggle">
+                            <input type="checkbox" id="toggle-voice-mode" onchange="onVoiceToggleModeChanged(this.checked)">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
                 </div>
             </div>
 
@@ -1300,6 +1401,65 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         let currentSelectedMode = 2;     // 1: Tap, 2: Hold, 4: Consumer, 7: Voice, 9: Switch Layer, 10: Transparent
         let editingBinding = null;
         let clearHighlightTimer = null;
+        let currentRemoteModel = 'xiaomi'; // 'xiaomi' | 'chromecast' — drives the keymap diagram
+        let voiceToggleMode = false;       // Chromecast 开关型语音设置（/api/ble/info 轮询缓存）
+
+        // Button lookup is model-aware: the Xiaomi diagram uses btn-0xXX ids, the
+        // Chromecast diagram uses cc-btn-0xXX. Both share the same MI_KEY codes, so
+        // remapping/telemetry logic is identical; only the visible diagram differs.
+        function remoteBtnEl(hex) {
+            const prefix = (currentRemoteModel === 'chromecast') ? 'cc-btn-' : 'btn-';
+            return document.getElementById(prefix + hex);
+        }
+
+        function detectRemoteModel(d) {
+            const manuf = d.dev_manufacturer || '';
+            const name = d.connected ? (d.name || '') : (d.bound_name || d.name || '');
+            const model = d.dev_model || '';
+            if (manuf.indexOf('Google') >= 0 || name.indexOf('Chromecast') >= 0 || model.indexOf('G9N9N') >= 0) {
+                return 'chromecast';
+            }
+            return 'xiaomi';
+        }
+
+        function setRemoteModel(kind) {
+            if (kind === currentRemoteModel) return;
+            currentRemoteModel = kind;
+            const xm = document.getElementById('remote-xiaomi');
+            const cc = document.getElementById('remote-chromecast');
+            if (xm) xm.style.display = (kind === 'xiaomi') ? '' : 'none';
+            if (cc) cc.style.display = (kind === 'chromecast') ? '' : 'none';
+            updateRemoteVisualTooltips();
+            updateVoiceModeDesc();
+        }
+
+        function updateVoiceModeDesc() {
+            const el = document.getElementById('voice-mode-desc');
+            if (!el) return;
+            el.innerText = (currentRemoteModel === 'chromecast' && voiceToggleMode)
+                ? '点按开关：按一次语音键开始收音并敲击输入法热键，松手后继续录音；再按一次结束并再次敲击热键。'
+                : '按住时开启硬件麦克风录音并发送输入法热键，松开时停止录音并释放热键。';
+        }
+
+        async function onVoiceToggleModeChanged(checked) {
+            const box = document.getElementById('toggle-voice-mode');
+            try {
+                const r = await fetch('/api/ble/voice-mode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: checked })
+                });
+                const d = await r.json();
+                if (!r.ok || d.error) throw new Error(d.error || 'failed');
+                voiceToggleMode = !!d.enabled;
+                if (box) box.checked = voiceToggleMode;
+                updateVoiceModeDesc();
+                showToast(voiceToggleMode ? '已启用点按开关语音：按一次开始，再按一次结束' : '已恢复按住说话模式');
+            } catch (e) {
+                if (box) box.checked = voiceToggleMode;
+                showToast('语音模式设置失败：' + e.message, true);
+            }
+        }
 
         const KEY_NAMES = {
             0x66: '电源键',
@@ -1318,7 +1478,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             0x80: '音量+',
             0x81: '音量-',
             0xC0: '电视键',
-            0x35: '电视键'
+            0x35: '电视键',
+            0x90: '静音键',
+            0x91: 'YouTube键',
+            0x92: 'Netflix键'
         };
 
         // DOM Key -> USB HID Keyboard Code Map
@@ -1531,7 +1694,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                     if (vk === 0x65) targetHex = '0x5D';
                     if (vk === 0x35) targetHex = '0xC0';
 
-                    const btnEl = document.getElementById(`btn-${targetHex}`);
+                    const btnEl = remoteBtnEl(targetHex);
                     if (btnEl) {
                         document.getElementById('live-key-name').innerText = btnName;
                         btnEl.classList.add('pressed');
@@ -1558,7 +1721,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             0x5D: { source_vk: 0x5D, has_click: true, click_type: 1, click_mod: 0, click_key: 44, click_cons: 0, has_long: false, long_ms: 600, long_type: 0, long_mod: 0, long_key: 0, long_cons: 0, has_double: false, double_ms: 250, double_type: 0, double_mod: 0, double_key: 0, double_cons: 0 },
             0x80: { source_vk: 0x80, has_click: true, click_type: 4, click_mod: 0, click_key: 0, click_cons: 0x00E9, has_long: false, long_ms: 600, long_type: 0, long_mod: 0, long_key: 0, long_cons: 0, has_double: false, double_ms: 250, double_type: 0, double_mod: 0, double_key: 0, double_cons: 0 },
             0x81: { source_vk: 0x81, has_click: true, click_type: 4, click_mod: 0, click_key: 0, click_cons: 0x00EA, has_long: false, long_ms: 600, long_type: 0, long_mod: 0, long_key: 0, long_cons: 0, has_double: false, double_ms: 250, double_type: 0, double_mod: 0, double_key: 0, double_cons: 0 },
-            0xC0: { source_vk: 0xC0, has_click: true, click_type: 1, click_mod: 0, click_key: 65, click_cons: 0, has_long: false, long_ms: 600, long_type: 0, long_mod: 0, long_key: 0, long_cons: 0, has_double: false, double_ms: 250, double_type: 0, double_mod: 0, double_key: 0, double_cons: 0 }
+            0xC0: { source_vk: 0xC0, has_click: true, click_type: 1, click_mod: 0, click_key: 65, click_cons: 0, has_long: false, long_ms: 600, long_type: 0, long_mod: 0, long_key: 0, long_cons: 0, has_double: false, double_ms: 250, double_type: 0, double_mod: 0, double_key: 0, double_cons: 0 },
+            0x90: { source_vk: 0x90, has_click: true, click_type: 4, click_mod: 0, click_key: 0, click_cons: 0x00E2, has_long: false, long_ms: 600, long_type: 0, long_mod: 0, long_key: 0, long_cons: 0, has_double: false, double_ms: 250, double_type: 0, double_mod: 0, double_key: 0, double_cons: 0 },
+            0x91: { source_vk: 0x91, has_click: true, click_type: 0, click_mod: 0, click_key: 0, click_cons: 0, has_long: false, long_ms: 600, long_type: 0, long_mod: 0, long_key: 0, long_cons: 0, has_double: false, double_ms: 250, double_type: 0, double_mod: 0, double_key: 0, double_cons: 0 },
+            0x92: { source_vk: 0x92, has_click: true, click_type: 0, click_mod: 0, click_key: 0, click_cons: 0, has_long: false, long_ms: 600, long_type: 0, long_mod: 0, long_key: 0, long_cons: 0, has_double: false, double_ms: 250, double_type: 0, double_mod: 0, double_key: 0, double_cons: 0 }
         };
 
         function getActionSummaryText(type, mod, key, cons, target_layer, mac) {
@@ -1797,13 +1963,13 @@ if (mod & 0x01) parts.push('左Ctrl');
 
         function updateRemoteVisualTooltips() {
             normalizeKeymapConfig();
-            const vkList = [0x66, 0x04, 0x52, 0x51, 0x50, 0x4F, 0x28, 0xF1, 0x24, 0x5D, 0x80, 0x81, 0xC0];
+            const vkList = [0x66, 0x04, 0x52, 0x51, 0x50, 0x4F, 0x28, 0xF1, 0x24, 0x5D, 0x80, 0x81, 0xC0, 0x90, 0x91, 0x92];
             const curLayer = currentKeymap.layers[currentEditingLayer] || currentKeymap.layers[0];
             const layer0 = currentKeymap.layers[0];
 
             vkList.forEach(vk => {
                 const hex = '0x' + vk.toString(16).toUpperCase().padStart(2, '0');
-                const el = document.getElementById(`btn-${hex}`);
+                const el = remoteBtnEl(hex);
                 if (!el) return;
 
                 const b0 = (layer0.bindings && layer0.bindings.find(x => x.source_vk === vk)) || FACTORY_KEYMAP[vk];
@@ -1863,14 +2029,33 @@ if (mod & 0x01) parts.push('左Ctrl');
             });
         }
 
+        function mergeFactoryDefaults() {
+            normalizeKeymapConfig();
+            const layer0 = currentKeymap.layers[0];
+            if (!layer0.bindings) layer0.bindings = [];
+            let added = false;
+            for (const vk in FACTORY_KEYMAP) {
+                const key = Number(vk);
+                if (!layer0.bindings.some(b => b.source_vk === key)) {
+                    layer0.bindings.push(JSON.parse(JSON.stringify(FACTORY_KEYMAP[vk])));
+                    added = true;
+                }
+            }
+            return added;
+        }
+
         async function loadKeymap() {
             try {
                 const res = await fetch('/api/keymap');
                 currentKeymap = await res.json();
                 normalizeKeymapConfig();
+                const added = mergeFactoryDefaults();
                 renderLayerTabs();
                 renderLayerCard();
                 updateRemoteVisualTooltips();
+                if (added && await saveKeymapToServer()) {
+                    showToast('已启用新增按键：静音 / YouTube / Netflix');
+                }
             } catch(e){}
         }
 
@@ -2121,7 +2306,9 @@ if (mod & 0x01) parts.push('左Ctrl');
                     if (!skipRender) renderTriggerView(2, curMod, curKey, 0);
                     startKeyboardRecording();
                 } else if (mode === 7) {
-if (inst) inst.innerHTML = '<b>语音按键快捷键</b>：敲击键盘录制录音时发送的快捷键（默认 右Alt+,；支持左/右 Alt、Ctrl、Shift、Win 组合）';
+if (inst) inst.innerHTML = (currentRemoteModel === 'chromecast' && voiceToggleMode)
+    ? '<b>语音按键快捷键</b>：开关模式下开始与结束录音时各轻点一次该热键（输入法按「按住=对讲、轻点=开关」区分，与小米共用同一热键）'
+    : '<b>语音按键快捷键</b>：敲击键盘录制录音时发送的快捷键（默认 右Alt+,；支持左/右 Alt、Ctrl、Shift、Win 组合）';
                     let curKey = (curCode > 0 && curCode < 500) ? curCode : ((curMod > 0) ? 0 : 54);
                     if (!skipRender) renderTriggerView(7, (curMod || curKey) ? curMod : 64, curKey, 0);
                     startKeyboardRecording();
@@ -2451,6 +2638,12 @@ if (mod & 0x01) chips.push('左Ctrl');
                 document.getElementById('voice-mode-locked-card').style.display = 'block';
                 document.getElementById('long-press-header').style.display = 'none';
                 document.getElementById('double-click-header').style.display = 'none';
+                // 开关型语音仅 Chromecast 支持；小米保持按住说话，不显示开关。
+                const ccToggleRow = document.getElementById('voice-toggle-row');
+                if (ccToggleRow) ccToggleRow.style.display = (currentRemoteModel === 'chromecast') ? 'block' : 'none';
+                const ccToggle = document.getElementById('toggle-voice-mode');
+                if (ccToggle) ccToggle.checked = voiceToggleMode;
+                updateVoiceModeDesc();
                 currentTriggerTab = 'click';
                 selectActionMode(7, true);
                 // A missing click_key means "modifier only" (e.g. bare Alt),
@@ -2648,7 +2841,9 @@ if (mod & 0x01) chips.push('左Ctrl');
             try {
                 const res = await fetch('/api/ble/info');
                 const d = await res.json();
-                
+                setRemoteModel(detectRemoteModel(d));
+                voiceToggleMode = !!d.voice_toggle;
+
                 // Update top/side status
                 const statBleState = document.getElementById('stat-ble-state');
                 const statBleName = document.getElementById('stat-ble-name');
@@ -2722,7 +2917,7 @@ if (mod & 0x01) chips.push('左Ctrl');
                     if (d.bound_mac && d.bound_mac.length > 0) {
                         boundInfoEl.innerText = d.bound_name || '已绑定遥控器';
                         boundInfoEl.style.color = 'var(--accent-cyan)';
-                        boundMacEl.innerText = `MAC: ${d.bound_mac} (已固化，仅响应此遥控器)`;
+                        boundMacEl.innerText = `MAC: ${d.bound_mac} (激活中，自动重连此遥控器)`;
                     } else {
                         boundInfoEl.innerText = '未绑定任何遥控器';
                         boundInfoEl.style.color = 'var(--text-muted)';
@@ -2746,6 +2941,7 @@ if (mod & 0x01) chips.push('左Ctrl');
                         devExtraEl.innerText = d.connected ? '等待 0x180A 设备信息服务响应' : '设备离线时无法读取';
                     }
                 }
+                refreshSavedRemotes();
             } catch (e) {}
         }
 
@@ -2850,6 +3046,74 @@ if (mod & 0x01) chips.push('左Ctrl');
                     btnEl.disabled = false;
                     btnEl.innerText = '连接并绑定';
                 }
+            }
+        }
+
+        async function refreshSavedRemotes() {
+            const container = document.getElementById('ble-saved-list');
+            if (!container) return;
+            try {
+                const res = await fetch('/api/ble/saved');
+                const d = await res.json();
+                const list = d.remotes || [];
+                if (list.length === 0) {
+                    container.innerHTML = '<div style="color:var(--text-muted); font-size:13px;">暂无已保存的遥控器，扫描并连接后会自动记忆。</div>';
+                    return;
+                }
+                let html = '<div style="display:grid; gap:8px;">';
+                list.forEach(r => {
+                    const safeName = (r.name || 'Remote').replace(/'/g, "\\'").replace(/"/g, "&quot;");
+                    html += `<div style="display:flex; justify-content:space-between; align-items:center; background:#0b0f17; padding:10px 12px; border-radius:8px; border:1px solid ${r.active ? 'var(--accent-cyan)' : '#243247'};">
+                        <div>
+                            <b>${r.name || 'Remote'}</b> ${r.active ? '<span class="badge" style="background:rgba(6,182,212,0.2); color:var(--accent-cyan); margin-left:6px;">当前激活</span>' : ''}
+                            <div style="font-size:12px; color:var(--text-muted); font-family:monospace; margin-top:2px;">${r.mac} | ${r.type === 0 ? 'Public' : 'Random'}</div>
+                        </div>
+                        <div style="display:flex; gap:6px;">
+                            ${r.active ? '' : `<button class="btn" style="padding:5px 12px; font-size:12px;" onclick="switchRemote('${r.mac}', this)">切换</button>`}
+                            <button class="btn btn-danger" style="padding:5px 12px; font-size:12px;" onclick="removeRemote('${r.mac}', '${safeName}')">删除</button>
+                        </div>
+                    </div>`;
+                });
+                html += '</div>';
+                container.innerHTML = html;
+            } catch (e) {
+                container.innerText = '加载失败: ' + e;
+            }
+        }
+
+        async function switchRemote(mac, btnEl) {
+            if (btnEl) { btnEl.disabled = true; btnEl.innerText = '切换中...'; }
+            showToast('正在切换到 ' + mac + ' ...');
+            try {
+                const res = await fetch('/api/ble/switch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mac: mac })
+                });
+                const d = await res.json();
+                showToast(d.status === 'ok' ? '已下发切换指令，正在连接目标遥控器...' : '切换失败: ' + (d.error || '该遥控器未保存'));
+            } catch (e) {
+                showToast('请求错误: ' + e);
+            } finally {
+                setTimeout(refreshBleInfo, 600);
+                setTimeout(refreshLogs, 600);
+            }
+        }
+
+        async function removeRemote(mac, name) {
+            if (!confirm('确定删除已保存的遥控器【' + name + '】吗？\n\n将清除其配对密钥。若删除的是当前激活遥控器，设备会回到自由配对模式。')) return;
+            try {
+                const res = await fetch('/api/ble/remove', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mac: mac })
+                });
+                const d = await res.json();
+                showToast(d.status === 'ok' ? '已删除 ' + name : '删除失败: ' + (d.error || '该遥控器未保存'));
+            } catch (e) {
+                showToast('请求错误: ' + e);
+            } finally {
+                setTimeout(refreshBleInfo, 400);
             }
         }
 

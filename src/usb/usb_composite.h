@@ -86,6 +86,10 @@ bool usb_hid_consumer_release(void);
 void usb_voice_action_set_ready(bool ready);
 void usb_voice_action_invalidate(void);
 bool usb_voice_action_is_active(void);
+// When true, the configured voice hotkey is sent as a tap on start and a tap on
+// stop (toggle IME) instead of press-and-hold. Set by the BLE layer for
+// Chromecast toggle mode; the host IME distinguishes tap from hold itself.
+void usb_voice_set_toggle_hotkey(bool on);
 
 /**
  * @brief Enqueue an atomic USB HID Consumer Tap.

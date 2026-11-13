@@ -130,6 +130,9 @@ static uint32_t s_voice_usb_claim_skips0 = 0;
 static bool s_voice_drain_pending = false;
 static uint32_t s_voice_release_ms = 0;
 static bool s_voice_hid_active = false;
+static bool s_voice_toggle_hotkey = false;
+static uint8_t s_voice_hotkey_mod = 0;
+static uint8_t s_voice_hotkey_key = 0;
 static remotemapper::ble::VoiceActionGate s_voice_action_gate;
 static portMUX_TYPE s_voice_action_gate_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -1200,7 +1203,12 @@ void usb_hid_dispatch_action(const key_action_t *action) {
             ++s_voice_diag_seq;
             s_voice_press_ms = millis();
             const bool hid_active = action->modifier != 0 || action->key_code != 0;
+            const bool toggle_hotkey = s_voice_toggle_hotkey;
             s_voice_hid_active = hid_active;
+            if (toggle_hotkey && hid_active) {
+                s_voice_hotkey_mod = action->modifier;
+                s_voice_hotkey_key = action->key_code;
+            }
             audio_pipeline_start_session(&g_audio_pipeline, 0);
             portEXIT_CRITICAL(&s_voice_state_mux);
             if (ended_previous_drain) {
@@ -1209,8 +1217,14 @@ void usb_hid_dispatch_action(const key_action_t *action) {
                         (unsigned)old_remaining);
             }
             if (hid_active) {
-                guard_add(action->modifier, action->key_code, 0, true);
-                usb_hid_keyboard_press(action->modifier, action->key_code);
+                if (toggle_hotkey) {
+                    // Toggle start: one tap of the same voice hotkey; the host
+                    // IME tells tap (toggle) from hold (push-to-talk) itself.
+                    usb_hid_keyboard_tap(action->modifier, action->key_code);
+                } else {
+                    guard_add(action->modifier, action->key_code, 0, true);
+                    usb_hid_keyboard_press(action->modifier, action->key_code);
+                }
             }
             break;
         }
@@ -1224,19 +1238,33 @@ void usb_hid_dispatch_action(const key_action_t *action) {
             uint32_t press_ms = 0;
             uint32_t release_ms = 0;
             bool hid_was_active = false;
+            bool toggle_hotkey = false;
+            uint8_t hotkey_mod = 0;
+            uint8_t hotkey_key = 0;
             portENTER_CRITICAL(&s_voice_state_mux);
             release_ms = millis();
             sequence = s_voice_diag_seq;
             press_ms = s_voice_press_ms;
             hid_was_active = s_voice_hid_active;
+            toggle_hotkey = s_voice_toggle_hotkey;
+            hotkey_mod = s_voice_hotkey_mod;
+            hotkey_key = s_voice_hotkey_key;
             s_voice_hid_active = false;
             s_voice_release_ms = release_ms;
-            s_voice_drain_pending = hid_was_active && audio_pipeline_is_active(&g_audio_pipeline);
-            if (!hid_was_active) audio_pipeline_stop_session(&g_audio_pipeline);
+            if (toggle_hotkey) {
+                // Toggle stop: the second hotkey tap closes the host IME, so no
+                // tail audio needs draining; close the pipeline immediately.
+                s_voice_drain_pending = false;
+                audio_pipeline_stop_session(&g_audio_pipeline);
+            } else {
+                s_voice_drain_pending = hid_was_active && audio_pipeline_is_active(&g_audio_pipeline);
+                if (!hid_was_active) audio_pipeline_stop_session(&g_audio_pipeline);
+            }
             portEXIT_CRITICAL(&s_voice_state_mux);
             guard_clear_voice();
             if (hid_was_active) {
-                usb_hid_keyboard_release();
+                if (toggle_hotkey) usb_hid_keyboard_tap(hotkey_mod, hotkey_key);
+                else usb_hid_keyboard_release();
             }
             {
                 uint32_t samples = 0, nonzero = 0;
@@ -1265,6 +1293,19 @@ void usb_hid_dispatch_action(const key_action_t *action) {
     key_engine_unlock_state(&g_key_engine);
 }
 
+void usb_voice_set_toggle_hotkey(bool on) {
+    extern key_mapper_engine_t g_key_engine;
+    key_engine_lock_state(&g_key_engine);
+    portENTER_CRITICAL(&s_voice_state_mux);
+    s_voice_toggle_hotkey = on;
+    if (!on) {
+        s_voice_hotkey_mod = 0;
+        s_voice_hotkey_key = 0;
+    }
+    portEXIT_CRITICAL(&s_voice_state_mux);
+    key_engine_unlock_state(&g_key_engine);
+}
+
 void usb_voice_action_set_ready(bool ready) {
     extern key_mapper_engine_t g_key_engine;
     key_engine_lock_state(&g_key_engine);
@@ -1289,12 +1330,18 @@ void usb_voice_action_invalidate(void) {
     // a MIC_OPEN failure if the keymap changes before the physical UP report.
     portENTER_CRITICAL(&s_voice_state_mux);
     const bool hid_was_active = s_voice_hid_active;
+    const bool toggle_hotkey = s_voice_toggle_hotkey;
+    const uint8_t hotkey_mod = s_voice_hotkey_mod;
+    const uint8_t hotkey_key = s_voice_hotkey_key;
     s_voice_hid_active = false;
     s_voice_drain_pending = false;
     audio_pipeline_stop_session(&g_audio_pipeline);
     portEXIT_CRITICAL(&s_voice_state_mux);
     guard_clear_voice();
-    if (hid_was_active) usb_hid_keyboard_release();
+    if (hid_was_active) {
+        if (toggle_hotkey) usb_hid_keyboard_tap(hotkey_mod, hotkey_key);
+        else usb_hid_keyboard_release();
+    }
     led_indicator_set(ble_remote_get_state() >= BLE_STATE_CONNECTED
             ? LED_STATE_CONNECTED : LED_STATE_WAIT_CONNECTION);
     app_log("VOICE", "Voice hold released after BLE readiness loss");

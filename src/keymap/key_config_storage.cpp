@@ -142,7 +142,8 @@ static bool valid_source_vk(uint32_t vk) {
         case MI_KEY_UP: case MI_KEY_DOWN: case MI_KEY_LEFT: case MI_KEY_RIGHT:
         case MI_KEY_OK: case MI_KEY_BACK: case MI_KEY_HOME: case MI_KEY_HOME_ALT:
         case MI_KEY_MENU: case MI_KEY_MENU_ALT: case MI_KEY_VOL_UP: case MI_KEY_VOL_DOWN:
-        case MI_KEY_TV: case MI_KEY_TV_ALT: return true;
+        case MI_KEY_TV: case MI_KEY_TV_ALT:
+        case MI_KEY_MUTE: case MI_KEY_YOUTUBE: case MI_KEY_NETFLIX: return true;
         default: return false;
     }
 }

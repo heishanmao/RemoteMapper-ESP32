@@ -53,6 +53,14 @@ static uint8_t                         s_bound_addr_type = BLE_ADDR_RANDOM;
 static String                          s_connected_name = "";
 static String                          s_connected_mac = "";
 
+// HID report dialect of the connected remote. Xiaomi sends standard keyboard /
+// consumer reports keyed by raw HID usage; Chromecast (Google) Report 1 carries
+// 1-based indices into a fixed consumer usage table. Detected from the DIS
+// manufacturer string during handshake; defaults to Xiaomi so an unreadable DIS
+// never changes the daily-driver's decoding path.
+enum RemoteProtocol : uint8_t { REMOTE_XIAOMI = 0, REMOTE_CHROMECAST = 1 };
+static RemoteProtocol                  s_remote_protocol = REMOTE_XIAOMI;
+
 // In-memory discovered BLE device cache (thread-safe, fed by Core 0 continuous scan)
 #define BLE_DISCOVERY_LIMIT 30
 #define BLE_NAME_MAX_LEN 64
@@ -103,6 +111,88 @@ static String sanitize_ble_name(const String& in) {
     return out;
 }
 
+// Multi-remote saved bindings. The active binding still lives in bound_* (so
+// auto-reconnect and the strict scan filter are unchanged); this list is an
+// additive superset that remembers every paired remote so adding a new one
+// never erases the previous daily-driver. Persisted as a JSON array in NVS.
+#define BLE_SAVED_MAX 4
+struct SavedRemote { String mac; String name; uint8_t type; };
+static SavedRemote s_saved[BLE_SAVED_MAX];
+static size_t      s_saved_count = 0;
+
+static int saved_list_find(const String& mac) {
+    for (size_t i = 0; i < s_saved_count; ++i) {
+        if (s_saved[i].mac.equalsIgnoreCase(mac)) return (int)i;
+    }
+    return -1;
+}
+
+static void saved_list_persist() {
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (size_t i = 0; i < s_saved_count; ++i) {
+        JsonObject o = arr.add<JsonObject>();
+        o["mac"] = s_saved[i].mac;
+        o["name"] = s_saved[i].name;
+        o["type"] = (int)s_saved[i].type;
+    }
+    String out;
+    serializeJson(doc, out);
+    s_ble_prefs.putString("saved_list", out);
+}
+
+static void saved_list_upsert(const String& mac, const String& name, uint8_t type) {
+    if (mac.length() == 0) return;
+    bool named = (name.length() > 0 && name != "Unnamed BLE Device");
+    bool changed = false;
+    int idx = saved_list_find(mac);
+    if (idx >= 0) {
+        if (named && s_saved[idx].name != name) { s_saved[idx].name = name; changed = true; }
+        if (s_saved[idx].type != type) { s_saved[idx].type = type; changed = true; }
+    } else {
+        if (s_saved_count >= BLE_SAVED_MAX) {
+            // Full: evict the oldest non-active slot; never evict the active one.
+            int victim = -1;
+            for (size_t i = 0; i < s_saved_count; ++i) {
+                if (!s_saved[i].mac.equalsIgnoreCase(s_bound_mac)) { victim = (int)i; break; }
+            }
+            if (victim < 0) return;
+            idx = victim;
+        } else {
+            idx = (int)s_saved_count++;
+        }
+        s_saved[idx].mac = mac;
+        s_saved[idx].name = named ? name : String("Remote");
+        s_saved[idx].type = type;
+        changed = true;
+    }
+    if (changed) saved_list_persist();
+}
+
+static void saved_list_load() {
+    s_saved_count = 0;
+    String raw = s_ble_prefs.getString("saved_list", "");
+    if (raw.length() > 0) {
+        JsonDocument doc;
+        if (deserializeJson(doc, raw) == DeserializationError::Ok && doc.is<JsonArray>()) {
+            for (JsonObject o : doc.as<JsonArray>()) {
+                if (s_saved_count >= BLE_SAVED_MAX) break;
+                String mac = o["mac"] | "";
+                if (mac.length() == 0) continue;
+                s_saved[s_saved_count].mac = mac;
+                s_saved[s_saved_count].name = o["name"] | "Remote";
+                s_saved[s_saved_count].type = (uint8_t)(o["type"] | 0);
+                s_saved_count++;
+            }
+        }
+    }
+    // Migration: a firmware upgrade from single-binding must keep the existing
+    // active remote (e.g. the Xiaomi daily-driver) present in the saved list.
+    if (s_bound_mac.length() > 0 && saved_list_find(s_bound_mac) < 0) {
+        saved_list_upsert(s_bound_mac, s_bound_name, s_bound_addr_type);
+    }
+}
+
 // Asynchronous Request flags from other tasks (e.g. WebServer on Core 1)
 static volatile bool                   s_req_unpair = false;
 static volatile bool                   s_req_reconnect = false;
@@ -130,6 +220,23 @@ static remotemapper::ble::MicSessionOwner s_mic_owner = {1, 0, 0, false, false, 
 static bool                            s_req_mic_stop = false;
 static uint32_t                        s_req_mic_stop_epoch = 0;
 static uint32_t                        s_voice_hogp_epoch = 0; // NimBLE host task only
+// Chromecast emits a spurious AUDIO_STOP (0x08) ~1ms after AUDIO_START, before
+// any audio streams; the real end is MIC_CLOSED (0x00) on button release. Ignore
+// that early 0x08 within this window so hold-to-talk stays open while audio flows.
+// Reset on connect; Xiaomi never uses this.
+#define CHROMECAST_EARLY_STOP_IGNORE_MS 300
+static uint32_t                        s_voice_start_ms = 0; // NimBLE host task only
+
+// Chromecast toggle (开关型) voice. The remote's mic is software-controlled: after
+// the physical release we re-issue MIC_OPEN and the firmware opens a host-owned
+// stream (AUDIO_START reason=0/stream=0) that keeps flowing until MIC_CLOSE.
+// Xiaomi is hold-only and never enters these paths (toggle_enabled() is false).
+static bool                            s_voice_toggle_mode = false;      // NVS user setting
+static bool                            s_toggle_session = false;         // toggle session open
+static bool                            s_toggle_software_stream = false; // on host-opened (0,0) stream
+static inline bool toggle_enabled(void) {
+    return s_voice_toggle_mode && s_remote_protocol == REMOTE_CHROMECAST;
+}
 static bool                            s_voice_timeout_pending = false;
 static uint32_t                        s_voice_timeout_generation = 0;
 static uint32_t                        s_voice_timeout_since_ms = 0;
@@ -239,6 +346,27 @@ static void write_hogp_mic_close(const remotemapper::ble::MicCloseCommand &comma
     s_ble_state = BLE_STATE_CONNECTED;
     app_log("ATVV", "MIC_CLOSE {0x0D,0x%02X} on Voice key release",
             (unsigned)command.session_id);
+}
+
+// Close a Chromecast toggle session: release the local voice action (host toggle
+// tap + pipeline stop) and MIC_CLOSE the open stream. Only called when a toggle
+// session is actually open; hold/Xiaomi never reach it.
+static void end_toggle_session(uint32_t now_ms, const char* reason) {
+    remotemapper::ble::MicCloseCommand close_command = {};
+    key_engine_lock_state(&g_key_engine);
+    portENTER_CRITICAL(&s_mic_control_mux);
+    s_toggle_session = false;
+    s_toggle_software_stream = false;
+    const bool write_close = remotemapper::ble::prepare_mic_close(
+            s_mic_owner, s_mic_owner.epoch, &close_command);
+    s_voice_hogp_epoch = 0;
+    s_voice_start_rejected = false;
+    portEXIT_CRITICAL(&s_mic_control_mux);
+    key_engine_feed_key(&g_key_engine, MI_KEY_VOICE, false, now_ms);
+    key_engine_unlock_state(&g_key_engine);
+    if (write_close) write_hogp_mic_close(close_command);
+    else s_ble_state = BLE_STATE_CONNECTED;
+    app_log("ATVV", "Toggle session ended (%s)", reason);
 }
 
 static void restore_mic_stop_request(uint32_t expected_epoch) {
@@ -633,8 +761,21 @@ static void on_ctl_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, siz
     s_last_link_rx_ms = millis();
     uint8_t op = pData[0];
 
+    // Chromecast session-lifecycle trace (START/STOP/CLOSED); skip SYNC/CAPS spam.
+    if (s_remote_protocol == REMOTE_CHROMECAST && (op == 0x04 || op == 0x08 || op == 0x00)) {
+        char hex[32];
+        size_t n = length < 8 ? length : 8;
+        for (size_t i = 0; i < n; i++) snprintf(hex + i * 3, 4, "%02X ", pData[i]);
+        app_log("ATVV_RAW", "CTL op=0x%02X len=%d: %s", op, (int)length, hex);
+    }
+
     // AUDIO_START with HTT reason: byte1 == 0x03
     if (op == 0x04 && length >= 2 && pData[1] == 0x03) {
+        // A second physical press while a toggle session is open ends it.
+        if (toggle_enabled() && s_toggle_session) {
+            end_toggle_session(millis(), "second_press");
+            return;
+        }
         // A physical AUDIO_START begins a fresh diagnostic session. In
         // particular, discard idle time between button presses from the first
         // interval and the reported frames-per-second window.
@@ -646,6 +787,7 @@ static void on_ctl_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, siz
         portEXIT_CRITICAL(&s_rx_mux);
         const uint8_t session_id = (length >= 4) ? pData[3] : 0;
         s_last_audio_ms = millis();
+        s_voice_start_ms = millis();
         // BLE owns decoder/filter/resampler state. Publish the new epoch and
         // reset producer state here before key-engine delivery starts USB audio.
         key_engine_lock_state(&g_key_engine);
@@ -691,9 +833,58 @@ static void on_ctl_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, siz
             s_ble_state = BLE_STATE_TALKING;
             app_log("ATVV", ">>> Voice button PRESSED (session %d)", session_id);
         }
+        s_toggle_session = toggle_enabled() && !rejected_voice_start;
+        s_toggle_software_stream = false;
+    }
+    // Host-opened software mic stream (AUDIO_START reason=0 / stream=0). Only
+    // meaningful in toggle mode after we re-issued MIC_OPEN on physical release;
+    // it carries audio while the button is up. Hold/Xiaomi never produce it.
+    else if (op == 0x04 && length >= 4 && pData[1] == 0x00 && pData[3] == 0x00) {
+        if (toggle_enabled() && s_toggle_session) {
+            s_toggle_software_stream = true;
+            // Same spurious-0x08 guard as the physical start: a stop arriving
+            // right after the software stream opens is not a second press.
+            s_voice_start_ms = millis();
+            portENTER_CRITICAL(&s_mic_control_mux);
+            s_mic_owner.active = true;
+            s_mic_owner.open = true;
+            s_mic_owner.session_id = 0;
+            portEXIT_CRITICAL(&s_mic_control_mux);
+            s_ble_state = BLE_STATE_TALKING;
+            app_log("ATVV", "Toggle: software mic stream (0,0) open, continuing after release");
+        }
+        return;
     }
     // AUDIO_STOP / MIC_CLOSED / release op (0x00 or 0x08):
     else if (op == 0x00 || op == 0x08) {
+        // Chromecast sends a spurious AUDIO_STOP (0x08) ~1ms after AUDIO_START,
+        // before any audio streams; the real end is MIC_CLOSED (0x00) on release.
+        // Ignore that early 0x08 so the hold-to-talk session stays open while audio
+        // flows. Xiaomi keeps both stop ops unchanged.
+        if (s_remote_protocol == REMOTE_CHROMECAST && op == 0x08 &&
+            s_voice_start_ms != 0 && (millis() - s_voice_start_ms) < CHROMECAST_EARLY_STOP_IGNORE_MS) {
+            app_log("ATVV", "Chromecast early AUDIO_STOP (0x08) ignored (%ums after START)",
+                    (unsigned)(millis() - s_voice_start_ms));
+            return;
+        }
+        // Toggle mode: physical release keeps the mic alive via a host MIC_OPEN;
+        // only a second press (HTT start above, or search while on the software
+        // stream) or a device-ended stop closes the session.
+        if (toggle_enabled() && s_toggle_session) {
+            if (op == 0x08) {
+                if (s_toggle_software_stream) end_toggle_session(millis(), "second_press");
+                return;
+            }
+            if (length >= 2 && pData[1] == 0x02) {
+                s_toggle_software_stream = false;
+                const uint8_t codec = atvv_select_codec(s_caps_codec_mask);
+                (void)write_hogp_mic_open(s_mic_owner.epoch, s_caps_version, codec);
+                app_log("ATVV", "Toggle: physical release -> MIC_OPEN to keep streaming");
+                return;
+            }
+            end_toggle_session(millis(), "device_ended");
+            return;
+        }
         key_engine_lock_state(&g_key_engine);
         portENTER_CRITICAL(&s_mic_control_mux);
         // The deployed ATVV stop variants do not have one stable session-id
@@ -771,6 +962,32 @@ static void on_ctl_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, siz
 
 static uint8_t s_last_hogp_key = 0;
 
+// Chromecast Report 1 (descriptor: Report Count 2, Report Size 8) carries two
+// 1-based indices into this fixed consumer usage table; 0 marks a released slot.
+// Map each index to the same internal MI_KEY codes the Xiaomi path uses so the
+// key engine, keymap and USB output stay shared. Verified against real hardware:
+// index 0x03 = Up, 0x0B = Back. Indices without an existing MI_KEY (play, mute,
+// search, YouTube, Netflix, stop) return 0 and are ignored for now.
+static uint8_t chromecast_index_to_key(uint8_t idx) {
+    switch (idx) {
+        case 1:  return MI_KEY_POWER;     // 0x019E Power
+        case 3:  return MI_KEY_UP;        // 0x0042 Up
+        case 4:  return MI_KEY_DOWN;      // 0x0043 Down
+        case 5:  return MI_KEY_LEFT;      // 0x0044 Left
+        case 6:  return MI_KEY_RIGHT;     // 0x0045 Right
+        case 7:  return MI_KEY_OK;        // 0x0041 OK
+        case 8:  return MI_KEY_MUTE;      // 0x00E2 Mute
+        case 10: return MI_KEY_HOME;      // 0x0223 Home
+        case 11: return MI_KEY_BACK;      // 0x0224 Back
+        case 12: return MI_KEY_VOL_UP;    // 0x00E9 Volume Up
+        case 13: return MI_KEY_VOL_DOWN;  // 0x00EA Volume Down
+        case 14: return MI_KEY_YOUTUBE;   // YouTube shortcut
+        case 15: return MI_KEY_NETFLIX;   // Netflix shortcut
+        case 17: return MI_KEY_TV;        // 0x0089 Input
+        default: return 0;
+    }
+}
+
 // HOGP HID Report Notification Callback
 static void on_hogp_report_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
     if (length < 1) return;
@@ -803,7 +1020,23 @@ static void on_hogp_report_notify(NimBLERemoteCharacteristic* pChar, uint8_t* pD
     uint8_t raw_key = 0;
     bool is_pressed = false;
 
-    if (length == 8) {
+    if (s_remote_protocol == REMOTE_CHROMECAST) {
+        // Google Report 1: up to two 1-based usage indices, 0 = released slot.
+        // The value arrives without a report-ID byte; the device may pad to 8
+        // bytes but only the first two are slots. Take the first pressed index.
+        uint8_t idx = pData[0];
+        if (idx == 0 && length >= 2) idx = pData[1];
+        if (idx != 0) {
+            raw_key = chromecast_index_to_key(idx);
+            is_pressed = (raw_key != 0);
+            if (raw_key == 0) {
+                app_log("HOGP", "Chromecast index %u has no key mapping (ignored)", (unsigned)idx);
+            }
+        } else {
+            raw_key = s_last_hogp_key;
+            is_pressed = false;
+        }
+    } else if (length == 8) {
         // Standard 8-byte Keyboard Report: [modifiers, reserved, key0..key5]
         if (pData[2] != 0) {
             raw_key = pData[2];
@@ -1124,6 +1357,10 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         s_dev_fw = "";
         s_dev_sw = "";
           s_last_hogp_key = 0;
+          s_voice_start_ms = 0;
+          s_toggle_session = false;
+          s_toggle_software_stream = false;
+          usb_voice_set_toggle_hotkey(false);
           portENTER_CRITICAL(&s_mic_control_mux);
           remotemapper::ble::disconnect_mic_owner(s_mic_owner);
           s_req_mic_stop = false;
@@ -1550,6 +1787,11 @@ static bool do_connect_adv_device(NimBLEAdvertisedDevice* advDevice) {
     // subscription burst is done, because an LL connection update issued during
     // GATT traffic is what previously killed the link mid-handshake.
 
+    s_remote_protocol = REMOTE_XIAOMI;   // re-detected from DIS during handshake
+    s_voice_start_ms = 0;
+    s_toggle_session = false;
+    s_toggle_software_stream = false;
+    usb_voice_set_toggle_hotkey(false);
     s_connected_name = sanitize_ble_name(advDevice->getName().c_str());
     s_connected_mac = advDevice->getAddress().toString().c_str();
     s_bound_addr_type = advDevice->getAddress().getType();
@@ -1567,6 +1809,7 @@ static bool do_connect_adv_device(NimBLEAdvertisedDevice* advDevice) {
         s_ble_prefs.putUChar("bound_type", s_bound_addr_type);
         app_log("BLE", "Bound and saved remote: %s (%s, Type: %d)", s_bound_name.c_str(), s_bound_mac.c_str(), (int)s_bound_addr_type);
     }
+    saved_list_upsert(s_connected_mac, s_connected_name, s_bound_addr_type);
 
     return setup_services_and_handshake();
 }
@@ -1606,6 +1849,11 @@ static bool do_connect_mac(const String& mac_str, uint8_t addr_type) {
     }
     request_audio_conn_params();
 
+    s_remote_protocol = REMOTE_XIAOMI;   // re-detected from DIS during handshake
+    s_voice_start_ms = 0;
+    s_toggle_session = false;
+    s_toggle_software_stream = false;
+    usb_voice_set_toggle_hotkey(false);
     s_connected_mac = mac_str;
     s_connected_name = "Xiaomi Voice Remote";
     portENTER_CRITICAL(&s_disc_mux);
@@ -1627,6 +1875,7 @@ static bool do_connect_mac(const String& mac_str, uint8_t addr_type) {
     s_ble_prefs.putString("bound_name", s_bound_name);
     s_ble_prefs.putUChar("bound_type", s_bound_addr_type);
     app_log("BLE", "Manually paired and saved: %s (%s, Type: %d)", s_bound_name.c_str(), s_bound_mac.c_str(), (int)s_bound_addr_type);
+    saved_list_upsert(s_connected_mac, s_connected_name, s_bound_addr_type);
 
     return setup_services_and_handshake();
 }
@@ -1694,6 +1943,28 @@ static void read_device_information(uint32_t gen) {
     app_log("GATTX", "Remote device info: model=%s, mfr=%s, serial=%s, hw=%s, fw=%s, sw=%s",
             s_dev_model.c_str(), s_dev_manuf.c_str(), s_dev_serial.c_str(),
             s_dev_hw.c_str(), s_dev_fw.c_str(), s_dev_sw.c_str());
+
+    // Detect the HID dialect from the DIS identity (manufacturer authoritative,
+    // advertised name / model as fallbacks) and correct placeholder names. A
+    // Chromecast connected by MAC or via the switch UI inherits a Xiaomi
+    // placeholder name; relabel it so the multi-remote list is not misleading.
+    const bool is_google = s_dev_manuf.indexOf("Google") >= 0 ||
+            s_connected_name.indexOf("Chromecast") >= 0 ||
+            s_dev_model.indexOf("G9N9N") >= 0;
+    s_remote_protocol = is_google ? REMOTE_CHROMECAST : REMOTE_XIAOMI;
+    usb_voice_set_toggle_hotkey(toggle_enabled());
+    if (is_google &&
+        (s_connected_name.length() == 0 ||
+         s_connected_name == "Xiaomi Voice Remote" ||
+         s_connected_name == "Remote" ||
+         s_connected_name == "Unnamed BLE Device")) {
+        s_connected_name = "Chromecast Remote";
+        s_bound_name = s_connected_name;
+        s_ble_prefs.putString("bound_name", s_bound_name);
+        saved_list_upsert(s_connected_mac, s_connected_name, s_bound_addr_type);
+    }
+    app_log("GATTX", "Remote protocol: %s",
+            is_google ? "Chromecast (indexed consumer)" : "Xiaomi (raw HID)");
 }
 
 // Hex + printable-ASCII rendering helper for one characteristic/descriptor value.
@@ -1922,6 +2193,10 @@ void ble_remote_init(void) {
     if (s_bound_mac.length() > 0) {
         app_log("BLE", "Loaded previously bound remote: %s (%s, Type: %d)", s_bound_name.c_str(), s_bound_mac.c_str(), (int)s_bound_addr_type);
     }
+    saved_list_load();
+    s_voice_toggle_mode = s_ble_prefs.getBool("voice_toggle", false);
+    app_log("BLE", "Saved remotes loaded: %u (active: %s)", (unsigned)s_saved_count,
+            s_bound_mac.length() > 0 ? s_bound_mac.c_str() : "none");
 
     NimBLEDevice::init("ESP32-RemoteBridge");
     s_nimble_eventq = nimble_port_get_dflt_eventq();
@@ -1956,6 +2231,24 @@ void ble_remote_gatt_dump_request(bool on) {
     s_gatt_dump_enabled = on;
     s_gatt_dump_pending = on; // dump on the current (or next) connection
     if (!on) gatt_spy_stop();
+}
+
+bool ble_remote_get_voice_toggle_mode(void) {
+    return s_voice_toggle_mode;
+}
+
+void ble_remote_set_voice_toggle_mode(bool on) {
+    if (s_voice_toggle_mode == on) return;
+    s_voice_toggle_mode = on;
+    s_ble_prefs.putBool("voice_toggle", on);
+    // Switching mode mid-session must not strand an open toggle mic.
+    if (s_toggle_session) end_toggle_session(millis(), "mode_change");
+    usb_voice_set_toggle_hotkey(toggle_enabled());
+    app_log("ATVV", "Voice toggle mode %s (Chromecast-only)", on ? "ON" : "OFF");
+}
+
+bool ble_remote_voice_toggle_active(void) {
+    return s_toggle_session;
 }
 
 
@@ -2313,6 +2606,7 @@ bool ble_remote_connect_target(const String& mac_str, uint8_t addr_type, const S
     s_ble_prefs.putString("bound_name", s_bound_name);
     s_ble_prefs.putUChar("bound_type", s_bound_addr_type);
     app_log("BLE", "Bound target saved to NVS: %s (%s)", s_bound_name.c_str(), s_bound_mac.c_str());
+    saved_list_upsert(s_bound_mac, s_bound_name, s_bound_addr_type);
 
     // Queue connection to be handled safely on Core 0
     s_pending_mac = mac_str;
@@ -2347,9 +2641,65 @@ void ble_remote_unpair(void) {
     s_ble_prefs.remove("bound_mac");
     s_ble_prefs.remove("bound_name");
     s_ble_prefs.remove("bound_type");
+    s_saved_count = 0;
+    s_ble_prefs.remove("saved_list");
     NimBLEDevice::deleteAllBonds();
-    app_log("BLE", "Unpaired: deleted all NimBLE bonds and cleared saved MAC from NVS");
+    app_log("BLE", "Unpaired: deleted all NimBLE bonds and cleared saved MAC + saved list from NVS");
     s_req_unpair = true;
+}
+
+String ble_remote_get_saved_json(void) {
+    JsonDocument doc;
+    doc["active"] = s_bound_mac;
+    JsonArray arr = doc["remotes"].to<JsonArray>();
+    for (size_t i = 0; i < s_saved_count; ++i) {
+        JsonObject o = arr.add<JsonObject>();
+        o["mac"] = s_saved[i].mac;
+        o["name"] = s_saved[i].name;
+        o["type"] = (int)s_saved[i].type;
+        o["active"] = s_saved[i].mac.equalsIgnoreCase(s_bound_mac);
+    }
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+bool ble_remote_switch_target(const String& mac) {
+    int idx = saved_list_find(mac);
+    if (idx < 0) return false;
+    s_bound_mac = s_saved[idx].mac;
+    s_bound_name = s_saved[idx].name;
+    s_bound_addr_type = s_saved[idx].type;
+    s_ble_prefs.putString("bound_mac", s_bound_mac);
+    s_ble_prefs.putString("bound_name", s_bound_name);
+    s_ble_prefs.putUChar("bound_type", s_bound_addr_type);
+    app_log("BLE", "Switch active remote to: %s (%s, Type: %d)", s_bound_name.c_str(), s_bound_mac.c_str(), (int)s_bound_addr_type);
+    // Reuse the stored bond (no deleteBond): disconnect the current remote and
+    // connect to the chosen MAC on the BLE task, exactly like a manual connect.
+    s_pending_mac = s_bound_mac;
+    s_pending_addr_type = s_bound_addr_type;
+    s_do_connect = true;
+    return true;
+}
+
+bool ble_remote_remove_saved(const String& mac) {
+    int idx = saved_list_find(mac);
+    if (idx < 0) return false;
+    uint8_t type = s_saved[idx].type;
+    for (size_t i = (size_t)idx; i + 1 < s_saved_count; ++i) s_saved[i] = s_saved[i + 1];
+    s_saved_count--;
+    saved_list_persist();
+    NimBLEDevice::deleteBond(NimBLEAddress(mac.c_str(), type));
+    app_log("BLE", "Removed saved remote: %s", mac.c_str());
+    if (s_bound_mac.equalsIgnoreCase(mac)) {
+        s_bound_mac = "";
+        s_bound_name = "";
+        s_ble_prefs.remove("bound_mac");
+        s_ble_prefs.remove("bound_name");
+        s_ble_prefs.remove("bound_type");
+        s_req_reconnect = true;   // drop the link and rescan in free-pairing mode
+    }
+    return true;
 }
 
 String ble_remote_get_connected_info(void) {
@@ -2367,6 +2717,8 @@ String ble_remote_get_connected_info(void) {
     doc["dev_hw"] = s_dev_hw;
     doc["dev_fw"] = s_dev_fw;
     doc["dev_sw"] = s_dev_sw;
+    doc["voice_toggle"] = s_voice_toggle_mode;
+    doc["voice_toggle_active"] = s_toggle_session;
     String out;
     serializeJson(doc, out);
     return out;

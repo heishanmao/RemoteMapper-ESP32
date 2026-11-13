@@ -126,6 +126,12 @@ String nvs_manager_dump_json(void) {
         if (prefs.isKey("bound_mac"))  bleObj["bound_mac"]  = prefs.getString("bound_mac", "");
         if (prefs.isKey("bound_name")) bleObj["bound_name"] = prefs.getString("bound_name", "");
         if (prefs.isKey("bound_type")) bleObj["bound_type"] = prefs.getUChar("bound_type", 0);
+        if (prefs.isKey("saved_list")) {
+            String sl = prefs.getString("saved_list", "");
+            JsonDocument subDoc;
+            if (deserializeJson(subDoc, sl) == DeserializationError::Ok) { bleObj["saved_list"] = subDoc; }
+            else { bleObj["saved_list"] = sl; }
+        }
         prefs.end();
     }
     if (prefs.begin("keymap_conf", true)) {

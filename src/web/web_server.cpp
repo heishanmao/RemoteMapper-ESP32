@@ -506,6 +506,34 @@ static void handle_ble_reconnect() {
     s_server.send(200, "application/json", "{\"status\":\"reconnecting\"}");
 }
 
+static void handle_ble_saved() {
+    s_server.send(200, "application/json", ble_remote_get_saved_json());
+}
+
+static void handle_ble_switch() {
+    JsonDocument doc;
+    if (deserializeJson(doc, s_server.arg("plain"))) {
+        s_server.send(400, "application/json", "{\"error\":\"invalid_json\"}");
+        return;
+    }
+    String mac = doc["mac"] | "";
+    bool ok = mac.length() > 0 && ble_remote_switch_target(mac);
+    app_log("WEB", "BLE switch active remote to %s: %s", mac.c_str(), ok ? "ok" : "not_saved");
+    s_server.send(200, "application/json", ok ? "{\"status\":\"ok\"}" : "{\"status\":\"failed\"}");
+}
+
+static void handle_ble_remove() {
+    JsonDocument doc;
+    if (deserializeJson(doc, s_server.arg("plain"))) {
+        s_server.send(400, "application/json", "{\"error\":\"invalid_json\"}");
+        return;
+    }
+    String mac = doc["mac"] | "";
+    bool ok = mac.length() > 0 && ble_remote_remove_saved(mac);
+    app_log("WEB", "BLE remove saved remote %s: %s", mac.c_str(), ok ? "ok" : "not_saved");
+    s_server.send(200, "application/json", ok ? "{\"status\":\"ok\"}" : "{\"status\":\"failed\"}");
+}
+
 static void handle_gatt_dump_get() {
     JsonDocument doc;
     doc["enabled"] = ble_remote_gatt_dump_enabled();
@@ -527,6 +555,37 @@ static void handle_gatt_dump_set() {
     app_log("BLE", "GATT explorer %s", on ? "ON (full GATT dump on each fresh remote connection)" : "OFF");
     JsonDocument doc;
     doc["enabled"] = on;
+    String out;
+    serializeJson(doc, out);
+    s_server.send(200, "application/json", out);
+}
+
+static void handle_voice_mode_get() {
+    JsonDocument doc;
+    doc["enabled"] = ble_remote_get_voice_toggle_mode();
+    doc["active"] = ble_remote_voice_toggle_active();
+    String out;
+    serializeJson(doc, out);
+    s_server.send(200, "application/json", out);
+}
+
+static void handle_voice_mode_set() {
+    bool on = ble_remote_get_voice_toggle_mode();
+    if (s_server.hasArg("plain")) {
+        JsonDocument doc;
+        if (deserializeJson(doc, s_server.arg("plain"))) {
+            s_server.send(400, "application/json", "{\"error\":\"invalid_json\"}");
+            return;
+        }
+        if (doc["enabled"].is<bool>()) on = doc["enabled"].as<bool>();
+    } else if (s_server.hasArg("enabled")) {
+        String v = s_server.arg("enabled");
+        on = (v == "1" || v.equalsIgnoreCase("true") || v.equalsIgnoreCase("on"));
+    }
+    ble_remote_set_voice_toggle_mode(on);
+    JsonDocument doc;
+    doc["enabled"] = ble_remote_get_voice_toggle_mode();
+    doc["active"] = ble_remote_voice_toggle_active();
     String out;
     serializeJson(doc, out);
     s_server.send(200, "application/json", out);
@@ -818,6 +877,9 @@ void web_server_init(void) {
     s_server.on("/api/ble/unpair", HTTP_POST, handle_ble_unpair);
     s_server.on("/api/ble/info", HTTP_GET, handle_ble_info);
     s_server.on("/api/ble/reconnect", HTTP_POST, handle_ble_reconnect);
+    s_server.on("/api/ble/saved", HTTP_GET, handle_ble_saved);
+    s_server.on("/api/ble/switch", HTTP_POST, handle_ble_switch);
+    s_server.on("/api/ble/remove", HTTP_POST, handle_ble_remove);
     s_server.on("/api/nvs", HTTP_GET, handle_nvs_get);
     s_server.on("/api/nvs/save", HTTP_POST, handle_nvs_save);
     s_server.on("/api/nvs/reset", HTTP_POST, handle_nvs_reset);
@@ -834,6 +896,8 @@ void web_server_init(void) {
     s_server.on("/api/guard", HTTP_POST, handle_guard_set);
     s_server.on("/api/debug/gatt-dump", HTTP_GET, handle_gatt_dump_get);
     s_server.on("/api/debug/gatt-dump", HTTP_POST, handle_gatt_dump_set);
+    s_server.on("/api/ble/voice-mode", HTTP_GET, handle_voice_mode_get);
+    s_server.on("/api/ble/voice-mode", HTTP_POST, handle_voice_mode_set);
 
 #if REMOTEMAPPER_OTA
     s_server.on("/api/ota/status", HTTP_GET, handle_ota_status);

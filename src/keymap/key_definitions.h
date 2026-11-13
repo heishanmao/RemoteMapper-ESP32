@@ -28,6 +28,11 @@ extern "C" {
 #define MI_KEY_VOICE        0x04    // Voice button (ATVV)
 #define MI_KEY_VOICE_ALT    0x3E    // Voice button (HOGP)
 
+// Chromecast-only physical keys (indexed consumer report). Never emitted by Xiaomi.
+#define MI_KEY_MUTE         0x90    // Mute
+#define MI_KEY_YOUTUBE      0x91    // YouTube shortcut
+#define MI_KEY_NETFLIX      0x92    // Netflix shortcut
+
 // ==========================================
 // 2. USB HID Keyboard Modifier Bitmasks
 // ==========================================
