@@ -3,7 +3,7 @@
 
 > **适用固件版本**：v1.0.0+ (Production Release)  
 > **目标主控硬件**：ESP32-S3-DevKitC-1 N16R8（16MB Octal SPI Flash + 8MB Octal SPI PSRAM）  
-> **适配遥控型号**：小米蓝牙语音遥控器 2 Pro（型号：RC003，铝合金金属机身款）  
+> **适配遥控型号**：小米蓝牙语音遥控器 2 Pro（型号：RC003，铝合金金属机身款）；Chromecast / Google TV 语音遥控器（型号：G9N9N，VID/PID `18D1:9450`）  
 > **文档受众**：嵌入式开发者、代码维护者与后续 AI Agent 协作开发  
 
 ---
@@ -22,6 +22,7 @@
 11. [源码文件索引与模块依赖关系](#十一-源码文件索引与模块依赖关系)
 12. [编译、烧录与测试指南](#十二-编译烧录与测试指南)
 13. [故障排查手册与常见问题 (Troubleshooting)](#十三-故障排查手册与常见问题-troubleshooting)
+14. [多遥控器适配与 Chromecast 语音](#十四-多遥控器适配与-chromecast-语音)
 
 ---
 
@@ -399,6 +400,66 @@ test.bat
 ### Q4: 音量加减在 Windows 下变成打开搜索栏？
 - **排查步骤**：
   1. 检查 WebUI 下拉菜单或 NVS 中音量键的键码，音量加标准 USB Consumer 键码为 **`0x00E9` (233)**，音量减为 **`0x00EA` (234)**；切勿使用旧版错误的 `545`（`0x0221` 代表 AC Search 全局搜索）。
+
+---
+
+# 十四. 多遥控器适配与 Chromecast 语音
+
+> 本章记录 v1.2.55 在小米 RC003 之外新增的 Chromecast / Google TV (G9N9N) 适配。**设计硬约束：小米是日常主力，所有 Chromecast 改动均按协议门控，小米代码路径保持不变。**
+
+### 1. 多遥控器绑定与协议识别
+* **扩展广播**：Chromecast 使用 BLE 扩展广播包，`platformio.ini` 启用 NimBLE 扩展广播编译开关后才能扫描到。
+* **协议识别**：连接后读取设备信息与 PnP ID（Chromecast VID/PID `18D1:9450`），判定 `s_remote_protocol = REMOTE_CHROMECAST`，否则按小米 RC003 处理。
+* **多绑定存储**：BLE 层维护 `saved_list` 多绑定持久化，Web 后台通过 `/api/ble` 系列路由在两只遥控器间切换；按键映射与语音热键配置随遥控器各自独立保存。
+* **门控原则**：所有 Chromecast 专用逻辑（索引解码、toggle 语音、早停忽略窗口）都以 `s_remote_protocol == REMOTE_CHROMECAST` 或 `toggle_enabled()` 为前提，小米链路不进入这些分支。
+
+### 2. Chromecast 索引式 HID 解码
+Chromecast 的 HOGP Report 1 不携带标准键码，而是**两个 1-based Consumer 索引**（0 表示该槽位释放）。`chromecast_index_to_key()` 将索引映射到与小米相同的内部 `MI_KEY` 键码，从而复用同一套键码引擎、键位映射与 USB 输出：
+
+| 索引 | 功能 | 索引 | 功能 |
+| :--- | :--- | :--- | :--- |
+| 1 | 电源 | 10 | 主页 |
+| 3~6 | 上/下/左/右 | 11 | 返回 |
+| 7 | 确定 | 12/13 | 音量+/音量- |
+| 8 | 静音 | 14/15 | YouTube / Netflix |
+| | | 17 | 输入源 (TV) |
+
+* 报文长度 1~8 字节均可解码（设备可能补零到 8 字节，仅前两字节是槽位）；无对应 `MI_KEY` 的索引（播放/搜索等）返回 0 忽略。
+* **语音键不走 HOGP**：Chromecast 语音严格经 ATVV CTL 通道（`ab5e0004`）上报，索引表中无语音映射，避免与 HOGP 竞争。
+
+### 3. Chromecast 开关型（toggle）语音
+小米麦克风为硬件门控（仅按住期间流音频），只能按住对讲；Chromecast 麦克风**软件可控**，可实现真开关录音。ATVV 关键 opcode：`0x04` AUDIO_START、`0x08` MICROPHONE_SEARCH/stop、`0x00` stop、`0x0B` CAPS_RESP、`0x0C` MIC_OPEN、`0x0D` MIC_CLOSE。
+
+```text
+ESP32-S3 (Central)                                  Chromecast G9N9N (Peripheral)
+      │── 按一下语音键 ─────────────────────────────────────────────►│
+      │◄─ AUDIO_START HTT [0x04,0x03,0x00,SID] ─────────────────────│  开始录音
+      │   • 轻点一次共用语音热键（输入法进入开关模式）              │
+      │── 物理松手 ─────────────────────────────────────────────────►│
+      │◄─ AUDIO_STOP [0x00,0x02] ───────────────────────────────────│
+      │── MIC_OPEN [0x0C,0x00] ────────────────────────────────────►│  续开麦克风
+      │◄─ AUDIO_START 软件流 [0x04,0x00,0x00,0x00] ─────────────────│  松手后持续录音
+      │   （按钮已抬起，音频继续经 UAC 推流）                       │
+      │── 再按一下语音键 ───────────────────────────────────────────►│
+      │◄─ AUDIO_START reason3 / 软件流 0x08 ────────────────────────│  第二次按压
+      │── MIC_CLOSE [0x0D,0x00] ───────────────────────────────────►│  结束录音
+      │   • 再轻点一次同一热键（输入法停止并转写）                  │
+```
+
+* **早停忽略窗口**：Chromecast 在 AUDIO_START 后约 1~2ms 会发一个虚假 `0x08`，用 `CHROMECAST_EARLY_STOP_IGNORE_MS`（300ms）窗口忽略，避免误判为结束。
+* **HID 信令**：toggle 模式在开始与结束各 `usb_hid_keyboard_tap()` 一次共用热键（默认右 Alt），松手即停音频流水线、不做 drain、不登记 guard 条目；由输入法在软件层区分「按住=对讲、轻点=开关」。hold 模式（小米）仍为 `guard_add` + 按住热键 + 松手 drain。
+* **会话收尾**：`end_toggle_session()` 在引擎锁内清 toggle 标志、 epoch 守卫的 `prepare_mic_close` 防重复关闭、下发 `MIC_CLOSE`；断连 invalidate 会补一次停止轻点，避免输入法卡在录音态。
+
+### 4. CAPS 确认超时有界恢复
+握手只发一次 `GET_CAPS`，若 `CAPS_RESP` 丢包，`voice_link_ready()` 将永久为 false，语音键整条链路失效直至重连。`ble_remote_task()` 新增有界恢复块：连接后 CAPS 未确认则每 3 秒重发 `GET_CAPS`、至多 5 次（`CAPS_CONFIRM_TIMEOUT_MS` / `CAPS_CONFIRM_MAX_ATTEMPTS`），到顶即止。
+* **严格 no-op**：健康链路（小米/Chromecast）CAPS 毫秒级到达，`!s_caps_received` 条件不成立，该块不产生任何写入或日志，不触碰小米工作路径。
+* **时序陷阱**：判定用新鲜 `millis()` 而非循环顶快照 `now`——握手可能在 tick 中途设置查询时间戳，用旧快照相减会 uint32 下溢导致立即误触发（实测已修复）。
+* 移植自上游 ZSTDJan/windows-remote-mic-app `075870c`（CAPABILITIES_MAX_ATTEMPTS=5）。
+
+### 5. 上游同步状态
+本仓库有两个上游，按「只移植能切实改善本配置的功能、不做合并」策略审计：
+* **cuicui-V5/RemoteMapper-ESP32**（固件原始仓库，git `upstream`）：v1.2.55 审计其分叉后 16 个提交，**0 项移植**。语音双模 `bc38a44` 是 HID 层 tap-tap 信令（音频仍受按住门控），劣于本仓库 Chromecast 真 toggle 且对支持按住的小米输入法无增益；消费键原生长按 `ce07ad4` 的 `ACTION_CONSUMER_HOLD` 本仓库已有，且改默认会撞掉「音量长按=切层」手势；右修饰键预设、独立修饰键持久化均已覆盖；其余为文档/工具/官网。
+* **ZSTDJan/windows-remote-mic-app**（Windows 宿主端）：多为宿主侧功能（微信输入法兼容、驱动识别、文字粘贴等）不可移植；协议层修复中 10 字节 CAPS_RESP、1/2 字节 HID 报告、收尾期新启动接管本仓库早已覆盖，仅 **CAPS 超时有界恢复**为缺口，已移植（见上节）。
 
 ---
 

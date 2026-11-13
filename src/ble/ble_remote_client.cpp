@@ -209,6 +209,13 @@ static size_t                          s_frame_size = AUDIO_DEFAULT_FRAME_BYTES;
 static void request_audio_conn_params(void);
 static uint16_t                        s_caps_version = 0;
 static uint8_t                         s_caps_codec_mask = 0;
+// Bounded CAPS-confirm recovery (upstream 075870c). If the handshake GET_CAPS
+// answer never lands, voice stays gated off for the whole link; re-query on a
+// fixed schedule instead of waiting for a reconnect. No-op once CAPS arrives.
+#define CAPS_CONFIRM_TIMEOUT_MS   3000
+#define CAPS_CONFIRM_MAX_ATTEMPTS 5
+static uint32_t                        s_caps_query_ms = 0;       // last GET_CAPS send
+static uint8_t                         s_caps_query_attempts = 0; // 0 = not queried yet
 // Invalidate handshake/readiness publications when this connection ends.
 static volatile uint32_t               s_conn_generation = 0;
 static bool                            s_caps_received = false; // s_mic_control_mux
@@ -1319,6 +1326,8 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         s_voice_cmd_available = false;
         s_voice_start_rejected = false;
         portEXIT_CRITICAL(&s_mic_control_mux);
+        s_caps_query_ms = 0;
+        s_caps_query_attempts = 0;
         usb_voice_action_set_ready(false);
         s_ble_state = BLE_STATE_CONNECTING;
         s_is_encrypted = false;
@@ -1687,6 +1696,8 @@ static bool setup_services_and_handshake() {
     if (s_char_cmd) {
         uint8_t cmd_caps[] = { 0x0A, 0x01, 0x00, 0x00, 0x03, 0x03 };
         s_char_cmd->writeValue(cmd_caps, sizeof(cmd_caps), false);
+        s_caps_query_ms = millis();
+        s_caps_query_attempts = 1;
         app_log("ATVV", "Handshake: GET_CAPS query sent (Mic remains in low-power standby)");
     }
 
@@ -2404,10 +2415,30 @@ void ble_remote_task(void) {
                         app_log("ATVV", "Background recovery succeeded: cmd=%p, aud=%p, ctl=%p", s_char_cmd, s_char_aud, s_char_ctl);
                         uint8_t cmd_caps[] = { 0x0A, 0x01, 0x00, 0x00, 0x03, 0x03 };
                         s_char_cmd->writeValue(cmd_caps, sizeof(cmd_caps), false);
+                        s_caps_query_ms = millis();
+                        s_caps_query_attempts = 1;
                     }
                 }
             }
         }
+    }
+
+    // 4b. CAPS-confirm recovery: a lost CAPS_RESP leaves the voice gate closed
+    // for the entire link. Re-query every 3 s, at most 5 attempts per connection
+    // (upstream 075870c). Healthy links answer within milliseconds, so this block
+    // is a strict no-op there and never touches a working Xiaomi session.
+    // Fresh millis(): the handshake can set s_caps_query_ms mid-tick, after the
+    // loop-top `now` snapshot; subtracting from that stale value underflows.
+    if (s_ble_state >= BLE_STATE_CONNECTED && s_client && s_client->isConnected() &&
+        s_char_cmd != nullptr && !s_caps_received &&
+        s_caps_query_attempts > 0 && s_caps_query_attempts < CAPS_CONFIRM_MAX_ATTEMPTS &&
+        millis() - s_caps_query_ms >= CAPS_CONFIRM_TIMEOUT_MS) {
+        s_caps_query_ms = millis();
+        s_caps_query_attempts++;
+        uint8_t cmd_caps[] = { 0x0A, 0x01, 0x00, 0x00, 0x03, 0x03 };
+        s_char_cmd->writeValue(cmd_caps, sizeof(cmd_caps), false);
+        app_log("ATVV", "CAPS unconfirmed: re-query GET_CAPS (attempt %u/%u)",
+                (unsigned)s_caps_query_attempts, (unsigned)CAPS_CONFIRM_MAX_ATTEMPTS);
     }
 
     // 5. Periodic Battery polling (every 30 minutes if connected, fallback for notifications)
