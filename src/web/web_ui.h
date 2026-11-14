@@ -186,6 +186,24 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         .event-field span:first-child { color: var(--text-muted); }
         .event-field span:last-child { font-weight: 600; font-family: monospace; color: #fff; }
 
+        /* Mapping connector canvas: one renderer reused by both remote models */
+        .mapping-canvas-wrap { overflow-x: auto; padding: 6px 0; }
+        .mapping-canvas { position: relative; height: 760px; min-width: 860px; margin: 0 auto; }
+        .mc-svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+        .mc-remote-holder { position: absolute; left: 50%; transform: translateX(-50%); top: 20px; }
+        .mc-col { position: absolute; top: 0; bottom: 0; width: 300px; }
+        .mc-left { left: 0; }
+        .mc-right { right: 0; }
+        .mc-card { position: absolute; left: 0; width: 100%; box-sizing: border-box; background: #0d1420; border: 1px solid var(--border-color); border-radius: 10px; padding: 6px 9px; }
+        .mc-card.override { border-color: rgba(6,182,212,0.5); background: rgba(6,182,212,0.08); }
+        .mc-card-head { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: #fff; margin-bottom: 5px; }
+        .mc-card-head .mc-src { margin-left: auto; font-size: 10px; font-weight: 600; }
+        .mc-boxes { display: flex; gap: 4px; }
+        .mc-box { flex: 1; min-width: 0; background: rgba(255,255,255,0.05); border-radius: 6px; padding: 4px 5px; cursor: pointer; text-align: center; transition: background 0.12s; }
+        .mc-box:hover { background: rgba(6,182,212,0.18); }
+        .mc-box .mc-trig { font-size: 10px; color: var(--text-muted); }
+        .mc-box .mc-val { font-size: 11px; color: #fff; font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
         /* Ultra-Simple Interactive Remap Modal */
         .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.8); backdrop-filter: blur(6px); display: none; align-items: center; justify-content: center; z-index: 100; padding: 20px; }
         .modal { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-card); max-width: 520px; width: 100%; padding: 24px; box-shadow: 0 25px 50px rgba(0,0,0,0.6); }
@@ -469,7 +487,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                     <b>默认层</b>：其他层未单独配置的按键会自动穿透继承默认层的映射。
                 </div>
                 
-                <div class="remote-tester-container">
+                <div class="mapping-canvas-wrap">
+                  <div class="mapping-canvas" id="mapping-canvas">
+                    <svg class="mc-svg" id="mc-svg"></svg>
+                    <div class="mc-col mc-left" id="mc-left"></div>
+                    <div class="mc-remote-holder">
                     <!-- Real Xiaomi Silver Metallic Remote DOM -->
                     <div class="real-remote-body" id="remote-xiaomi">
                         <!-- Top Row: Power & Voice -->
@@ -563,7 +585,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
                         <div class="cc-brand">Chromecast</div>
                     </div>
+                    </div><!-- /mc-remote-holder -->
+                    <div class="mc-col mc-right" id="mc-right"></div>
+                  </div><!-- /mapping-canvas -->
+                </div><!-- /mapping-canvas-wrap -->
 
+                <div class="remote-tester-container" style="justify-content:flex-start;">
                     <!-- Live Key Event Telemetry -->
                     <div class="event-box">
                         <h3 style="margin-bottom: 12px; font-size: 15px; color: var(--accent-cyan);">实时按键状态</h3>
@@ -599,6 +626,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                         </div>
                     </div>
                 </div>
+
             </div>
         </div>
 
@@ -1484,6 +1512,20 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             0x92: 'Netflix键'
         };
 
+        // Which connector column each key belongs to, per model. Center keys (up/down/OK)
+        // are split to keep the two columns balanced. Order is irrelevant: the renderer
+        // sorts each column by the key's measured Y so connectors never cross.
+        const MODEL_SIDES = {
+            xiaomi: {
+                left:  [0x66, 0x52, 0x50, 0xF1, 0x24, 0x5D],
+                right: [0x04, 0x4F, 0x28, 0x51, 0x80, 0x81, 0xC0]
+            },
+            chromecast: {
+                left:  [0x66, 0x52, 0x50, 0x28, 0xF1, 0x24, 0x91],
+                right: [0x04, 0x4F, 0x51, 0x90, 0x92, 0xC0, 0x80, 0x81]
+            }
+        };
+
         // DOM Key -> USB HID Keyboard Code Map
         const DOM_TO_HID = {
             'KeyA': 0x04, 'KeyB': 0x05, 'KeyC': 0x06, 'KeyD': 0x07, 'KeyE': 0x08,
@@ -1572,6 +1614,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c === targetEl));
             if (id === 'tab-ble') refreshBleInfo();
             else if (id === 'tab-logs') refreshLogs();
+            else if (id === 'tab-tester') renderMappingCanvas();
         }
 
         async function fetchStatus() {
@@ -2027,7 +2070,134 @@ if (mod & 0x01) parts.push('左Ctrl');
 
                 el.title = desc;
             });
+            renderMappingCanvas();
         }
+
+        // Merge Layer 0 base with the active editing layer (per-action transparency),
+        // mirroring firmware get_effective_binding. Returns the effective binding plus
+        // whether this layer overrides it. Used by the mapping canvas cards.
+        function getEffectiveBinding(vk) {
+            normalizeKeymapConfig();
+            const layer0 = currentKeymap.layers[0];
+            const cur = currentKeymap.layers[currentEditingLayer] || layer0;
+            const b0 = (layer0.bindings && layer0.bindings.find(x => x.source_vk === vk)) || FACTORY_KEYMAP[vk] || null;
+            const bCur = (currentEditingLayer > 0 && cur.bindings) ? (cur.bindings.find(x => x.source_vk === vk) || null) : null;
+            const eff = b0 ? JSON.parse(JSON.stringify(b0)) : { source_vk: vk };
+            let overridden = false;
+            if (bCur) {
+                ['click', 'long', 'double'].forEach(t => {
+                    if (bCur['has_' + t] && bCur[t + '_type'] !== 10) {
+                        overridden = true;
+                        eff['has_' + t] = true;
+                        eff[t + '_type'] = bCur[t + '_type'];
+                        eff[t + '_mod'] = bCur[t + '_mod'] || 0;
+                        eff[t + '_key'] = bCur[t + '_key'] || 0;
+                        eff[t + '_cons'] = bCur[t + '_cons'] || 0;
+                        eff[t + '_layer'] = bCur[t + '_layer'] || 0;
+                        eff[t + '_mac'] = bCur[t + '_mac'] || '';
+                        if (t === 'long') eff.long_ms = bCur.long_ms || 600;
+                        if (t === 'double') eff.double_ms = bCur.double_ms || 250;
+                    }
+                });
+            }
+            return { eff: eff, overridden: overridden };
+        }
+
+        // Open the remap modal straight onto a specific trigger box (单击/双击/长按).
+        // openRemapModal has no awaits, so the modal is fully shown by the time it
+        // returns; switching the trigger tab right after is safe. The voice key on
+        // Layer 0 is locked to the voice card (no trigger tabs), so skip it there.
+        function openRemapAt(vk, name, trigger) {
+            openRemapModal(vk, name);
+            const voiceLocked = (vk === 0x04 || vk === 0x3E) && currentEditingLayer === 0;
+            if (!voiceLocked && trigger && trigger !== 'click') switchTriggerTab(trigger);
+        }
+
+        // Cubic-Bezier connector from a remote key anchor to a card edge, with an
+        // arrow tip. Geometry mirrors the upstream RemoteMappingCanvas control points.
+        function connectorPath(s, e, side) {
+            const dir = side === 'left' ? -1 : 1;
+            const tipX = e.x - dir * 6;
+            const dist = Math.min(70, Math.max(34, Math.abs(tipX - s.x) * 0.58));
+            const endDist = Math.min(42, Math.max(24, dist * 0.6));
+            const d = `M ${s.x} ${s.y} C ${s.x + dir * dist} ${s.y}, ${tipX - dir * endDist} ${e.y}, ${tipX} ${e.y}`;
+            const arrow = `M ${tipX} ${e.y} L ${tipX - dir * 6} ${e.y - 4} L ${tipX - dir * 6} ${e.y + 4} Z`;
+            return `<path d="${d}" fill="none" stroke="rgba(148,163,184,0.45)" stroke-width="1.2"/>`
+                 + `<path d="${arrow}" fill="rgba(148,163,184,0.6)"/>`;
+        }
+
+        function mappingCardHtml(vk, top) {
+            const r = getEffectiveBinding(vk);
+            const eff = r.eff;
+            const name = KEY_NAMES[vk] || ('0x' + vk.toString(16).toUpperCase());
+            let src = '', srcColor = 'var(--text-muted)';
+            if (currentEditingLayer > 0) {
+                src = r.overridden ? '覆盖' : '继承';
+                if (r.overridden) srcColor = 'var(--accent-cyan)';
+            }
+            const box = (t, label) => {
+                let val;
+                if (!eff['has_' + t]) val = '—';
+                else if (eff[t + '_type'] === 0) val = t === 'click' ? '未映射' : '无动作';
+                else val = getActionSummaryText(eff[t + '_type'], eff[t + '_mod'] || 0, eff[t + '_key'] || 0, eff[t + '_cons'] || 0, eff[t + '_layer'] || 0, eff[t + '_mac'] || '');
+                const safe = String(val).replace(/"/g, '&quot;');
+                return `<div class="mc-box" onclick="openRemapAt(${vk},'${name}','${t}')" title="${label}：${safe}">`
+                     + `<div class="mc-trig">${label}</div><div class="mc-val">${val}</div></div>`;
+            };
+            return `<div class="mc-card ${r.overridden ? 'override' : ''}" style="top:${top}px;">`
+                 + `<div class="mc-card-head"><span>${name}</span>`
+                 + (src ? `<span class="mc-src" style="color:${srcColor}">${src}</span>` : '')
+                 + `</div><div class="mc-boxes">${box('click', '单击')}${box('double', '双击')}${box('long', '长按')}</div></div>`;
+        }
+
+        // One renderer for both models: measure each key's live DOM center, sort each
+        // column by Y, lay cards into equal slots, and draw connectors into the SVG.
+        function renderMappingCanvas() {
+            const canvas = document.getElementById('mapping-canvas');
+            const svg = document.getElementById('mc-svg');
+            const leftCol = document.getElementById('mc-left');
+            const rightCol = document.getElementById('mc-right');
+            if (!canvas || !svg || !leftCol || !rightCol) return;
+            normalizeKeymapConfig();
+            const sides = MODEL_SIDES[currentRemoteModel] || MODEL_SIDES.xiaomi;
+            const W = canvas.clientWidth, H = canvas.clientHeight, colW = leftCol.clientWidth;
+            // Center the remote photo vertically against the card columns (upstream does
+            // the same), so connectors fan out symmetrically instead of hugging the top.
+            const holder = canvas.querySelector('.mc-remote-holder');
+            const rb = document.getElementById(currentRemoteModel === 'chromecast' ? 'remote-chromecast' : 'remote-xiaomi');
+            if (holder && rb) holder.style.top = Math.max(16, (H - rb.offsetHeight) / 2) + 'px';
+            const crect = canvas.getBoundingClientRect();
+            const measure = vk => {
+                const el = remoteBtnEl('0x' + vk.toString(16).toUpperCase().padStart(2, '0'));
+                if (!el) return null;
+                const r = el.getBoundingClientRect();
+                return { x: r.left + r.width / 2 - crect.left, y: r.top + r.height / 2 - crect.top };
+            };
+            let paths = '';
+            ['left', 'right'].forEach(side => {
+                const list = sides[side].map(vk => ({ vk: vk, a: measure(vk) })).filter(o => o.a);
+                list.sort((p, q) => p.a.y - q.a.y);
+                if (!list.length) { (side === 'left' ? leftCol : rightCol).innerHTML = ''; return; }
+                const slotH = H / list.length;
+                let html = '';
+                list.forEach((o, i) => {
+                    const top = i * slotH + Math.max(2, (slotH - 70) / 2);
+                    const cardY = top + 35;
+                    const edgeX = side === 'left' ? colW : W - colW;
+                    paths += connectorPath(o.a, { x: edgeX, y: cardY }, side);
+                    html += mappingCardHtml(o.vk, top);
+                });
+                (side === 'left' ? leftCol : rightCol).innerHTML = html;
+            });
+            svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+            svg.innerHTML = paths;
+        }
+
+        let mcResizeTimer = null;
+        window.addEventListener('resize', () => {
+            clearTimeout(mcResizeTimer);
+            mcResizeTimer = setTimeout(renderMappingCanvas, 120);
+        });
 
         function mergeFactoryDefaults() {
             normalizeKeymapConfig();
