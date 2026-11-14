@@ -380,7 +380,20 @@ bool key_config_storage_save_candidate(const key_mapper_engine_t *candidate) {
         app_log("KEYMAP", "Failed to open keymap_conf NVS namespace for writing!");
         return false;
     }
+    // The nvs partition is only 20KB (0x5000) and cannot be enlarged without
+    // moving otadata, which OTA depends on. A ~3KB cfg_json blob fills the
+    // partition after a few saves: NVS skips identical-value writes (so a
+    // no-op save succeeds) but any real change hits ESP_ERR_NVS_NOT_ENOUGH_
+    // SPACE and putString returns 0. Erasing the old entry first releases
+    // its slots for in-page reuse, keeping repeated edits working forever.
+    prefs.remove("cfg_json");
     size_t written = prefs.putString("cfg_json", json);
+    if (written != json.length()) {
+        // Last resort: wipe the namespace (cfg_json is its only key) and
+        // retry once in case fragmentation blocked the single erase.
+        prefs.clear();
+        written = prefs.putString("cfg_json", json);
+    }
     String readback = prefs.getString("cfg_json", "");
     prefs.end();
 
