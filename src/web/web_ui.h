@@ -2273,12 +2273,48 @@ if (mod & 0x01) parts.push('左Ctrl');
             const mode = currentSelectedMode;
 
             const longToggle = document.getElementById('toggle-enable-long');
-            if (longToggle) editingBinding.has_long = longToggle.checked;
+            const doubleToggle = document.getElementById('toggle-enable-double');
+            const rawHasLong = !!editingBinding.has_long;
+            const rawHasDouble = !!editingBinding.has_double;
+            let lngExplicitOff = false, dblExplicitOff = false;
+            if (longToggle) {
+                if (currentEditingLayer > 0 && longToggle.checked !== mcShownHasLong) {
+                    // Toggle flipped on an overlay layer: materialize an explicit
+                    // override. Unchecked is a hard disable (ACTION_NONE, type 0),
+                    // never "inherit" -- otherwise Layer 0's action keeps firing.
+                    if (longToggle.checked) {
+                        editingBinding.has_long = true; // concrete type set by the long tab branch
+                    } else {
+                        lngExplicitOff = true;
+                        editingBinding.has_long = true;
+                        editingBinding.long_type = 0;
+                        editingBinding.long_key = 0; editingBinding.long_mod = 0;
+                        editingBinding.long_cons = 0; editingBinding.long_layer = 0;
+                    }
+                } else if (!(currentEditingLayer > 0 && !rawHasLong && mcShownHasLong)) {
+                    editingBinding.has_long = longToggle.checked;
+                }
+                // else: inherited-on and untouched -> keep raw has_long=false (inherit)
+            }
             const longSlider = document.getElementById('slider-long-ms');
             if (longSlider) editingBinding.long_ms = parseInt(longSlider.value) || 600;
 
-            const doubleToggle = document.getElementById('toggle-enable-double');
-            if (doubleToggle) editingBinding.has_double = doubleToggle.checked;
+            if (doubleToggle) {
+                if (currentEditingLayer > 0 && doubleToggle.checked !== mcShownHasDouble) {
+                    if (doubleToggle.checked) {
+                        editingBinding.has_double = true; // concrete type set by the double tab branch
+                    } else {
+                        dblExplicitOff = true;
+                        editingBinding.has_double = true;
+                        editingBinding.double_type = 0;
+                        editingBinding.double_key = 0; editingBinding.double_mod = 0;
+                        editingBinding.double_cons = 0; editingBinding.double_layer = 0;
+                    }
+                } else if (!(currentEditingLayer > 0 && !rawHasDouble && mcShownHasDouble)) {
+                    editingBinding.has_double = doubleToggle.checked;
+                }
+                // else: inherited-on and untouched -> keep raw has_double=false (inherit)
+            }
             const doubleSlider = document.getElementById('slider-double-ms');
             if (doubleSlider) editingBinding.double_ms = parseInt(doubleSlider.value) || 250;
 
@@ -2308,40 +2344,56 @@ if (mod & 0x01) parts.push('左Ctrl');
                     editingBinding.has_click = (mode !== 0 && (code > 0 || mod > 0));
                 }
             } else if (currentTriggerTab === 'long') {
-                editingBinding.long_type = mode;
-                if (mode === 9) {
-                    editingBinding.long_layer = selectedTargetLayer;
-                    editingBinding.long_key = 0; editingBinding.long_mod = 0; editingBinding.long_cons = 0;
-                } else if (mode === 10) {
-                    editingBinding.long_key = 0; editingBinding.long_mod = 0; editingBinding.long_cons = 0;
-                } else if (mode === 11) {
-                    editingBinding.long_mac = wolMac;
-                    editingBinding.long_key = 0; editingBinding.long_mod = 0; editingBinding.long_cons = 0;
-                } else if (mode === 4) {
-                    editingBinding.long_cons = code;
-                    editingBinding.long_key = 0; editingBinding.long_mod = 0;
+                if (lngExplicitOff) {
+                    // Explicit disable already written above (has_long=true, type 0);
+                    // skip mode assignment so the off state survives the save.
                 } else {
-                    editingBinding.long_key = code;
-                    editingBinding.long_mod = mod;
-                    editingBinding.long_cons = 0;
+                    editingBinding.long_type = mode;
+                    if (currentEditingLayer > 0 && !rawHasLong && mode !== mcLoadedLongMode) {
+                        // User picked a concrete action on top of an inherited trigger.
+                        editingBinding.has_long = true;
+                    }
+                    if (mode === 9) {
+                        editingBinding.long_layer = selectedTargetLayer;
+                        editingBinding.long_key = 0; editingBinding.long_mod = 0; editingBinding.long_cons = 0;
+                    } else if (mode === 10) {
+                        editingBinding.long_key = 0; editingBinding.long_mod = 0; editingBinding.long_cons = 0;
+                    } else if (mode === 11) {
+                        editingBinding.long_mac = wolMac;
+                        editingBinding.long_key = 0; editingBinding.long_mod = 0; editingBinding.long_cons = 0;
+                    } else if (mode === 4) {
+                        editingBinding.long_cons = code;
+                        editingBinding.long_key = 0; editingBinding.long_mod = 0;
+                    } else {
+                        editingBinding.long_key = code;
+                        editingBinding.long_mod = mod;
+                        editingBinding.long_cons = 0;
+                    }
                 }
             } else if (currentTriggerTab === 'double') {
-                editingBinding.double_type = mode;
-                if (mode === 9) {
-                    editingBinding.double_layer = selectedTargetLayer;
-                    editingBinding.double_key = 0; editingBinding.double_mod = 0; editingBinding.double_cons = 0;
-                } else if (mode === 10) {
-                    editingBinding.double_key = 0; editingBinding.double_mod = 0; editingBinding.double_cons = 0;
-                } else if (mode === 11) {
-                    editingBinding.double_mac = wolMac;
-                    editingBinding.double_key = 0; editingBinding.double_mod = 0; editingBinding.double_cons = 0;
-                } else if (mode === 4) {
-                    editingBinding.double_cons = code;
-                    editingBinding.double_key = 0; editingBinding.double_mod = 0;
+                if (dblExplicitOff) {
+                    // Explicit disable already written above (has_double=true, type 0).
                 } else {
-                    editingBinding.double_key = code;
-                    editingBinding.double_mod = mod;
-                    editingBinding.double_cons = 0;
+                    editingBinding.double_type = mode;
+                    if (currentEditingLayer > 0 && !rawHasDouble && mode !== mcLoadedDoubleMode) {
+                        editingBinding.has_double = true;
+                    }
+                    if (mode === 9) {
+                        editingBinding.double_layer = selectedTargetLayer;
+                        editingBinding.double_key = 0; editingBinding.double_mod = 0; editingBinding.double_cons = 0;
+                    } else if (mode === 10) {
+                        editingBinding.double_key = 0; editingBinding.double_mod = 0; editingBinding.double_cons = 0;
+                    } else if (mode === 11) {
+                        editingBinding.double_mac = wolMac;
+                        editingBinding.double_key = 0; editingBinding.double_mod = 0; editingBinding.double_cons = 0;
+                    } else if (mode === 4) {
+                        editingBinding.double_cons = code;
+                        editingBinding.double_key = 0; editingBinding.double_mod = 0;
+                    } else {
+                        editingBinding.double_key = code;
+                        editingBinding.double_mod = mod;
+                        editingBinding.double_cons = 0;
+                    }
                 }
             }
         }
@@ -2371,10 +2423,12 @@ if (mod & 0x01) parts.push('左Ctrl');
                 longHeader.style.display = 'block';
                 doubleHeader.style.display = 'none';
                 actionLabel.innerText = '长按触发动作模式';
-                document.getElementById('toggle-enable-long').checked = !!editingBinding.has_long;
+                document.getElementById('toggle-enable-long').checked = mcShownHasLong;
                 document.getElementById('slider-long-ms').value = editingBinding.long_ms || 600;
                 document.getElementById('label-long-ms').innerText = `${editingBinding.long_ms || 600}ms`;
-                mode = editingBinding.long_type !== undefined ? editingBinding.long_type : 1;
+                mode = (currentEditingLayer > 0 && !editingBinding.has_long) ? mcShownLongType
+                     : (editingBinding.long_type !== undefined ? editingBinding.long_type : 1);
+                mcLoadedLongMode = mode;
                 mod = editingBinding.long_mod || 0;
                 key = editingBinding.long_key || 0;
                 cons = editingBinding.long_cons || 0;
@@ -2384,10 +2438,12 @@ if (mod & 0x01) parts.push('左Ctrl');
                 longHeader.style.display = 'none';
                 doubleHeader.style.display = 'block';
                 actionLabel.innerText = '双击触发动作模式';
-                document.getElementById('toggle-enable-double').checked = !!editingBinding.has_double;
+                document.getElementById('toggle-enable-double').checked = mcShownHasDouble;
                 document.getElementById('slider-double-ms').value = editingBinding.double_ms || 250;
                 document.getElementById('label-double-ms').innerText = `${editingBinding.double_ms || 250}ms`;
-                mode = editingBinding.double_type !== undefined ? editingBinding.double_type : 1;
+                mode = (currentEditingLayer > 0 && !editingBinding.has_double) ? mcShownDoubleType
+                     : (editingBinding.double_type !== undefined ? editingBinding.double_type : 1);
+                mcLoadedDoubleMode = mode;
                 mod = editingBinding.double_mod || 0;
                 key = editingBinding.double_key || 0;
                 cons = editingBinding.double_cons || 0;
@@ -2741,6 +2797,32 @@ if (mod & 0x01) chips.push('左Ctrl');
             }
         }
 
+        // Effective (inheritance-aware) state of the long/double triggers for
+        // the key being edited. On overlay layers (1~4) a trigger without an
+        // override inherits Layer 0, so the modal must show and save the
+        // EFFECTIVE state: otherwise the toggle reads "off" while the default
+        // layer's action keeps firing, and unchecking it can never silence it
+        // (the firmware treats has_*=false on an overlay as "inherit").
+        // mcShown* = what the toggles display when the modal opens. Flipping a
+        // toggle materializes an explicit override, where unchecked means a
+        // hard disable (ACTION_NONE, type 0) -- never inherit.
+        let mcShownHasLong = false, mcShownHasDouble = false;
+        let mcShownLongType = 1, mcShownDoubleType = 1;
+        let mcLoadedLongMode = 1, mcLoadedDoubleMode = 1;
+
+        function resolveEffectiveTrigger(vk, binding, trigger) {
+            const pick = b => (b && b['has_' + trigger] && b[trigger + '_type'] !== 10 && b[trigger + '_type'] !== 0) ? b : null;
+            const curHit = pick(binding);
+            if (curHit) return { active: true, type: curHit[trigger + '_type'] };
+            if (currentEditingLayer > 0) {
+                const layer0 = currentKeymap.layers[0];
+                const base = ((layer0 && layer0.bindings) || []).find(x => x.source_vk === vk) || FACTORY_KEYMAP[vk];
+                const baseHit = pick(base);
+                if (baseHit) return { active: true, type: baseHit[trigger + '_type'] };
+            }
+            return { active: false, type: 0 };
+        }
+
         async function openRemapModal(keyVk, keyName) {
             editingKey = keyVk;
             normalizeKeymapConfig();
@@ -2782,16 +2864,28 @@ if (mod & 0x01) chips.push('左Ctrl');
                 transCard.style.display = (currentEditingLayer === 0) ? 'none' : 'block';
             }
 
-            // Sync switches and sliders before tab loads
+            // Sync switches and sliders before tab loads. On overlay layers the
+            // toggles reflect the effective (inheritance-aware) state, so an
+            // inherited-on trigger no longer reads "off" while it fires.
+            mcShownHasLong = !!editingBinding.has_long;
+            mcShownHasDouble = !!editingBinding.has_double;
+            mcShownLongType = editingBinding.long_type !== undefined ? editingBinding.long_type : 1;
+            mcShownDoubleType = editingBinding.double_type !== undefined ? editingBinding.double_type : 1;
+            if (currentEditingLayer > 0) {
+                const effL = resolveEffectiveTrigger(searchVk, editingBinding, 'long');
+                const effD = resolveEffectiveTrigger(searchVk, editingBinding, 'double');
+                mcShownHasLong = effL.active; mcShownLongType = effL.type;
+                mcShownHasDouble = effD.active; mcShownDoubleType = effD.type;
+            }
             const longToggle = document.getElementById('toggle-enable-long');
-            if (longToggle) longToggle.checked = !!editingBinding.has_long;
+            if (longToggle) longToggle.checked = mcShownHasLong;
             const longSlider = document.getElementById('slider-long-ms');
             if (longSlider) longSlider.value = editingBinding.long_ms || 600;
             const longLabel = document.getElementById('label-long-ms');
             if (longLabel) longLabel.innerText = `${editingBinding.long_ms || 600}ms`;
 
             const doubleToggle = document.getElementById('toggle-enable-double');
-            if (doubleToggle) doubleToggle.checked = !!editingBinding.has_double;
+            if (doubleToggle) doubleToggle.checked = mcShownHasDouble;
             const doubleSlider = document.getElementById('slider-double-ms');
             if (doubleSlider) doubleSlider.value = editingBinding.double_ms || 250;
             const doubleLabel = document.getElementById('label-double-ms');
@@ -2974,13 +3068,15 @@ if (mod & 0x01) chips.push('左Ctrl');
                 editingBinding.has_double = false;
             }
 
-            // Sparse storage cleanup: if on Layer 1~4 and binding is completely transparent or disabled, remove it
+            // Sparse storage cleanup: if on Layer 1~4 and binding is completely transparent, remove it.
+            // Explicit hard-disables (ACTION_NONE, type 0) are NOT transparent:
+            // they must persist to keep the default layer's action silenced.
             let isAllTransparent = false;
             if (currentEditingLayer > 0) {
                 isAllTransparent = 
-                    (!editingBinding.has_click || editingBinding.click_type === 10 || editingBinding.click_type === 0) &&
-                    (!editingBinding.has_long || editingBinding.long_type === 10 || editingBinding.long_type === 0) &&
-                    (!editingBinding.has_double || editingBinding.double_type === 10 || editingBinding.double_type === 0);
+                    (!editingBinding.has_click || editingBinding.click_type === 10) &&
+                    (!editingBinding.has_long || editingBinding.long_type === 10) &&
+                    (!editingBinding.has_double || editingBinding.double_type === 10);
             }
 
             const idx = curLayer.bindings.findIndex(x => x.source_vk === editingBinding.source_vk);
