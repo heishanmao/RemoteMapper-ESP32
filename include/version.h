@@ -2,9 +2,9 @@
 
 #define FIRMWARE_NAME       "RemoteMapper-ESP32"
 #if defined(REMOTEMAPPER_DWC2_DRIVER)
-#define FIRMWARE_VERSION    "1.2.60"
+#define FIRMWARE_VERSION    "1.2.61"
 #else
-#define FIRMWARE_VERSION    "1.2.60-legacy-usb"
+#define FIRMWARE_VERSION    "1.2.61-legacy-usb"
 #endif
 #define HARDWARE_TARGET     "ESP32-S3-N16R8"
 #define AUTHOR              "RemoteMapper Project"

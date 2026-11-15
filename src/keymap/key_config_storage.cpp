@@ -370,6 +370,24 @@ bool key_config_storage_save(key_mapper_engine_t *engine) {
     return key_config_storage_save_candidate(&snapshot);
 }
 
+// NVS variable-length entries must fit entirely inside one 4KB page: the
+// usable data area is ~4000 bytes per entry, so a cfg_json blob larger than
+// that can NEVER be written -- not even into an empty partition. Erasing the
+// old entry does not help once the JSON grows past the limit; the write fails
+// with ESP_ERR_NVS_NOT_ENOUGH_SPACE and (with the erase-first strategy) leaves
+// the namespace empty. To keep the config growable, large JSON is split
+// across two keys ("cfg_a" + "cfg_b"), each far below the per-page limit.
+#define KEYMAP_NVS_SINGLE_KEY_MAX 3800
+
+static bool keymap_nvs_put_and_verify(Preferences &prefs, const char *key, const String &value) {
+    if (value.length() == 0) return true; // nothing to store
+    prefs.remove(key);
+    size_t written = prefs.putString(key, value);
+    if (written != value.length()) return false;
+    String readback = prefs.getString(key, "");
+    return readback == value;
+}
+
 bool key_config_storage_save_candidate(const key_mapper_engine_t *candidate) {
     if (!candidate || candidate->active_layer >= MAX_LAYERS) return false;
     String json = key_config_layout_to_json(candidate->layers, candidate->active_layer);
@@ -386,24 +404,41 @@ bool key_config_storage_save_candidate(const key_mapper_engine_t *candidate) {
     // no-op save succeeds) but any real change hits ESP_ERR_NVS_NOT_ENOUGH_
     // SPACE and putString returns 0. Erasing the old entry first releases
     // its slots for in-page reuse, keeping repeated edits working forever.
-    prefs.remove("cfg_json");
-    size_t written = prefs.putString("cfg_json", json);
-    if (written != json.length()) {
-        // Last resort: wipe the namespace (cfg_json is its only key) and
-        // retry once in case fragmentation blocked the single erase.
+    if (json.length() <= KEYMAP_NVS_SINGLE_KEY_MAX) {
+        if (keymap_nvs_put_and_verify(prefs, "cfg_json", json)) {
+            prefs.end();
+            app_log("KEYMAP", "Saved keymap to NVS successfully (%u bytes written)", (unsigned int)json.length());
+            return true;
+        }
+        // Last resort for the single-key path: wipe the namespace (it only
+        // holds keymap state) and retry once in case fragmentation blocked
+        // the blob placement.
         prefs.clear();
-        written = prefs.putString("cfg_json", json);
+        if (keymap_nvs_put_and_verify(prefs, "cfg_json", json)) {
+            prefs.end();
+            app_log("KEYMAP", "Saved keymap to NVS after clear (%u bytes written)", (unsigned int)json.length());
+            return true;
+        }
+        app_log("KEYMAP", "Single-key NVS write failed (%u bytes), falling back to chunked storage", (unsigned int)json.length());
     }
-    String readback = prefs.getString("cfg_json", "");
-    prefs.end();
 
-    if (written != json.length() || readback != json) {
-        app_log("KEYMAP", "ERROR: keymap NVS write failed verification (written=%u expected=%u readback=%s)",
-                (unsigned int)written, (unsigned int)json.length(), readback == json ? "match" : "mismatch");
-        return false;
+    // Chunked storage: split the JSON in half so each part fits comfortably
+    // inside one NVS page. Loader concatenates cfg_a + cfg_b.
+    prefs.clear();
+    const size_t half = (json.length() + 1) / 2;
+    const String part_a = json.substring(0, half);
+    const String part_b = json.substring(half);
+    const bool ok_a = keymap_nvs_put_and_verify(prefs, "cfg_a", part_a);
+    const bool ok_b = keymap_nvs_put_and_verify(prefs, "cfg_b", part_b);
+    prefs.end();
+    if (ok_a && ok_b) {
+        app_log("KEYMAP", "Saved keymap to NVS chunked (%u = %u + %u bytes)",
+                (unsigned int)json.length(), (unsigned int)part_a.length(), (unsigned int)part_b.length());
+        return true;
     }
-    app_log("KEYMAP", "Saved keymap to NVS successfully (%u bytes written)", (unsigned int)written);
-    return true;
+    app_log("KEYMAP", "ERROR: keymap NVS chunked write failed (len=%u ok_a=%d ok_b=%d)",
+            (unsigned int)json.length(), ok_a ? 1 : 0, ok_b ? 1 : 0);
+    return false;
 }
 
 bool key_config_storage_load(key_mapper_engine_t *engine) {
@@ -415,6 +450,11 @@ bool key_config_storage_load(key_mapper_engine_t *engine) {
         return false;
     }
     String json = prefs.getString("cfg_json", "");
+    if (json.length() == 0) {
+        // Chunked format: cfg_a + cfg_b concatenated.
+        String a = prefs.getString("cfg_a", "");
+        if (a.length() > 0) json = a + prefs.getString("cfg_b", "");
+    }
     prefs.end();
 
     if (json.length() == 0) {
