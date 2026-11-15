@@ -356,11 +356,9 @@ static void key_engine_load_defaults_impl(key_mapper_engine_t *engine, bool upda
         memset(&b, 0, sizeof(b));
         b.source_vk = MI_KEY_VOL_UP;
         b.has_click = true;
-        b.click_action = (key_action_t){ ACTION_CONSUMER_TAP, USB_MOD_NONE, USB_KEY_NONE, USB_CONSUMER_VOLUME_UP, 0 };
-        b.has_repeat = true;
-        b.repeat_action = (key_action_t){ ACTION_CONSUMER_TAP, USB_MOD_NONE, USB_KEY_NONE, USB_CONSUMER_VOLUME_UP, 0 };
-        b.repeat_delay_ms = 350;
-        b.repeat_interval_ms = 70;
+        // Native hold pass-through (borrowed from upstream): the host paces
+        // its own auto-repeat while held, instead of the engine firing taps.
+        b.click_action = (key_action_t){ ACTION_CONSUMER_HOLD, USB_MOD_NONE, USB_KEY_NONE, USB_CONSUMER_VOLUME_UP, 0 };
         l0->bindings[l0->binding_count++] = b;
     }
 
@@ -370,11 +368,7 @@ static void key_engine_load_defaults_impl(key_mapper_engine_t *engine, bool upda
         memset(&b, 0, sizeof(b));
         b.source_vk = MI_KEY_VOL_DOWN;
         b.has_click = true;
-        b.click_action = (key_action_t){ ACTION_CONSUMER_TAP, USB_MOD_NONE, USB_KEY_NONE, USB_CONSUMER_VOLUME_DOWN, 0 };
-        b.has_repeat = true;
-        b.repeat_action = (key_action_t){ ACTION_CONSUMER_TAP, USB_MOD_NONE, USB_KEY_NONE, USB_CONSUMER_VOLUME_DOWN, 0 };
-        b.repeat_delay_ms = 350;
-        b.repeat_interval_ms = 70;
+        b.click_action = (key_action_t){ ACTION_CONSUMER_HOLD, USB_MOD_NONE, USB_KEY_NONE, USB_CONSUMER_VOLUME_DOWN, 0 };
         l0->bindings[l0->binding_count++] = b;
     }
 

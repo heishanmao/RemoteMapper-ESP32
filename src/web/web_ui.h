@@ -1080,8 +1080,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                         <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">组合快捷键</div>
                     </div>
                     <div class="mode-card" id="mode-card-4" onclick="selectActionMode(4)">
-                        <div class="mode-title" style="font-size:13px; font-weight:700; color:#fff;">多媒体控制</div>
-                        <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">音量/播放/休眠</div>
+                        <div class="mode-title" style="font-size:13px; font-weight:700; color:#fff;">多媒体点按</div>
+                        <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">点按触发·可连发</div>
+                    </div>
+                    <div class="mode-card" id="mode-card-5" onclick="selectActionMode(5)">
+                        <div class="mode-title" style="font-size:13px; font-weight:700; color:#fff;">多媒体直通</div>
+                        <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">按住生效·主机连调</div>
                     </div>
                     <div class="mode-card" id="mode-card-9" onclick="selectActionMode(9)">
                         <div class="mode-title" style="font-size:13px; font-weight:700; color:#fff;">切换层级</div>
@@ -1876,6 +1880,9 @@ if (mod & 0x01) parts.push('左Ctrl');
             if (type === 7) {
                 return hotkeyStr ? `[语音: ${hotkeyStr}]` : '[语音对讲录音]';
             }
+            if (type === 5 && cons > 0) {
+                return `[直通: ${hotkeyStr}]`;
+            }
             return hotkeyStr;
         }
 
@@ -2380,7 +2387,7 @@ if (mod & 0x01) parts.push('左Ctrl');
                     editingBinding.click_mac = wolMac;
                     editingBinding.click_key = 0; editingBinding.click_mod = 0; editingBinding.click_cons = 0;
                     editingBinding.has_click = (wolMac.length >= 12);
-                } else if (mode === 4) {
+                } else if (mode === 4 || mode === 5) {
                     editingBinding.click_cons = code;
                     editingBinding.click_key = 0; editingBinding.click_mod = 0;
                     editingBinding.has_click = (code > 0);
@@ -2440,7 +2447,7 @@ if (mod & 0x01) parts.push('左Ctrl');
                     } else if (mode === 11) {
                         editingBinding.long_mac = wolMac;
                         editingBinding.long_key = 0; editingBinding.long_mod = 0; editingBinding.long_cons = 0;
-                    } else if (mode === 4) {
+                    } else if (mode === 4 || mode === 5) {
                         editingBinding.long_cons = code;
                         editingBinding.long_key = 0; editingBinding.long_mod = 0;
                     } else {
@@ -2465,7 +2472,7 @@ if (mod & 0x01) parts.push('左Ctrl');
                     } else if (mode === 11) {
                         editingBinding.double_mac = wolMac;
                         editingBinding.double_key = 0; editingBinding.double_mod = 0; editingBinding.double_cons = 0;
-                    } else if (mode === 4) {
+                    } else if (mode === 4 || mode === 5) {
                         editingBinding.double_cons = code;
                         editingBinding.double_key = 0; editingBinding.double_mod = 0;
                     } else {
@@ -2629,11 +2636,13 @@ if (mod & 0x01) parts.push('左Ctrl');
                 let curMod = parseHexOrDec(document.getElementById('adv-mod').value) || 0;
                 let curCode = parseHexOrDec(document.getElementById('adv-code').value) || 0;
 
-                if (mode === 4) {
-                    if (inst) inst.innerHTML = '<b>多媒体控制模式</b>：在下方下拉框中选择具体的控制功能';
+                if (mode === 4 || mode === 5) {
+                    if (inst) inst.innerHTML = (mode === 5)
+                        ? '<b>多媒体直通模式</b>：按下即生效、松开即停止，按住时由电脑自主调节（音量等连续调节最顺滑）'
+                        : '<b>多媒体点按模式</b>：在下方下拉框中选择具体的控制功能（单击触发，可开启按住连发）';
                     let curCons = curCode >= 500 ? curCode : 545;
                     if (!skipRender) {
-                        renderTriggerView(4, 0, 0, curCons);
+                        renderTriggerView(mode, 0, 0, curCons);
                         if (quickSelect) quickSelect.value = `c:0:${curCons}`;
                     }
                 } else if (mode === 1) {
@@ -2774,8 +2783,10 @@ if (inst) inst.innerHTML = (currentRemoteModel === 'chromecast' && voiceToggleMo
             if (isVoice && currentEditingLayer === 0) {
                 type = 7;
                 cons = 0;
-            } else if (type === 4 || cons > 0) {
-                type = 4;
+            } else if (type === 4 || type === 5 || cons > 0) {
+                // Consumer action: keep tap (4) vs hold pass-through (5)
+                // distinct so the right mode card stays selected.
+                if (type !== 4 && type !== 5) type = 4;
                 key = 0;
                 mod = 0;
             } else if (type === 9) {
@@ -2864,6 +2875,14 @@ if (inst) inst.innerHTML = (currentRemoteModel === 'chromecast' && voiceToggleMo
                 display.innerHTML = `<span class="kbd-chip" style="border-color:var(--accent-cyan); color:var(--accent-cyan);">🖱 ${moveMap[key] || ('移动 0x' + (key||0).toString(16).toUpperCase())}</span>`;
                 const quickSel = document.getElementById('quick-key-select');
                 if (quickSel) quickSel.value = 'mv:0x00:0x' + (key||0).toString(16).toUpperCase().padStart(2, '0');
+                return;
+            }
+
+            if (type === 5 && cons > 0) {
+                const consMap = {233:'音量+', 545:'音量+', 234:'音量-', 546:'音量-', 226:'静音', 547:'静音', 205:'播放/暂停', 516:'播放/暂停', 537:'下一曲', 538:'上一曲', 548:'返回', 557:'主页'};
+                display.innerHTML = `<span class="kbd-chip" style="border-color:var(--accent-cyan); color:var(--accent-cyan);">⏳ 按住生效: ${consMap[cons] || ('多媒体 0x' + cons.toString(16).toUpperCase())}</span>`;
+                const quickSel = document.getElementById('quick-key-select');
+                if (quickSel) quickSel.value = 'c:0:' + cons;
                 return;
             }
 
@@ -3104,8 +3123,10 @@ if (mod & 0x01) chips.push('左Ctrl');
                     document.getElementById('quick-key-select').value = '';
                     return;
                 }
-                selectActionMode(4);
-                renderTriggerView(4, 0, 0, code);
+                // Preserve hold pass-through (5) if the user is already in it.
+                const consMode = (currentSelectedMode === 5) ? 5 : 4;
+                selectActionMode(consMode);
+                renderTriggerView(consMode, 0, 0, code);
             } else if (prefix === 'mo') {
                 selectActionMode(17, true);
                 renderTriggerView(17, 0, code, 0);
@@ -3113,10 +3134,10 @@ if (mod & 0x01) chips.push('左Ctrl');
                 selectActionMode(18, true);
                 renderTriggerView(18, 0, code, 0);
             } else if (prefix === 'm') {
-                if (currentSelectedMode === 4 || currentSelectedMode === 9 || currentSelectedMode === 10 || currentSelectedMode === 11) selectActionMode(2);
+                if (currentSelectedMode === 4 || currentSelectedMode === 5 || currentSelectedMode === 9 || currentSelectedMode === 10 || currentSelectedMode === 11) selectActionMode(2);
                 renderTriggerView(currentSelectedMode, mod, 0, 0);
             } else if (prefix === 'k') {
-                if (currentSelectedMode === 4 || currentSelectedMode === 9 || currentSelectedMode === 10 || currentSelectedMode === 11) selectActionMode(2);
+                if (currentSelectedMode === 4 || currentSelectedMode === 5 || currentSelectedMode === 9 || currentSelectedMode === 10 || currentSelectedMode === 11) selectActionMode(2);
                 renderTriggerView(currentSelectedMode, mod, code, 0);
             }
         }
@@ -3128,8 +3149,8 @@ if (mod & 0x01) chips.push('左Ctrl');
 
             if (isVoice && currentEditingLayer === 0) {
                 renderTriggerView(7, mod, code, 0);
-            } else if (currentSelectedMode === 4 || code >= 500) {
-                renderTriggerView(4, 0, 0, code);
+            } else if (currentSelectedMode === 4 || currentSelectedMode === 5 || code >= 500) {
+                renderTriggerView(currentSelectedMode === 5 ? 5 : 4, 0, 0, code);
             } else if (currentSelectedMode === 9 || currentSelectedMode === 10 || currentSelectedMode === 11) {
                 renderTriggerView(currentSelectedMode, 0, 0, 0);
             } else {
