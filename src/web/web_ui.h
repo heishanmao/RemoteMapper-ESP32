@@ -1095,6 +1095,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                         <div class="mode-title" style="font-size:13px; font-weight:700; color:#fff;">鼠标动作</div>
                         <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">左/右/中键·滚轮</div>
                     </div>
+                    <div class="mode-card" id="mode-card-18" onclick="selectActionMode(18)">
+                        <div class="mode-title" style="font-size:13px; font-weight:700; color:#fff;">指针移动</div>
+                        <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">按住持续移动指针</div>
+                    </div>
                     <div class="mode-card" id="mode-card-10" onclick="selectActionMode(10)">
                         <div class="mode-title" style="font-size:13px; font-weight:700; color:#fff;">穿透继承</div>
                         <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">继承默认层配置</div>
@@ -1420,6 +1424,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                             <option value="mo:0x00:0x04">鼠标中键 (Mouse Middle)</option>
                             <option value="mo:0x00:0x10">滚轮向上 (Wheel Up)</option>
                             <option value="mo:0x00:0x20">滚轮向下 (Wheel Down)</option>
+                        </optgroup>
+                        <optgroup label="指针移动（按住持续移动）" id="quick-optgroup-mouse-move">
+                            <option value="mv:0x00:0x01">指针上移 (Move Up)</option>
+                            <option value="mv:0x00:0x02">指针下移 (Move Down)</option>
+                            <option value="mv:0x00:0x04">指针左移 (Move Left)</option>
+                            <option value="mv:0x00:0x08">指针右移 (Move Right)</option>
                         </optgroup>
                     </select>
                 </div>
@@ -1805,6 +1815,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             if (type === 17) {
                 const mouseMap = {1:'鼠标左键', 2:'鼠标右键', 4:'鼠标中键', 16:'滚轮上', 32:'滚轮下'};
                 return `[${mouseMap[key] || ('鼠标 0x' + (key||0).toString(16).toUpperCase())}]`;
+            }
+            if (type === 18) {
+                const moveMap = {1:'指针上移', 2:'指针下移', 4:'指针左移', 8:'指针右移'};
+                return `[${moveMap[key] || ('移动 0x' + (key||0).toString(16).toUpperCase())}]`;
             }
             if (type === 9) {
                 const tgt = target_layer || 0;
@@ -2378,10 +2392,22 @@ if (mod & 0x01) parts.push('左Ctrl');
                 }
                 // 按住连发：仅点按类动作（键盘 tap=1 / 消费者 tap=4 / 鼠标 tap=17）
                 // 且单击有效时才允许开启；连发动作镜像单击字段。
+                // 指针移动(mode 18)必须连发才连续，保存时强制开启。
                 const repeatToggle = document.getElementById('toggle-enable-repeat');
                 if (repeatToggle) {
                     const repeatable = editingBinding.has_click && (mode === 1 || mode === 4 || mode === 17);
-                    if (repeatToggle.checked && repeatable) {
+                    const moveMode = mode === 18 && editingBinding.has_click;
+                    if (moveMode) {
+                        editingBinding.has_repeat = true;
+                        editingBinding.repeat_delay_ms = 150;
+                        editingBinding.repeat_interval_ms = 25;
+                        editingBinding.repeat_type = editingBinding.click_type;
+                        editingBinding.repeat_key = editingBinding.click_key;
+                        editingBinding.repeat_mod = editingBinding.click_mod;
+                        editingBinding.repeat_cons = editingBinding.click_cons;
+                        editingBinding.repeat_layer = editingBinding.click_layer;
+                        editingBinding.repeat_mac = editingBinding.click_mac;
+                    } else if (repeatToggle.checked && repeatable) {
                         const repSlider = document.getElementById('slider-repeat-ms');
                         editingBinding.has_repeat = true;
                         editingBinding.repeat_delay_ms = 300;
@@ -2581,6 +2607,18 @@ if (mod & 0x01) parts.push('左Ctrl');
                     renderTriggerView(17, 0, curCode, 0);
                     if (quickSelect) quickSelect.value = 'mo:0x00:0x' + curCode.toString(16).toUpperCase().padStart(2, '0');
                 }
+            } else if (mode === 18) {
+                if (recorderBox) recorderBox.style.display = 'none';
+                if (advContainer) advContainer.style.display = 'block';
+                if (layerBox) layerBox.style.display = 'none';
+                if (transBox) transBox.style.display = 'none';
+                if (advActionBox) advActionBox.style.display = 'none';
+                if (inst) inst.innerHTML = '<b>指针移动模式</b>：选择移动方向，保存后按住按键指针将持续移动（连发自动开启）';
+                let curCode = parseHexOrDec(document.getElementById('adv-code').value) || 0x01;
+                if (!skipRender) {
+                    renderTriggerView(18, 0, curCode, 0);
+                    if (quickSelect) quickSelect.value = 'mv:0x00:0x' + curCode.toString(16).toUpperCase().padStart(2, '0');
+                }
             } else {
                 if (recorderBox) recorderBox.style.display = 'block';
                 if (advContainer) advContainer.style.display = 'block';
@@ -2758,6 +2796,12 @@ if (inst) inst.innerHTML = (currentRemoteModel === 'chromecast' && voiceToggleMo
                 key = key || 0x10;
                 mod = 0;
                 cons = 0;
+            } else if (type === 18) {
+                // Pointer-move directions live in key_code (speed uses the
+                // firmware default); force a sensible default for the badge.
+                key = key || 0x01;
+                mod = 0;
+                cons = 0;
             }
 
             currentSelectedMode = type;
@@ -2812,6 +2856,14 @@ if (inst) inst.innerHTML = (currentRemoteModel === 'chromecast' && voiceToggleMo
                 display.innerHTML = `<span class="kbd-chip" style="border-color:var(--accent-cyan); color:var(--accent-cyan);">🖱 ${mouseMap[key] || ('鼠标 0x' + (key||0).toString(16).toUpperCase())}</span>`;
                 const quickSel = document.getElementById('quick-key-select');
                 if (quickSel) quickSel.value = 'mo:0x00:0x' + (key||0).toString(16).toUpperCase().padStart(2, '0');
+                return;
+            }
+
+            if (type === 18) {
+                const moveMap = {1:'指针上移', 2:'指针下移', 4:'指针左移', 8:'指针右移'};
+                display.innerHTML = `<span class="kbd-chip" style="border-color:var(--accent-cyan); color:var(--accent-cyan);">🖱 ${moveMap[key] || ('移动 0x' + (key||0).toString(16).toUpperCase())}</span>`;
+                const quickSel = document.getElementById('quick-key-select');
+                if (quickSel) quickSel.value = 'mv:0x00:0x' + (key||0).toString(16).toUpperCase().padStart(2, '0');
                 return;
             }
 
@@ -3057,6 +3109,9 @@ if (mod & 0x01) chips.push('左Ctrl');
             } else if (prefix === 'mo') {
                 selectActionMode(17, true);
                 renderTriggerView(17, 0, code, 0);
+            } else if (prefix === 'mv') {
+                selectActionMode(18, true);
+                renderTriggerView(18, 0, code, 0);
             } else if (prefix === 'm') {
                 if (currentSelectedMode === 4 || currentSelectedMode === 9 || currentSelectedMode === 10 || currentSelectedMode === 11) selectActionMode(2);
                 renderTriggerView(currentSelectedMode, mod, 0, 0);
@@ -3097,7 +3152,7 @@ if (mod & 0x01) chips.push('左Ctrl');
 
             // If user is in layer switch, transparent, advanced extension, or
             // mouse action mode, ignore keypresses (nothing to record).
-            if (currentSelectedMode === 9 || currentSelectedMode === 10 || currentSelectedMode === 11 || currentSelectedMode === 17) return;
+            if (currentSelectedMode === 9 || currentSelectedMode === 10 || currentSelectedMode === 11 || currentSelectedMode === 17 || currentSelectedMode === 18) return;
 
             // If user is typing in advanced numeric inputs, let it through
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;

@@ -29,12 +29,14 @@ typedef enum {
        Keeping the gap stable lets keymap configs stay interchangeable. */
     ACTION_RESERVED_VOICE_TOGGLE = 15,
     ACTION_RESERVED_VOICE_TOGGLE_RELEASE = 16,
-    ACTION_MOUSE_TAP = 17       // Tap a mouse button or wheel notch; key_code
+    ACTION_MOUSE_TAP = 17,      // Tap a mouse button or wheel notch; key_code
                                 // encodes which (MOUSE_CODE_* below)
+    ACTION_MOUSE_MOVE = 18      // Move the pointer; key_code encodes direction
+                                // (MOUSE_MOVE_* below), modifier = pixels/tick
 } key_action_type_t;
 
 // Highest action type accepted by JSON parsing and storage validation.
-#define KEY_ACTION_TYPE_MAX ACTION_MOUSE_TAP
+#define KEY_ACTION_TYPE_MAX ACTION_MOUSE_MOVE
 
 // ACTION_MOUSE_TAP key_code encodings: HID button bits plus wheel pseudo-codes.
 #define MOUSE_CODE_LEFT        0x01
@@ -42,6 +44,15 @@ typedef enum {
 #define MOUSE_CODE_MIDDLE      0x04
 #define MOUSE_CODE_WHEEL_UP    0x10
 #define MOUSE_CODE_WHEEL_DOWN  0x20
+
+// ACTION_MOUSE_MOVE key_code encodings: relative movement directions.
+// modifier holds the per-tick delta in pixels (0 -> MOUSE_MOVE_SPEED_DEFAULT).
+#define MOUSE_MOVE_UP          0x01
+#define MOUSE_MOVE_DOWN        0x02
+#define MOUSE_MOVE_LEFT        0x04
+#define MOUSE_MOVE_RIGHT       0x08
+#define MOUSE_MOVE_SPEED_DEFAULT 8
+#define MOUSE_MOVE_TICK_MS     25     // fixed repeat cadence for smooth motion
 
 typedef struct {
     key_action_type_t type;

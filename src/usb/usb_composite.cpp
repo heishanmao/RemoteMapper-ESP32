@@ -68,6 +68,16 @@ static struct {
     int8_t wheel;
 } s_mouse_tap = {};
 
+// Pointer-movement mailbox: ACTION_MOUSE_MOVE carries a relative (dx, dy)
+// delta. Like the tap mailbox it is self-contained and owned end-to-end by
+// the sender task, so no epoch bookkeeping applies. Kept separate from the
+// tap mailbox so a click and a move tick can both be in flight at once.
+static struct {
+    bool pending;
+    int8_t dx;
+    int8_t dy;
+} s_mouse_move = {};
+
 // Non-recursive mutex guarding the USB HID reports + registry. Defined here in
 // plain C++ (file-local helpers): the guard section below lives outside the
 // extern "C" block, so keeping the same linkage avoids a C/C++ conflict.
@@ -269,6 +279,31 @@ static void hid_mouse_send_tap_pair(uint8_t buttons, int8_t wheel) {
     else s_hid_tx_failed++;
 }
 
+static void hid_mouse_send_move(int8_t dx, int8_t dy) {
+    if (!tud_ready() || (dx == 0 && dy == 0)) return;
+    hid_lock();
+    hid_mouse_report_t report = {};
+    report.x = dx;
+    report.y = dy;
+    const bool ok = s_hid_transport.SendReport(HID_REPORT_ID_MOUSE,
+            &report, sizeof(report), 20);
+    hid_unlock();
+    if (ok) s_hid_tx_ok++;
+    else s_hid_tx_failed++;
+}
+
+static void hid_mouse_request_move(uint8_t dir, uint8_t speed) {
+    const int8_t step = (int8_t)(speed ? speed : MOUSE_MOVE_SPEED_DEFAULT);
+    portENTER_CRITICAL(&s_hid_command_mux);
+    s_mouse_move.dx = (dir & MOUSE_MOVE_RIGHT) ? step
+            : ((dir & MOUSE_MOVE_LEFT) ? (int8_t)-step : 0);
+    s_mouse_move.dy = (dir & MOUSE_MOVE_DOWN) ? step
+            : ((dir & MOUSE_MOVE_UP) ? (int8_t)-step : 0);
+    s_mouse_move.pending = true;
+    portEXIT_CRITICAL(&s_hid_command_mux);
+    if (s_hid_sender_task) xTaskNotifyGive(s_hid_sender_task);
+}
+
 static void hid_sender_task(void *) {
     using Queue = remotemapper::HidCommandQueue;
     for (;;) {
@@ -288,6 +323,23 @@ static void hid_sender_task(void *) {
         portEXIT_CRITICAL(&s_hid_command_mux);
         if (mouse_pending) {
             hid_mouse_send_tap_pair(mouse_buttons, mouse_wheel);
+            continue;
+        }
+
+        // Movement mailbox drains right after taps (same self-contained
+        // guarantee: one report, no held host state).
+        bool mouse_move_pending = false;
+        int8_t mouse_dx = 0, mouse_dy = 0;
+        portENTER_CRITICAL(&s_hid_command_mux);
+        if (s_mouse_move.pending) {
+            mouse_move_pending = true;
+            mouse_dx = s_mouse_move.dx;
+            mouse_dy = s_mouse_move.dy;
+            s_mouse_move.pending = false;
+        }
+        portEXIT_CRITICAL(&s_hid_command_mux);
+        if (mouse_move_pending) {
+            hid_mouse_send_move(mouse_dx, mouse_dy);
             continue;
         }
 
@@ -1244,6 +1296,9 @@ void usb_hid_dispatch_action(const key_action_t *action) {
             break;
         case ACTION_MOUSE_TAP:
             hid_mouse_request_tap(action->key_code);
+            break;
+        case ACTION_MOUSE_MOVE:
+            hid_mouse_request_move(action->key_code, action->modifier);
             break;
         case ACTION_VOICE_HOLD: {
             // Serialize a new session against loop-side drain completion. The

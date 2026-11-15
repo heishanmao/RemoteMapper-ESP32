@@ -171,7 +171,8 @@ static void emit_action(key_mapper_engine_t *engine, const key_action_t *action,
     if (engine->active_layer != 0 && engine->layers[engine->active_layer].type == LAYER_TYPE_ONESHOT) {
         if (action->type == ACTION_KEYBOARD_TAP || action->type == ACTION_CONSUMER_TAP ||
             action->type == ACTION_KEYBOARD_RELEASE || action->type == ACTION_CONSUMER_RELEASE ||
-            action->type == ACTION_VOICE_RELEASE || action->type == ACTION_MOUSE_TAP) {
+            action->type == ACTION_VOICE_RELEASE || action->type == ACTION_MOUSE_TAP ||
+            action->type == ACTION_MOUSE_MOVE) {
             key_engine_switch_layer(engine, 0, engine->last_telemetry.timestamp);
         }
     }
@@ -573,7 +574,10 @@ void key_engine_feed_key(key_mapper_engine_t *engine, uint8_t raw_key_code, bool
                     b.click_action.type == ACTION_CONSUMER_HOLD || 
                     b.click_action.type == ACTION_VOICE_HOLD) {
                     emit_action(engine, &b.click_action, raw_key_code, true);
-                } else if (b.click_action.type == ACTION_SWITCH_LAYER || b.click_action.type == ACTION_WOL) {
+                } else if (b.click_action.type == ACTION_SWITCH_LAYER || b.click_action.type == ACTION_WOL ||
+                           b.click_action.type == ACTION_MOUSE_MOVE) {
+                    // Mouse move fires its first tick on press so the pointer
+                    // reacts instantly; repeat keeps it going while held.
                     emit_action(engine, &b.click_action, raw_key_code, true);
                 }
             }
@@ -596,7 +600,8 @@ void key_engine_feed_key(key_mapper_engine_t *engine, uint8_t raw_key_code, bool
                 } else if (b.click_action.type == ACTION_VOICE_HOLD) {
                     key_action_t rel = { ACTION_VOICE_RELEASE, 0, 0, 0, 0 };
                     emit_action(engine, &rel, raw_key_code, false);
-                } else if (b.has_click && b.click_action.type != ACTION_SWITCH_LAYER && b.click_action.type != ACTION_WOL) {
+                } else if (b.has_click && b.click_action.type != ACTION_SWITCH_LAYER && b.click_action.type != ACTION_WOL &&
+                           b.click_action.type != ACTION_MOUSE_MOVE) {
                     emit_action(engine, &b.click_action, raw_key_code, false);
                 }
             } else {
@@ -678,6 +683,11 @@ void key_engine_tick(key_mapper_engine_t *engine, uint32_t now_ms) {
                     emit_action(engine, &b.repeat_action, b.source_vk, true);
                     uint32_t interval = b.repeat_interval_ms ? b.repeat_interval_ms : 150;
                     s->next_repeat_timestamp = now_ms + interval;
+                } else if (b.repeat_action.type == ACTION_MOUSE_MOVE) {
+                    // Pointer movement uses a fixed fast cadence for smooth
+                    // motion; speed lives in the action itself (px per tick).
+                    emit_action(engine, &b.repeat_action, b.source_vk, true);
+                    s->next_repeat_timestamp = now_ms + MOUSE_MOVE_TICK_MS;
                 } else {
                     s->next_repeat_timestamp = now_ms + 500;
                 }
