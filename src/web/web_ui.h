@@ -1047,6 +1047,24 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 </div>
             </div>
 
+            <div id="repeat-config-row" style="display:none; background:#070a10; border:1px solid var(--border-color); border-radius:10px; padding:12px 14px; margin-bottom:14px;">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <div>
+                        <b style="font-size:13px; color:#fff;">按住连发</b>
+                        <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">按住按键时按以下间隔重复执行单击动作（滚轮/多媒体键连续滚动或调节）</div>
+                    </div>
+                    <label class="switch-toggle">
+                        <input type="checkbox" id="toggle-enable-repeat" onchange="onToggleRepeat()">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div style="margin-top:10px; display:flex; align-items:center; gap:12px;">
+                    <span style="font-size:12px; color:var(--text-muted); white-space:nowrap;">连发间隔:</span>
+                    <input type="range" id="slider-repeat-ms" min="60" max="500" step="10" value="150" oninput="onRepeatSliderChange(this.value)" style="flex:1;">
+                    <span id="label-repeat-ms" style="font-size:12px; font-weight:bold; color:var(--accent-cyan); width:55px;">150ms</span>
+                </div>
+            </div>
+
             <!-- Mode Selector -->
             <div style="margin-bottom: 16px;">
                 <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px; font-weight:600;" id="action-mode-label">触发动作模式</label>
@@ -2358,6 +2376,26 @@ if (mod & 0x01) parts.push('左Ctrl');
                     editingBinding.click_cons = 0;
                     editingBinding.has_click = (mode !== 0 && (code > 0 || mod > 0));
                 }
+                // 按住连发：仅点按类动作（键盘 tap=1 / 消费者 tap=4 / 鼠标 tap=17）
+                // 且单击有效时才允许开启；连发动作镜像单击字段。
+                const repeatToggle = document.getElementById('toggle-enable-repeat');
+                if (repeatToggle) {
+                    const repeatable = editingBinding.has_click && (mode === 1 || mode === 4 || mode === 17);
+                    if (repeatToggle.checked && repeatable) {
+                        const repSlider = document.getElementById('slider-repeat-ms');
+                        editingBinding.has_repeat = true;
+                        editingBinding.repeat_delay_ms = 300;
+                        editingBinding.repeat_interval_ms = repSlider ? (parseInt(repSlider.value) || 150) : 150;
+                        editingBinding.repeat_type = editingBinding.click_type;
+                        editingBinding.repeat_key = editingBinding.click_key;
+                        editingBinding.repeat_mod = editingBinding.click_mod;
+                        editingBinding.repeat_cons = editingBinding.click_cons;
+                        editingBinding.repeat_layer = editingBinding.click_layer;
+                        editingBinding.repeat_mac = editingBinding.click_mac;
+                    } else {
+                        editingBinding.has_repeat = false;
+                    }
+                }
             } else if (currentTriggerTab === 'long') {
                 if (lngExplicitOff) {
                     // Explicit disable already written above (has_long=true, type 0);
@@ -2427,6 +2465,8 @@ if (mod & 0x01) parts.push('左Ctrl');
             if (tab === 'click') {
                 longHeader.style.display = 'none';
                 doubleHeader.style.display = 'none';
+                const repeatRow = document.getElementById('repeat-config-row');
+                if (repeatRow) repeatRow.style.display = 'block';
                 actionLabel.innerText = '单击触发动作模式';
                 mode = editingBinding.click_type !== undefined ? editingBinding.click_type : 2;
                 mod = editingBinding.click_mod || 0;
@@ -2434,9 +2474,17 @@ if (mod & 0x01) parts.push('左Ctrl');
                 cons = editingBinding.click_cons || 0;
                 target_layer = editingBinding.click_layer !== undefined ? editingBinding.click_layer : (currentEditingLayer === 1 ? 0 : 1);
                 mac = editingBinding.click_mac || '';
+                const repeatToggle = document.getElementById('toggle-enable-repeat');
+                if (repeatToggle) repeatToggle.checked = !!editingBinding.has_repeat;
+                const repeatSlider = document.getElementById('slider-repeat-ms');
+                if (repeatSlider) repeatSlider.value = editingBinding.repeat_interval_ms || 150;
+                const repeatLabel = document.getElementById('label-repeat-ms');
+                if (repeatLabel) repeatLabel.innerText = `${editingBinding.repeat_interval_ms || 150}ms`;
             } else if (tab === 'long') {
                 longHeader.style.display = 'block';
                 doubleHeader.style.display = 'none';
+                const repeatRow = document.getElementById('repeat-config-row');
+                if (repeatRow) repeatRow.style.display = 'none';
                 actionLabel.innerText = '长按触发动作模式';
                 document.getElementById('toggle-enable-long').checked = mcShownHasLong;
                 document.getElementById('slider-long-ms').value = editingBinding.long_ms || 600;
@@ -2452,6 +2500,8 @@ if (mod & 0x01) parts.push('左Ctrl');
             } else if (tab === 'double') {
                 longHeader.style.display = 'none';
                 doubleHeader.style.display = 'block';
+                const repeatRow = document.getElementById('repeat-config-row');
+                if (repeatRow) repeatRow.style.display = 'none';
                 actionLabel.innerText = '双击触发动作模式';
                 document.getElementById('toggle-enable-double').checked = mcShownHasDouble;
                 document.getElementById('slider-double-ms').value = editingBinding.double_ms || 250;
@@ -2836,6 +2886,18 @@ if (mod & 0x01) chips.push('左Ctrl');
                 editingBinding.double_ms = parseInt(val);
                 document.getElementById('label-double-ms').innerText = `${val}ms`;
             }
+        }
+
+        function onToggleRepeat() {
+            if (!editingBinding) return;
+            editingBinding.has_repeat = document.getElementById('toggle-enable-repeat').checked;
+            showToast(editingBinding.has_repeat ? '已开启按住连发' : '已关闭按住连发');
+        }
+
+        function onRepeatSliderChange(val) {
+            if (!editingBinding) return;
+            editingBinding.repeat_interval_ms = parseInt(val) || 150;
+            document.getElementById('label-repeat-ms').innerText = `${editingBinding.repeat_interval_ms}ms`;
         }
 
         // Effective (inheritance-aware) state of the long/double triggers for

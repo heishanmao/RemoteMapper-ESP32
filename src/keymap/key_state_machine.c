@@ -669,8 +669,18 @@ void key_engine_tick(key_mapper_engine_t *engine, uint32_t now_ms) {
             }
 
             if (b.has_repeat && now_ms >= s->next_repeat_timestamp) {
-                emit_action(engine, &b.repeat_action, b.source_vk, true);
-                s->next_repeat_timestamp = now_ms + b.repeat_interval_ms;
+                // 连发语义：按住时周期性重发"点按"动作。仅允许点按类
+                // （键盘 tap / 消费者 tap / 鼠标 tap）；其他类型不支持连发，
+                // 降频探测以避免按住期间持续误发 hold 类动作。
+                if (b.repeat_action.type == ACTION_KEYBOARD_TAP ||
+                    b.repeat_action.type == ACTION_CONSUMER_TAP ||
+                    b.repeat_action.type == ACTION_MOUSE_TAP) {
+                    emit_action(engine, &b.repeat_action, b.source_vk, true);
+                    uint32_t interval = b.repeat_interval_ms ? b.repeat_interval_ms : 150;
+                    s->next_repeat_timestamp = now_ms + interval;
+                } else {
+                    s->next_repeat_timestamp = now_ms + 500;
+                }
             }
         } else {
             if (s->waiting_double && (now_ms - s->release_timestamp >= b.double_ms)) {
