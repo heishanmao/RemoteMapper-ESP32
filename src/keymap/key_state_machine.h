@@ -54,6 +54,10 @@ typedef enum {
 #define MOUSE_MOVE_SPEED_DEFAULT 8
 #define MOUSE_MOVE_TICK_MS     25     // fixed repeat cadence for smooth motion
 
+// Continuous-hold failsafe: auto-repeat stops after this long even if the
+// release event is lost (upstream SayAll uses the same 60s cap).
+#define KEYMAP_HOLD_FAILSAFE_MS 60000
+
 typedef struct {
     key_action_type_t type;
     uint8_t           modifier;     // USB_MOD_*

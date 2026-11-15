@@ -673,7 +673,13 @@ void key_engine_tick(key_mapper_engine_t *engine, uint32_t now_ms) {
                 emit_action(engine, &b.long_action, b.source_vk, true);
             }
 
-            if (b.has_repeat && now_ms >= s->next_repeat_timestamp) {
+            // Failsafe (borrowed from upstream SayAll's hold execution): stop
+            // auto-repeat after 60s of continuous hold. If the BLE release
+            // event is ever lost, repeats must not fire forever. Held
+            // keyboard/consumer states are already force-released by the USB
+            // guard; the mouse mailboxes bypass it, so this matters most for
+            // pointer movement.
+            if (b.has_repeat && hold_time < KEYMAP_HOLD_FAILSAFE_MS && now_ms >= s->next_repeat_timestamp) {
                 // 连发语义：按住时周期性重发"点按"动作。仅允许点按类
                 // （键盘 tap / 消费者 tap / 鼠标 tap）；其他类型不支持连发，
                 // 降频探测以避免按住期间持续误发 hold 类动作。
