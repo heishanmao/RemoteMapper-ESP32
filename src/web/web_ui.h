@@ -1073,6 +1073,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                         <div class="mode-title" style="font-size:13px; font-weight:700; color:#fff;">高级扩展</div>
                         <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">WOL网络唤醒等</div>
                     </div>
+                    <div class="mode-card" id="mode-card-17" onclick="selectActionMode(17)">
+                        <div class="mode-title" style="font-size:13px; font-weight:700; color:#fff;">鼠标动作</div>
+                        <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">左/右/中键·滚轮</div>
+                    </div>
                     <div class="mode-card" id="mode-card-10" onclick="selectActionMode(10)">
                         <div class="mode-title" style="font-size:13px; font-weight:700; color:#fff;">穿透继承</div>
                         <div style="font-size:11px; color:var(--text-muted); margin-top:2px;">继承默认层配置</div>
@@ -1391,6 +1395,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                             <option value="c:0x00:0x0225">网页前进 (Browser Forward)</option>
                             <option value="c:0x00:0x0223">网页主页 (Browser Home)</option>
                             <option value="c:0x00:0x0192">打开计算器 (Calculator)</option>
+                        </optgroup>
+                        <optgroup label="鼠标动作（左/右/中键·滚轮）" id="quick-optgroup-mouse">
+                            <option value="mo:0x00:0x01">鼠标左键 (Mouse Left)</option>
+                            <option value="mo:0x00:0x02">鼠标右键 (Mouse Right)</option>
+                            <option value="mo:0x00:0x04">鼠标中键 (Mouse Middle)</option>
+                            <option value="mo:0x00:0x10">滚轮向上 (Wheel Up)</option>
+                            <option value="mo:0x00:0x20">滚轮向下 (Wheel Down)</option>
                         </optgroup>
                     </select>
                 </div>
@@ -1773,6 +1784,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         function getActionSummaryText(type, mod, key, cons, target_layer, mac) {
             if (type === 10) return '[继承默认层]';
             if (type === 11) return `[WOL唤醒: ${mac || '已配置'}]`;
+            if (type === 17) {
+                const mouseMap = {1:'鼠标左键', 2:'鼠标右键', 4:'鼠标中键', 16:'滚轮上', 32:'滚轮下'};
+                return `[${mouseMap[key] || ('鼠标 0x' + (key||0).toString(16).toUpperCase())}]`;
+            }
             if (type === 9) {
                 const tgt = target_layer || 0;
                 let tgtName = tgt === 0 ? '默认层' : `层${tgt}`;
@@ -2504,6 +2519,18 @@ if (mod & 0x01) parts.push('左Ctrl');
                 if (advActionBox) advActionBox.style.display = 'block';
                 switchAdvSubTab('wol');
                 if (!skipRender) renderTriggerView(11, 0, 0, 0);
+            } else if (mode === 17) {
+                if (recorderBox) recorderBox.style.display = 'none';
+                if (advContainer) advContainer.style.display = 'block';
+                if (layerBox) layerBox.style.display = 'none';
+                if (transBox) transBox.style.display = 'none';
+                if (advActionBox) advActionBox.style.display = 'none';
+                if (inst) inst.innerHTML = '<b>鼠标动作模式</b>：在下方下拉框中选择左/右/中键或滚轮方向（单击触发）';
+                let curCode = parseHexOrDec(document.getElementById('adv-code').value) || 0x10;
+                if (!skipRender) {
+                    renderTriggerView(17, 0, curCode, 0);
+                    if (quickSelect) quickSelect.value = 'mo:0x00:0x' + curCode.toString(16).toUpperCase().padStart(2, '0');
+                }
             } else {
                 if (recorderBox) recorderBox.style.display = 'block';
                 if (advContainer) advContainer.style.display = 'block';
@@ -2675,6 +2702,12 @@ if (inst) inst.innerHTML = (currentRemoteModel === 'chromecast' && voiceToggleMo
                 key = 0;
                 mod = 0;
                 cons = 0;
+            } else if (type === 17) {
+                // Mouse actions live in key_code; force a sensible default so
+                // the badge never renders an empty chip.
+                key = key || 0x10;
+                mod = 0;
+                cons = 0;
             }
 
             currentSelectedMode = type;
@@ -2721,6 +2754,14 @@ if (inst) inst.innerHTML = (currentRemoteModel === 'chromecast' && voiceToggleMo
                 }
                 display.innerHTML = `<span class="kbd-chip" style="border-color:var(--accent-orange); color:var(--accent-orange);">🌐 WOL 唤醒: ${mac || '未配置MAC'}</span>`;
                 syncQuickKeySelect(0, 0, 0);
+                return;
+            }
+
+            if (type === 17) {
+                const mouseMap = {1:'鼠标左键', 2:'鼠标右键', 4:'鼠标中键', 16:'滚轮上', 32:'滚轮下'};
+                display.innerHTML = `<span class="kbd-chip" style="border-color:var(--accent-cyan); color:var(--accent-cyan);">🖱 ${mouseMap[key] || ('鼠标 0x' + (key||0).toString(16).toUpperCase())}</span>`;
+                const quickSel = document.getElementById('quick-key-select');
+                if (quickSel) quickSel.value = 'mo:0x00:0x' + (key||0).toString(16).toUpperCase().padStart(2, '0');
                 return;
             }
 
@@ -2895,6 +2936,8 @@ if (mod & 0x01) chips.push('左Ctrl');
             document.getElementById('modal-title').innerText = (isVoice && currentEditingLayer === 0) ? '设置语音键快捷键' : `${layerPrefix}设置 ${keyName} 映射`;
             document.getElementById('modal-vk-badge').innerText = '0x' + searchVk.toString(16).toUpperCase().padStart(2, '0');
             document.getElementById('quick-optgroup-media').style.display = (isVoice && currentEditingLayer === 0) ? 'none' : 'block';
+            const mouseGroup = document.getElementById('quick-optgroup-mouse');
+            if (mouseGroup) mouseGroup.style.display = (isVoice && currentEditingLayer === 0) ? 'none' : 'block';
 
             if (isVoice && currentEditingLayer === 0) {
                 document.getElementById('trigger-tab-bar').style.display = 'none';
@@ -2949,6 +2992,9 @@ if (mod & 0x01) chips.push('左Ctrl');
                 }
                 selectActionMode(4);
                 renderTriggerView(4, 0, 0, code);
+            } else if (prefix === 'mo') {
+                selectActionMode(17, true);
+                renderTriggerView(17, 0, code, 0);
             } else if (prefix === 'm') {
                 if (currentSelectedMode === 4 || currentSelectedMode === 9 || currentSelectedMode === 10 || currentSelectedMode === 11) selectActionMode(2);
                 renderTriggerView(currentSelectedMode, mod, 0, 0);
@@ -2987,8 +3033,9 @@ if (mod & 0x01) chips.push('左Ctrl');
             const modal = document.getElementById('remap-modal');
             if (modal.style.display !== 'flex') return;
 
-            // If user is in layer switch, transparent, or advanced extension mode, ignore keypresses
-            if (currentSelectedMode === 9 || currentSelectedMode === 10 || currentSelectedMode === 11) return;
+            // If user is in layer switch, transparent, advanced extension, or
+            // mouse action mode, ignore keypresses (nothing to record).
+            if (currentSelectedMode === 9 || currentSelectedMode === 10 || currentSelectedMode === 11 || currentSelectedMode === 17) return;
 
             // If user is typing in advanced numeric inputs, let it through
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;

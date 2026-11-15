@@ -16,6 +16,7 @@
 #include "USBCDC.h"
 #include "USBHIDKeyboard.h"
 #include "USBHIDConsumerControl.h"
+#include "USBHIDMouse.h"
 #include "tusb.h"
 #include "esp32-hal-tinyusb.h"
 #include "esp_system.h"
@@ -29,6 +30,10 @@ USBCDC USBSerial;
 
 static USBHIDKeyboard        s_keyboard;
 static USBHIDConsumerControl s_consumer;
+// Mouse joins the framework's composite HID interface (report ID 2). Its
+// descriptor grows the report map, so hosts see one more HID collection
+// after re-enumeration; keyboard/consumer report IDs are unchanged.
+static USBHIDMouse           s_mouse;
 static bool                  s_usb_ready = false;
 static bool                  s_usb_initialized = false;
 static uint32_t               s_recovery_by_reason[4] = {};
@@ -51,6 +56,17 @@ static portMUX_TYPE s_hid_registry_mux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_voice_state_mux = portMUX_INITIALIZER_UNLOCKED;
 static remotemapper::HidCommandQueue s_hid_commands;
 static TaskHandle_t s_hid_sender_task = nullptr;
+
+// Mouse taps deliberately bypass the HID command queue: a tap is a
+// self-contained press->release pair owned end-to-end by the sender task,
+// so no epoch bookkeeping applies and no host-visible held state can
+// outlive one loop iteration. Only the sender task ever sends mouse
+// reports, keeping TinyUSB single-writer with keyboard/consumer traffic.
+static struct {
+    bool pending;
+    uint8_t buttons;
+    int8_t wheel;
+} s_mouse_tap = {};
 
 // Non-recursive mutex guarding the USB HID reports + registry. Defined here in
 // plain C++ (file-local helpers): the guard section below lives outside the
@@ -222,10 +238,59 @@ static bool hid_send_command_report(const remotemapper::HidCommandQueue::Command
     return ok;
 }
 
+static void hid_mouse_request_tap(uint8_t code) {
+    portENTER_CRITICAL(&s_hid_command_mux);
+    s_mouse_tap.buttons = (uint8_t)(code & (MOUSE_CODE_LEFT | MOUSE_CODE_RIGHT | MOUSE_CODE_MIDDLE));
+    s_mouse_tap.wheel = (code & MOUSE_CODE_WHEEL_UP) ? 1
+            : ((code & MOUSE_CODE_WHEEL_DOWN) ? -1 : 0);
+    s_mouse_tap.pending = true;
+    portEXIT_CRITICAL(&s_hid_command_mux);
+    if (s_hid_sender_task) xTaskNotifyGive(s_hid_sender_task);
+}
+
+static void hid_mouse_send_tap_pair(uint8_t buttons, int8_t wheel) {
+    if (!tud_ready()) return;
+    hid_lock();
+    hid_mouse_report_t report = {};
+    report.buttons = buttons;
+    report.wheel = wheel;
+    const bool down_ok = s_hid_transport.SendReport(HID_REPORT_ID_MOUSE,
+            &report, sizeof(report), 20);
+    if (down_ok) {
+        // Hold the down state briefly so the host sees a real click, not a
+        // 0-length blip some apps discard.
+        vTaskDelay(pdMS_TO_TICKS(12));
+        report.buttons = 0;
+        report.wheel = 0;
+        s_hid_transport.SendReport(HID_REPORT_ID_MOUSE, &report, sizeof(report), 20);
+    }
+    hid_unlock();
+    if (down_ok) s_hid_tx_ok++;
+    else s_hid_tx_failed++;
+}
+
 static void hid_sender_task(void *) {
     using Queue = remotemapper::HidCommandQueue;
     for (;;) {
         Queue::Command command = {};
+        // Mouse tap mailbox drains first: during queue recovery the mailbox
+        // stays live (its reports are self-contained and cannot get stuck).
+        bool mouse_pending = false;
+        uint8_t mouse_buttons = 0;
+        int8_t mouse_wheel = 0;
+        portENTER_CRITICAL(&s_hid_command_mux);
+        if (s_mouse_tap.pending) {
+            mouse_pending = true;
+            mouse_buttons = s_mouse_tap.buttons;
+            mouse_wheel = s_mouse_tap.wheel;
+            s_mouse_tap.pending = false;
+        }
+        portEXIT_CRITICAL(&s_hid_command_mux);
+        if (mouse_pending) {
+            hid_mouse_send_tap_pair(mouse_buttons, mouse_wheel);
+            continue;
+        }
+
         portENTER_CRITICAL(&s_hid_command_mux);
         const bool available = s_hid_commands.peek(command);
         const bool recovering = s_hid_commands.recovering();
@@ -941,6 +1006,7 @@ void usb_composite_init(void) {
 
     s_keyboard.begin();
     s_consumer.begin();
+    s_mouse.begin();
     s_hid_transport.begin();
     const bool usb_started = USB.begin();
     TaskHandle_t sender = nullptr;
@@ -1175,6 +1241,9 @@ void usb_hid_dispatch_action(const key_action_t *action) {
         case ACTION_CONSUMER_RELEASE:
             guard_clear_nonvoice();
             usb_hid_consumer_release();
+            break;
+        case ACTION_MOUSE_TAP:
+            hid_mouse_request_tap(action->key_code);
             break;
         case ACTION_VOICE_HOLD: {
             // Serialize a new session against loop-side drain completion. The

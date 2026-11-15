@@ -24,8 +24,24 @@ typedef enum {
     ACTION_WOL,                 // 11: Wake-on-LAN Magic Packet
     ACTION_ADV_MACRO,           // 12: Future placeholder (Macro Sequence)
     ACTION_ADV_HTTP,            // 13: Future placeholder (HTTP Webhook)
-    ACTION_ADV_MQTT             // 14: Future placeholder (MQTT Publish)
+    ACTION_ADV_MQTT,            // 14: Future placeholder (MQTT Publish)
+    /* 15/16 reserved: upstream numbers ACTION_VOICE_TOGGLE(_RELEASE) here.
+       Keeping the gap stable lets keymap configs stay interchangeable. */
+    ACTION_RESERVED_VOICE_TOGGLE = 15,
+    ACTION_RESERVED_VOICE_TOGGLE_RELEASE = 16,
+    ACTION_MOUSE_TAP = 17       // Tap a mouse button or wheel notch; key_code
+                                // encodes which (MOUSE_CODE_* below)
 } key_action_type_t;
+
+// Highest action type accepted by JSON parsing and storage validation.
+#define KEY_ACTION_TYPE_MAX ACTION_MOUSE_TAP
+
+// ACTION_MOUSE_TAP key_code encodings: HID button bits plus wheel pseudo-codes.
+#define MOUSE_CODE_LEFT        0x01
+#define MOUSE_CODE_RIGHT       0x02
+#define MOUSE_CODE_MIDDLE      0x04
+#define MOUSE_CODE_WHEEL_UP    0x10
+#define MOUSE_CODE_WHEEL_DOWN  0x20
 
 typedef struct {
     key_action_type_t type;

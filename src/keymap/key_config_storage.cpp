@@ -190,8 +190,8 @@ static bool parse_bindings_array(JsonArray arr, key_layer_t *layer) {
         const uint32_t repeat_layer = parse_u32_or_hex(obj["repeat_layer"], 0);
         const uint32_t repeat_delay = parse_u32_or_hex(obj["repeat_delay_ms"], 0);
         const uint32_t repeat_interval = parse_u32_or_hex(obj["repeat_interval_ms"], 0);
-        if (click_type > ACTION_ADV_MQTT || long_type > ACTION_ADV_MQTT || double_type > ACTION_ADV_MQTT ||
-            repeat_type > ACTION_ADV_MQTT ||
+        if (click_type > KEY_ACTION_TYPE_MAX || long_type > KEY_ACTION_TYPE_MAX || double_type > KEY_ACTION_TYPE_MAX ||
+            repeat_type > KEY_ACTION_TYPE_MAX ||
             click_mod > UINT8_MAX || click_key > UINT8_MAX || click_cons > UINT16_MAX || click_layer > UINT8_MAX ||
             long_mod > UINT8_MAX || long_key > UINT8_MAX || long_cons > UINT16_MAX || long_layer > UINT8_MAX ||
             double_mod > UINT8_MAX || double_key > UINT8_MAX || double_cons > UINT16_MAX || double_layer > UINT8_MAX ||
@@ -253,10 +253,10 @@ static bool parse_bindings_array(JsonArray arr, key_layer_t *layer) {
             if (!wol_manager_parse_mac(obj["repeat_mac"].as<String>().c_str(), b.repeat_action.wol_mac)) return false;
         }
 
-        if ((uint32_t)b.click_action.type > ACTION_ADV_MQTT ||
-            (uint32_t)b.long_action.type > ACTION_ADV_MQTT ||
-            (uint32_t)b.double_action.type > ACTION_ADV_MQTT ||
-            (uint32_t)b.repeat_action.type > ACTION_ADV_MQTT ||
+        if ((uint32_t)b.click_action.type > KEY_ACTION_TYPE_MAX ||
+            (uint32_t)b.long_action.type > KEY_ACTION_TYPE_MAX ||
+            (uint32_t)b.double_action.type > KEY_ACTION_TYPE_MAX ||
+            (uint32_t)b.repeat_action.type > KEY_ACTION_TYPE_MAX ||
             (b.has_long && (b.long_ms == 0 || b.long_ms > 60000)) ||
             (b.has_double && (b.double_ms == 0 || b.double_ms > 60000)) ||
             (b.has_repeat && (b.repeat_delay_ms == 0 || b.repeat_interval_ms == 0))) return false;

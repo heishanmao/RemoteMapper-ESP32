@@ -171,7 +171,7 @@ static void emit_action(key_mapper_engine_t *engine, const key_action_t *action,
     if (engine->active_layer != 0 && engine->layers[engine->active_layer].type == LAYER_TYPE_ONESHOT) {
         if (action->type == ACTION_KEYBOARD_TAP || action->type == ACTION_CONSUMER_TAP ||
             action->type == ACTION_KEYBOARD_RELEASE || action->type == ACTION_CONSUMER_RELEASE ||
-            action->type == ACTION_VOICE_RELEASE) {
+            action->type == ACTION_VOICE_RELEASE || action->type == ACTION_MOUSE_TAP) {
             key_engine_switch_layer(engine, 0, engine->last_telemetry.timestamp);
         }
     }
